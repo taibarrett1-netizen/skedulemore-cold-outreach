@@ -187,7 +187,7 @@ async function login(page, credentials) {
       throw err;
     }
     logger.log('On 2FA page, entering security code...');
-    const codeEntered = await page.evaluate((code) => {
+    const codeInputFocused = await page.evaluate(() => {
       const inputs = Array.from(document.querySelectorAll('input'));
       const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden');
       const codeInput = visible.find((el) => {
@@ -197,17 +197,17 @@ async function login(page, credentials) {
       }) || visible[0];
       if (!codeInput) return false;
       codeInput.focus();
-      codeInput.value = '';
-      codeInput.value = code;
-      codeInput.dispatchEvent(new Event('input', { bubbles: true }));
+      codeInput.click();
       return true;
-    }, twoFactorCode);
-    if (!codeEntered) {
+    });
+    if (!codeInputFocused) {
       page.off('response', respHandler);
       const err = new Error('Two-factor code input not found on page.');
       err.code = 'TWO_FACTOR_REQUIRED';
       throw err;
     }
+    await delay(300);
+    await page.keyboard.type(twoFactorCode, { delay: 80 + Math.floor(Math.random() * 40) });
     await humanDelay();
     const confirmClicked = await page.evaluate(function () {
       const labels = ['Confirm', 'Next', 'Submit'];
@@ -953,28 +953,49 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
 
 /**
  * Complete 2FA on an existing page (same browser session as the login that hit 2FA).
- * Enters the code, clicks Confirm, waits for redirect, dismisses dialogs, returns cookies.
+ * Enters the code via keyboard (so React/Instagram registers it), clicks Confirm, waits for redirect, dismisses dialogs, returns cookies.
  */
 async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsername) {
   const code = String(twoFactorCode).replace(/\D/g, '').slice(0, 6);
   if (!code) throw new Error('Invalid 2FA code.');
   logger.log('Entering 2FA code on existing session...');
-  const codeEntered = await page.evaluate((c) => {
+  const inputCount = await page.evaluate(() => {
     const inputs = Array.from(document.querySelectorAll('input'));
-    const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden');
-    const codeInput = visible.find((el) => {
-      const p = (el.placeholder || '').toLowerCase();
-      const a = (el.getAttribute('aria-label') || '').toLowerCase();
-      return p.includes('code') || p.includes('security') || a.includes('code') || a.includes('security') || (el.type !== 'password' && el.type !== 'email');
-    }) || visible[0];
-    if (!codeInput) return false;
-    codeInput.focus();
-    codeInput.value = '';
-    codeInput.value = c;
-    codeInput.dispatchEvent(new Event('input', { bubbles: true }));
-    return true;
-  }, code);
-  if (!codeEntered) throw new Error('Two-factor code input not found.');
+    const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden' && el.type !== 'password');
+    return visible.length;
+  });
+  const isSixBoxes = inputCount === 6;
+  if (isSixBoxes) {
+    for (let i = 0; i < 6; i++) {
+      const digit = code[i] || '';
+      await page.evaluate((index) => {
+        const inputs = Array.from(document.querySelectorAll('input'));
+        const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden' && el.type !== 'password');
+        const el = visible[index];
+        if (el) { el.focus(); el.click(); }
+      }, i);
+      await delay(80);
+      if (digit) await page.keyboard.type(digit, { delay: 50 });
+      await delay(60);
+    }
+  } else {
+    const codeInputFocused = await page.evaluate(() => {
+      const inputs = Array.from(document.querySelectorAll('input'));
+      const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden');
+      const codeInput = visible.find((el) => {
+        const p = (el.placeholder || '').toLowerCase();
+        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+        return p.includes('code') || p.includes('security') || a.includes('code') || a.includes('security') || (el.type !== 'password' && el.type !== 'email');
+      }) || visible[0];
+      if (!codeInput) return false;
+      codeInput.focus();
+      codeInput.click();
+      return true;
+    });
+    if (!codeInputFocused) throw new Error('Two-factor code input not found.');
+    await delay(300);
+    await page.keyboard.type(code, { delay: 80 + Math.floor(Math.random() * 40) });
+  }
   await delay(500 + Math.floor(Math.random() * 1000));
   const confirmClicked = await page.evaluate(function () {
     const labels = ['Confirm', 'Next', 'Submit'];
@@ -988,11 +1009,14 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
     return false;
   });
   if (confirmClicked) {
-    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
-    await delay(2000);
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await delay(3000);
   }
   if (page.url().includes('/accounts/login/two_factor')) {
-    throw new Error('Two-factor code may be wrong or expired. Try again with a fresh code.');
+    await delay(2000);
+    if (page.url().includes('/accounts/login/two_factor')) {
+      throw new Error('Two-factor code may be wrong or expired. Try again with a fresh code.');
+    }
   }
   for (let i = 0; i < 3; i++) {
     const dismissed = await page.evaluate(function () {
