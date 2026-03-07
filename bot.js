@@ -186,6 +186,7 @@ async function login(page, credentials) {
       err.page = page;
       throw err;
     }
+    await ensure2FACodeEntryPage(page);
     logger.log('On 2FA page, entering security code...');
     const codeInputFocused = await page.evaluate(() => {
       const inputs = Array.from(document.querySelectorAll('input'));
@@ -952,12 +953,44 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
 }
 
 /**
+ * If Instagram is showing "choose 2FA method", click through to the code entry screen.
+ * Prioritises WhatsApp, then authentication app.
+ */
+async function ensure2FACodeEntryPage(page) {
+  const clicked = await page.evaluate(function () {
+    const body = (document.body && document.body.innerText) || '';
+    const hasCodeInput = document.querySelectorAll('input[type="text"]:not([type="hidden"]), input[type="tel"], input:not([type="hidden"]):not([type="password"])').length >= 1;
+    if (hasCodeInput && (body.includes('Security Code') || body.includes('6-digit') || body.includes('Enter'))) return false;
+    const clickables = Array.from(document.querySelectorAll('button, div[role="button"], a, span[role="button"], [role="button"]'));
+    const lower = (el) => (el.textContent || '').toLowerCase().trim();
+    const whatsApp = clickables.find((el) => {
+      const t = lower(el);
+      return t.includes('whatsapp') || (t.includes('send') && t.includes('whatsapp')) || (t.includes('get code') && t.includes('whatsapp'));
+    });
+    if (whatsApp && whatsApp.offsetParent) { whatsApp.scrollIntoView({ block: 'center' }); whatsApp.click(); return true; }
+    const app = clickables.find((el) => {
+      const t = lower(el);
+      return t.includes('authentication app') || t.includes('authenticator') || (t.includes('app') && t.length < 25);
+    });
+    if (app && app.offsetParent) { app.scrollIntoView({ block: 'center' }); app.click(); return true; }
+    const sms = clickables.find((el) => lower(el).includes('text message') || lower(el).includes('sms'));
+    if (sms && sms.offsetParent) { sms.scrollIntoView({ block: 'center' }); sms.click(); return true; }
+    return false;
+  });
+  if (clicked) {
+    logger.log('Clicked 2FA method (WhatsApp preferred), waiting for code entry...');
+    await delay(3000);
+  }
+}
+
+/**
  * Complete 2FA on an existing page (same browser session as the login that hit 2FA).
  * Enters the code via keyboard (so React/Instagram registers it), clicks Confirm, waits for redirect, dismisses dialogs, returns cookies.
  */
 async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsername) {
   const code = String(twoFactorCode).replace(/\D/g, '').slice(0, 6);
   if (!code) throw new Error('Invalid 2FA code.');
+  if (page.url().includes('/accounts/login/two_factor')) await ensure2FACodeEntryPage(page);
   logger.log('Entering 2FA code on existing session...');
   const inputCount = await page.evaluate(() => {
     const inputs = Array.from(document.querySelectorAll('input'));
