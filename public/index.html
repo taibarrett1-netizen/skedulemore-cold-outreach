@@ -173,10 +173,12 @@
       setTimeout(() => { el.style.display = 'none'; }, 5000);
     }
 
-    function doConnect(username, password, clientId, twoFactorCode) {
-      const body = { username, password, clientId };
-      if (twoFactorCode) body.twoFactorCode = String(twoFactorCode).replace(/\D/g, '').slice(0, 6);
-      return fetch('/api/instagram/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+    function doConnect(username, password, clientId) {
+      return fetch('/api/instagram/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, clientId }) }).then(r => r.json());
+    }
+
+    function submit2FACode(pending2FAId, twoFactorCode, clientId) {
+      return fetch('/api/instagram/connect/2fa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending2FAId, twoFactorCode, clientId }) }).then(r => r.json());
     }
 
     function open2FAModal() {
@@ -360,10 +362,10 @@
           document.getElementById('connect-password').value = '';
           document.getElementById('twofa-code').value = '';
           connectPending = null;
-        } else if (data.code === 'two_factor_required') {
-          connectPending = { username, password, clientId };
+        } else if (data.code === 'two_factor_required' && data.pending2FAId) {
+          connectPending = { clientId, pending2FAId: data.pending2FAId };
           open2FAModal();
-          showConnectMsg('Enter the 6-digit code below.', false);
+          showConnectMsg('Enter the 6-digit code below (same session, no new code sent).', false);
         } else {
           showConnectMsg(data.error || data.message || 'Connect failed.', false);
         }
@@ -371,16 +373,15 @@
     });
 
     document.getElementById('btn-twofa-submit').addEventListener('click', () => {
-      if (!connectPending) return;
+      if (!connectPending || !connectPending.pending2FAId) return;
       const code = document.getElementById('twofa-code').value.trim();
       if (!code) return;
       const btn = document.getElementById('btn-twofa-submit');
       btn.disabled = true;
-      doConnect(connectPending.username, connectPending.password, connectPending.clientId, code).then((data) => {
+      submit2FACode(connectPending.pending2FAId, code, connectPending.clientId).then((data) => {
         if (data.ok) {
           showConnectMsg('Connected. Password and code were not stored.', true);
           document.getElementById('connect-password').value = '';
-          document.getElementById('connect-username').value = '';
           document.getElementById('twofa-code').value = '';
           close2FAModal();
         } else {

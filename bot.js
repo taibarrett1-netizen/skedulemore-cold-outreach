@@ -183,6 +183,7 @@ async function login(page, credentials) {
       page.off('response', respHandler);
       const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
       err.code = 'TWO_FACTOR_REQUIRED';
+      err.page = page;
       throw err;
     }
     logger.log('On 2FA page, entering security code...');
@@ -917,8 +918,8 @@ async function runBot() {
 
 /**
  * One-time connect: log in with given credentials and return session (cookies).
- * Used by POST /api/instagram/connect. Password is never stored.
- * If the account has 2FA, call again with twoFactorCode (6-digit from app or WhatsApp).
+ * If the account has 2FA and no code is provided, returns { twoFactorRequired: true, page, browser, username }
+ * so the server can keep the session and the user can submit the code to POST /api/instagram/connect/2fa.
  */
 async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null) {
   const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
@@ -927,6 +928,7 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   });
+  let keepBrowserOpen = false;
   try {
     const page = await browser.newPage();
     if (useMobile) await applyMobileEmulation(page);
@@ -938,9 +940,84 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
     });
     const cookies = await page.cookies();
     return { cookies, username: instagramUsername };
+  } catch (e) {
+    if (e.code === 'TWO_FACTOR_REQUIRED' && e.page) {
+      keepBrowserOpen = true;
+      return { twoFactorRequired: true, page: e.page, browser, username: instagramUsername };
+    }
+    throw e;
   } finally {
-    await browser.close().catch(() => {});
+    if (!keepBrowserOpen) await browser.close().catch(() => {});
   }
 }
 
-module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, login, connectInstagram };
+/**
+ * Complete 2FA on an existing page (same browser session as the login that hit 2FA).
+ * Enters the code, clicks Confirm, waits for redirect, dismisses dialogs, returns cookies.
+ */
+async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsername) {
+  const code = String(twoFactorCode).replace(/\D/g, '').slice(0, 6);
+  if (!code) throw new Error('Invalid 2FA code.');
+  logger.log('Entering 2FA code on existing session...');
+  const codeEntered = await page.evaluate((c) => {
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden');
+    const codeInput = visible.find((el) => {
+      const p = (el.placeholder || '').toLowerCase();
+      const a = (el.getAttribute('aria-label') || '').toLowerCase();
+      return p.includes('code') || p.includes('security') || a.includes('code') || a.includes('security') || (el.type !== 'password' && el.type !== 'email');
+    }) || visible[0];
+    if (!codeInput) return false;
+    codeInput.focus();
+    codeInput.value = '';
+    codeInput.value = c;
+    codeInput.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }, code);
+  if (!codeEntered) throw new Error('Two-factor code input not found.');
+  await delay(500 + Math.floor(Math.random() * 1000));
+  const confirmClicked = await page.evaluate(function () {
+    const labels = ['Confirm', 'Next', 'Submit'];
+    const buttons = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]'));
+    for (const label of labels) {
+      const btn = buttons.find((el) => (el.textContent || el.value || '').trim() === label);
+      if (btn && btn.offsetParent) { btn.scrollIntoView({ block: 'center' }); btn.click(); return true; }
+    }
+    const confirmLike = buttons.find((el) => /confirm|next|submit/i.test((el.textContent || el.value || '').trim()));
+    if (confirmLike && confirmLike.offsetParent) { confirmLike.click(); return true; }
+    return false;
+  });
+  if (confirmClicked) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await delay(2000);
+  }
+  if (page.url().includes('/accounts/login/two_factor')) {
+    throw new Error('Two-factor code may be wrong or expired. Try again with a fresh code.');
+  }
+  for (let i = 0; i < 3; i++) {
+    const dismissed = await page.evaluate(function () {
+      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+      for (let d = 0; d < dialogs.length; d++) {
+        const txt = (dialogs[d].textContent || '').toLowerCase();
+        if (txt.indexOf('save your login') !== -1 || txt.indexOf('not now') !== -1 || txt.indexOf('turn on notifications') !== -1) {
+          const notNow = Array.from(dialogs[d].querySelectorAll('span, button, div[role="button"]')).find(function (el) {
+            return (el.textContent || '').trim().toLowerCase() === 'not now';
+          });
+          if (notNow) {
+            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+            if (btn) { btn.click(); return true; }
+          }
+        }
+      }
+      return false;
+    });
+    if (dismissed) await delay(2000);
+    else break;
+  }
+  const cookies = await page.cookies();
+  await browser.close().catch(() => {});
+  logger.log('2FA completed, session saved.');
+  return { cookies, username: instagramUsername };
+}
+
+module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, login, connectInstagram, completeInstagram2FA };

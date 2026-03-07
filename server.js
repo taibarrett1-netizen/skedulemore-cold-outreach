@@ -26,7 +26,7 @@ const {
   pickScraperSessionForJob,
   savePlatformScraperSession,
 } = require('./database/supabase');
-const { loadLeadsFromCSV, connectInstagram } = require('./bot');
+const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 
@@ -267,10 +267,24 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true, count: usernames.length });
 });
 
+// Pending 2FA sessions: id -> { page, browser, username, clientId, createdAt }. Cleared when code is submitted or after TTL.
+const pending2FAMap = new Map();
+const PENDING_2FA_TTL_MS = 2 * 60 * 1000;
+
+function cleanupExpired2FA() {
+  const now = Date.now();
+  for (const [id, data] of pending2FAMap.entries()) {
+    if (now - data.createdAt > PENDING_2FA_TTL_MS) {
+      pending2FAMap.delete(id);
+      if (data.browser) data.browser.close().catch(() => {});
+    }
+  }
+}
+
 // --- API: Instagram connect (one-time; password never stored) ---
-// If account has 2FA, first call returns { ok: false, code: 'two_factor_required' }; send same username, password, clientId plus twoFactorCode (6-digit) to complete.
+// If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
 app.post('/api/instagram/connect', async (req, res) => {
-  const { username, password, clientId, twoFactorCode } = req.body || {};
+  const { username, password, clientId } = req.body || {};
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
@@ -278,7 +292,24 @@ app.post('/api/instagram/connect', async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
-    const result = await connectInstagram(username, password, twoFactorCode || null);
+    const result = await connectInstagram(username, password, null);
+    if (result.twoFactorRequired) {
+      cleanupExpired2FA();
+      const pendingId = require('crypto').randomBytes(16).toString('hex');
+      pending2FAMap.set(pendingId, {
+        page: result.page,
+        browser: result.browser,
+        username: result.username,
+        clientId,
+        createdAt: Date.now(),
+      });
+      return res.status(200).json({
+        ok: false,
+        code: 'two_factor_required',
+        message: 'Enter the 6-digit code from your app or WhatsApp.',
+        pending2FAId: pendingId,
+      });
+    }
     await saveSession(clientId, { cookies: result.cookies }, result.username);
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
@@ -288,6 +319,33 @@ app.post('/api/instagram/connect', async (req, res) => {
       return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
     }
     res.status(500).json({ ok: false, error: e.message || 'Login failed' });
+  }
+});
+
+app.post('/api/instagram/connect/2fa', async (req, res) => {
+  const { pending2FAId, twoFactorCode, clientId } = req.body || {};
+  if (!pending2FAId || !twoFactorCode || !clientId) {
+    return res.status(400).json({ ok: false, error: 'pending2FAId, twoFactorCode, and clientId are required' });
+  }
+  const pending = pending2FAMap.get(pending2FAId);
+  if (!pending) {
+    return res.status(400).json({ ok: false, error: 'Session expired. Start Connect again and enter the new code when the popup appears.' });
+  }
+  if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
+    pending2FAMap.delete(pending2FAId);
+    if (pending.browser) pending.browser.close().catch(() => {});
+    return res.status(400).json({ ok: false, error: 'Session expired. Start Connect again and enter the new code when the popup appears.' });
+  }
+  pending2FAMap.delete(pending2FAId);
+  try {
+    const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
+    await saveSession(clientId, { cookies: result.cookies }, result.username);
+    await updateSettingsInstagramUsername(clientId, result.username);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Instagram 2FA complete failed', e);
+    if (pending.browser) pending.browser.close().catch(() => {});
+    res.status(500).json({ ok: false, error: e.message || '2FA failed' });
   }
 });
 

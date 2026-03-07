@@ -4,41 +4,49 @@ Give this to your dashboard/frontend (e.g. Lovable or other app) so they can add
 
 ---
 
-**Backend is already done.** When the user clicks **Connect** with Instagram username and password, the API can now return “2FA required” and accept a second request with the 6-digit code. Implement the following on the **dashboard** (Cold Outreach → Connect tab).
+**Backend is already done.** The server keeps the same browser session when 2FA is required and returns a `pending2FAId`. The second step is a separate endpoint so the user’s code is used on that same session (Instagram does not send a second code).
 
 ---
 
 ## API contract
 
-- **Endpoint:** `POST /api/instagram/connect`
-- **Body:** `{ username, password, clientId }` (all required when Supabase is used). Optionally `twoFactorCode` (6-digit string) on the second request.
+**Step 1 – Connect**  
+- **Endpoint:** `POST /api/instagram/connect`  
+- **Body:** `{ username, password, clientId }` (all required when Supabase is used).
 
-**Responses:**
+**Responses from step 1:**
 
-1. **Success:** `{ ok: true }`  
-   → Show success message, then clear the password and any 2FA code from the form (do not store them). Optionally clear the 2FA modal if it was open.
+1. **Success (no 2FA):** `{ ok: true }`  
+   → Show success, clear password from the form. Done.
 
-2. **2FA required:** `{ ok: false, code: "two_factor_required", message: "…" }`  
-   → Do **not** show a generic error. Instead:
-   - Keep the same `username`, `password`, and `clientId` in memory for the next request (do not re-display the password in the UI).
-   - Show a **popup/modal** titled something like **“Two-factor code required”** with:
-     - Short text: e.g. “Enter the 6-digit code from your authenticator app or WhatsApp.”
-     - A single input: 6-digit security code (numeric, max length 6).
-     - Buttons: **Submit** and **Cancel**.
-   - When the user clicks **Submit**: call `POST /api/instagram/connect` again with the **same** `username`, `password`, and `clientId`, plus `twoFactorCode` set to the value from the input (digits only, e.g. strip non-digits and take first 6).
-   - If that second response is `{ ok: true }`: close the modal, show success, and clear password and code from the form like in (1).
-   - If the second response is an error: show the error message (e.g. “Code may be wrong or expired. Try again.”) and leave the modal open so they can enter a new code or cancel.
-   - **Cancel** closes the modal and discards the pending 2FA step (user can try Connect again from scratch).
+2. **2FA required:** `{ ok: false, code: "two_factor_required", message: "…", pending2FAId: "<id>" }`  
+   → Do **not** show a generic error. Store `pending2FAId` and `clientId` in memory (e.g. in component state). Show a **popup/modal** titled e.g. **“Two-factor code required”** with:
+   - Short text: “Enter the 6-digit code from your authenticator app or WhatsApp.” (You can add: “Same login session — no new code will be sent.”)
+   - One input: 6-digit security code (numeric, max length 6).
+   - Buttons: **Submit** and **Cancel**.
 
 3. **Other errors:** `{ ok: false, error: "…" }` or HTTP 4xx/5xx  
-   → Show the `error` (or a generic “Login failed”) in the usual way on the Connect form; no 2FA modal.
+   → Show `error` on the Connect form; no 2FA modal.
+
+**Step 2 – Submit 2FA code**  
+- **Endpoint:** `POST /api/instagram/connect/2fa`  
+- **Body:** `{ pending2FAId, twoFactorCode, clientId }` (all required).  
+  Use the `pending2FAId` from step 1 and the `clientId` you stored. `twoFactorCode` = value from the modal input (digits only, first 6 chars).
+
+**Responses from step 2:**
+
+1. **Success:** `{ ok: true }`  
+   → Close the modal, show success, clear password and code from the form. Do not store password or code.
+
+2. **Error (wrong/expired code or expired session):** `{ ok: false, error: "…" }`  
+   → Show the error in the modal or on the form; e.g. “Code may be wrong or expired. Try again.” or “Session expired. Start Connect again and enter the new code when the popup appears.” Leave the modal open so the user can try another code or cancel.
+
+**Cancel** in the modal closes it and discards the pending step; the user can click Connect again from scratch (they will get a new code from Instagram on the next attempt).
 
 ---
 
 ## UX summary
 
-- First tap **Connect** → if 2FA is required, show the popup and ask for the 6-digit code; do not show a generic “login failed” for `two_factor_required`.
-- User enters code from WhatsApp or authenticator app → **Submit** → same API with `twoFactorCode`; on success, register the connection and clear password and code like normal.
-- After a successful connect (with or without 2FA), never store the password or the 2FA code; only clear the fields and close the modal.
-
-Use this so the dashboard registers 2FA, shows the popup to enter the code, then completes the connection and deletes password and code as usual.
+- **Connect** → if response is `two_factor_required`, store `pending2FAId` and `clientId`, show the popup. Do **not** call the connect API again with the same username/password and a code; that would start a new login and trigger a second code.
+- User enters the **same** code they already received → **Submit** → call `POST /api/instagram/connect/2fa` with `pending2FAId`, `twoFactorCode`, `clientId`. On success, close modal and clear form.
+- After any successful connect, never store password or 2FA code; only clear fields and close the modal.
