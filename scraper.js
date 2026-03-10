@@ -267,6 +267,45 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
 
+    const logScrollDebug = async (label) => {
+      const dbg = await page.evaluate(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return { ok: false };
+        const scrollables = [];
+        for (const div of dialog.querySelectorAll('div')) {
+          if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
+            scrollables.push({
+              scrollHeight: div.scrollHeight,
+              clientHeight: div.clientHeight,
+              scrollTop: div.scrollTop,
+              links: div.querySelectorAll('a[href^="/"]').length,
+            });
+          }
+        }
+        return {
+          ok: true,
+          dialogScrollHeight: dialog.scrollHeight,
+          dialogClientHeight: dialog.clientHeight,
+          dialogScrollTop: dialog.scrollTop,
+          scrollables,
+        };
+      });
+      if (!dbg.ok) {
+        logger.log(`[Scraper] ${label}: no dialog`);
+        return;
+      }
+      logger.log(
+        `[Scraper] ${label}: dialog h=${dbg.dialogScrollHeight} ch=${dbg.dialogClientHeight} top=${dbg.dialogScrollTop} | scrollables=${dbg.scrollables.length}`
+      );
+      if (SCRAPER_DEBUG && dbg.scrollables.length > 0) {
+        dbg.scrollables.slice(0, 5).forEach((s, i) => {
+          logger.log(`[Scraper]   [${i}] h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
+        });
+      }
+    };
+
+    await logScrollDebug('Initial modal state');
+
     let totalScraped = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
@@ -453,6 +492,30 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       scrollCount++;
+      const getScrollDebug = () =>
+        page.evaluate(() => {
+          const dialog = document.querySelector('[role="dialog"]');
+          if (!dialog) return { ok: false, scrollables: [] };
+          const scrollables = [];
+          for (const div of dialog.querySelectorAll('div')) {
+            if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
+              scrollables.push({
+                scrollHeight: div.scrollHeight,
+                clientHeight: div.clientHeight,
+                scrollTop: div.scrollTop,
+                links: div.querySelectorAll('a[href^="/"]').length,
+              });
+            }
+          }
+          return {
+            ok: true,
+            dialogScrollHeight: dialog.scrollHeight,
+            dialogClientHeight: dialog.clientHeight,
+            dialogScrollTop: dialog.scrollTop,
+            scrollables,
+          };
+        });
+
       const scrollIncrementally = () =>
         page.evaluate((chunkPx) => {
           const dialog = document.querySelector('[role="dialog"]');
@@ -478,17 +541,50 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           if (!scrollTarget) return { scrolled: false };
           const prev = scrollTarget.scrollTop;
           scrollTarget.scrollTop = Math.min(scrollTarget.scrollTop + chunkPx, scrollTarget.scrollHeight);
-          return { scrolled: scrollTarget.scrollTop !== prev };
+          return {
+            scrolled: scrollTarget.scrollTop !== prev,
+            debug: {
+              scrollHeight: scrollTarget.scrollHeight,
+              clientHeight: scrollTarget.clientHeight,
+              scrollTopBefore: prev,
+              scrollTopAfter: scrollTarget.scrollTop,
+            },
+          };
         }, SCROLL_CHUNK_PX);
 
       let anyScrollThisIter = false;
       for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-        const { scrolled } = await scrollIncrementally();
+        const result = await scrollIncrementally();
+        const scrolled = result.scrolled;
         if (scrolled) anyScrollThisIter = true;
+        if (SCRAPER_DEBUG && c === 0) {
+          const dbg = await getScrollDebug();
+          logger.log(
+            `[Scraper] Scroll iter ${scrollCount} chunk 0: scrolled=${scrolled}` +
+              (result.debug ? ` target h=${result.debug.scrollHeight} ch=${result.debug.clientHeight} top=${result.debug.scrollTopAfter}` : ' no target') +
+              ` | dialog: ${dbg.ok ? `h=${dbg.dialogScrollHeight} ch=${dbg.dialogClientHeight}` : 'none'}` +
+              ` | scrollables: ${dbg.scrollables.length}`
+          );
+          if (dbg.scrollables.length > 0 && dbg.scrollables.length <= 5) {
+            dbg.scrollables.forEach((s, i) => {
+              logger.log(`[Scraper]   scrollable[${i}]: h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
+            });
+          }
+        }
         await delay(SCROLL_CHUNK_DELAY_MS);
       }
 
       if (!anyScrollThisIter) {
+        const dbg = await getScrollDebug();
+          logger.log(
+            `[Scraper] At bottom (iter ${scrollCount}): dialog h=${dbg.ok ? dbg.dialogScrollHeight : '?'} ch=${dbg.ok ? dbg.dialogClientHeight : '?'}` +
+              ` | scrollables: ${dbg.scrollables.length}`
+          );
+        if (SCRAPER_DEBUG && dbg.scrollables.length > 0) {
+          dbg.scrollables.forEach((s, i) => {
+            logger.log(`[Scraper]   [${i}] h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
+          });
+        }
         const wheelScrolled = await page.evaluate(() => {
           const dialog = document.querySelector('[role="dialog"]');
           if (!dialog) return false;
@@ -541,7 +637,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           loadRetries++;
         }
         if (!anyScrollThisIter) {
-          logger.log('[Scraper] No more scrollable content');
+          const finalDbg = await getScrollDebug();
+          logger.log(
+            `[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries. ` +
+              `Dialog: h=${finalDbg.ok ? finalDbg.dialogScrollHeight : '?'} ch=${finalDbg.ok ? finalDbg.dialogClientHeight : '?'}. ` +
+              `Scrollables: ${finalDbg.scrollables.length}`
+          );
           break;
         }
       }
