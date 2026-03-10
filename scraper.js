@@ -28,6 +28,9 @@ const SCRAPE_DELAY_MAX_MS = 5000;
 const SCROLL_PAUSE_MS = 1500;
 const LOAD_WAIT_MS = 3000;
 const LOAD_WAIT_RETRIES = 3;
+const SCROLL_CHUNK_PX = 300;
+const SCROLL_CHUNKS_PER_ITER = 8;
+const SCROLL_CHUNK_DELAY_MS = 600;
 const HEADLESS = process.env.SCRAPER_HEADLESS !== 'false';
 
 function delay(ms) {
@@ -228,6 +231,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log('[Scraper] Followers modal opened, extracting...');
     await delay(randomDelay(2500, 5000));
+    await page.evaluate(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      if (dialog) {
+        dialog.focus();
+        for (let i = 0; i < 3; i++) {
+          dialog.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, bubbles: true }));
+        }
+      }
+    });
+    await delay(1500);
 
     const saveLoginDismissed = await page.evaluate(function () {
       const dialogs = document.querySelectorAll('[role="dialog"]');
@@ -440,66 +453,99 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       scrollCount++;
-      const scrollToBottom = () =>
-        page.evaluate(() => {
+      const scrollIncrementally = () =>
+        page.evaluate((chunkPx) => {
+          const dialog = document.querySelector('[role="dialog"]');
+          if (!dialog) return { scrolled: false };
+          let scrollTarget = null;
+          let maxLinks = 0;
+          for (const div of dialog.querySelectorAll('div')) {
+            const links = div.querySelectorAll('a[href^="/"]');
+            if (links.length > maxLinks && div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
+              maxLinks = links.length;
+              scrollTarget = div;
+            }
+          }
+          if (!scrollTarget && dialog.scrollHeight > dialog.clientHeight) scrollTarget = dialog;
+          if (!scrollTarget) {
+            for (const div of dialog.querySelectorAll('div')) {
+              if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
+                scrollTarget = div;
+                break;
+              }
+            }
+          }
+          if (!scrollTarget) return { scrolled: false };
+          const prev = scrollTarget.scrollTop;
+          scrollTarget.scrollTop = Math.min(scrollTarget.scrollTop + chunkPx, scrollTarget.scrollHeight);
+          return { scrolled: scrollTarget.scrollTop !== prev };
+        }, SCROLL_CHUNK_PX);
+
+      let anyScrollThisIter = false;
+      for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
+        const { scrolled } = await scrollIncrementally();
+        if (scrolled) anyScrollThisIter = true;
+        await delay(SCROLL_CHUNK_DELAY_MS);
+      }
+
+      if (!anyScrollThisIter) {
+        const wheelScrolled = await page.evaluate(() => {
           const dialog = document.querySelector('[role="dialog"]');
           if (!dialog) return false;
-          const scrollables = dialog.querySelectorAll('div');
-          for (const s of scrollables) {
-            const style = window.getComputedStyle(s);
-            const overflow = style.overflowY || style.overflow || '';
-            const canScroll = s.scrollHeight > s.clientHeight;
-            if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && canScroll) {
-              const prev = s.scrollTop;
-              s.scrollTop = s.scrollHeight;
-              return s.scrollTop !== prev || s.scrollHeight > s.clientHeight;
-            }
+          dialog.focus();
+          const targets = [dialog, ...dialog.querySelectorAll('div')].filter((el) => el.clientHeight > 80);
+          for (const el of targets) {
+            el.dispatchEvent(new WheelEvent('wheel', { deltaY: 400, bubbles: true }));
           }
-          for (const s of scrollables) {
-            if (s.scrollHeight > s.clientHeight && s.clientHeight > 100) {
-              s.scrollTop = s.scrollHeight;
-              return true;
-            }
-          }
-          const prev = dialog.scrollTop;
-          dialog.scrollTop = dialog.scrollHeight;
-          return dialog.scrollTop !== prev;
+          return true;
         });
+        if (wheelScrolled) await delay(800);
+        await page.evaluate(() => {
+          const dialog = document.querySelector('[role="dialog"]');
+          if (dialog) dialog.focus();
+        });
+        for (let k = 0; k < 4; k++) {
+          await page.keyboard.press('PageDown');
+          await delay(400);
+        }
+        const { scrolled: kbdScrolled } = await page.evaluate(() => {
+          const dialog = document.querySelector('[role="dialog"]');
+          if (!dialog) return { scrolled: false };
+          let anyScroll = false;
+          for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
+            if (el.scrollHeight > el.clientHeight && el.clientHeight > 80) {
+              const prev = el.scrollTop;
+              el.scrollTop = el.scrollHeight;
+              if (el.scrollTop !== prev) anyScroll = true;
+            }
+          }
+          return { scrolled: anyScroll };
+        });
+        if (kbdScrolled) anyScrollThisIter = true;
+      }
 
-      let scrolled = await scrollToBottom();
-
-      if (!scrolled) {
+      if (!anyScrollThisIter) {
         let loadRetries = 0;
         while (loadRetries < LOAD_WAIT_RETRIES) {
           logger.log(`[Scraper] At bottom, waiting ${LOAD_WAIT_MS}ms for loading to finish...`);
           await delay(LOAD_WAIT_MS);
-          scrolled = await scrollToBottom();
-          if (scrolled) {
+          for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
+            const { scrolled } = await scrollIncrementally();
+            if (scrolled) anyScrollThisIter = true;
+            await delay(SCROLL_CHUNK_DELAY_MS);
+          }
+          if (anyScrollThisIter) {
             logger.log('[Scraper] More content loaded, continuing scroll');
             break;
           }
           loadRetries++;
         }
-        if (!scrolled) {
+        if (!anyScrollThisIter) {
           logger.log('[Scraper] No more scrollable content');
           break;
         }
       }
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
-
-      await page.evaluate(() => {
-        const dialog = document.querySelector('[role="dialog"]');
-        if (dialog) {
-          const scrollables = dialog.querySelectorAll('div');
-          for (const s of scrollables) {
-            if (s.scrollHeight > s.clientHeight) {
-              s.scrollTop = s.scrollHeight;
-              break;
-            }
-          }
-        }
-      });
-      await delay(800 + Math.floor(Math.random() * 1200));
     }
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
