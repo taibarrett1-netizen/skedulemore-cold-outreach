@@ -297,7 +297,7 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
-async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null) {
+async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null, messageGroupMessageId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const u = normalizeUsername(username);
@@ -310,6 +310,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
   };
   if (campaignId) insertPayload.campaign_id = campaignId;
   if (messageGroupId) insertPayload.message_group_id = messageGroupId;
+  if (messageGroupMessageId) insertPayload.message_group_message_id = messageGroupMessageId;
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
 
@@ -1005,11 +1006,12 @@ async function getRandomMessageFromGroup(messageGroupId) {
   if (!sb || !messageGroupId) return null;
   const { data, error } = await sb
     .from('cold_dm_message_group_messages')
-    .select('message_text')
+    .select('id, message_text')
     .eq('message_group_id', messageGroupId)
     .order('sort_order', { ascending: true });
   if (error || !data || data.length === 0) return null;
-  return data[Math.floor(Math.random() * data.length)].message_text;
+  const row = data[Math.floor(Math.random() * data.length)];
+  return { id: row.id, message_text: row.message_text };
 }
 
 async function getMessageTemplateById(templateId) {
@@ -1033,8 +1035,13 @@ async function getNextPendingCampaignLead(clientId) {
     const campaignTz = camp.timezone ?? null;
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     let messageText = null;
+    let messageGroupMessageId = null;
     if (camp.message_group_id) {
-      messageText = await getRandomMessageFromGroup(camp.message_group_id);
+      const groupMsg = await getRandomMessageFromGroup(camp.message_group_id);
+      if (groupMsg) {
+        messageText = groupMsg.message_text;
+        messageGroupMessageId = groupMsg.id;
+      }
     }
     if (!messageText && camp.message_template_id) {
       messageText = await getMessageTemplateById(camp.message_template_id);
@@ -1118,6 +1125,7 @@ async function getNextPendingCampaignLead(clientId) {
       last_name: leadRow.last_name ?? null,
       messageText,
       messageGroupId: camp.message_group_id || null,
+      messageGroupMessageId: messageGroupMessageId || null,
       dailySendLimit: camp.daily_send_limit,
       hourlySendLimit: camp.hourly_send_limit,
       minDelaySec: camp.min_delay_sec,

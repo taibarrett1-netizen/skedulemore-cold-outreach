@@ -514,7 +514,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
 }
 
 async function sendDM(page, username, adapter, options = {}) {
-  const { messageOverride, campaignId, campaignLeadId, messageGroupId, dailySendLimit, hourlySendLimit } = options;
+  const { messageOverride, campaignId, campaignLeadId, messageGroupId, messageGroupMessageId, dailySendLimit, hourlySendLimit } = options;
   const u = normalizeUsername(username);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
@@ -538,7 +538,7 @@ async function sendDM(page, username, adapter, options = {}) {
   }
 
   const messageTemplate = messageOverride || adapter.getRandomMessage();
-  const logSent = (status, finalMsg) => adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId);
+  const logSent = (status, finalMsg) => adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId);
 
   let lastError;
   const nameFallback = { first_name: options.first_name, last_name: options.last_name };
@@ -599,8 +599,8 @@ async function buildAdapterForClient(clientId) {
     dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
     maxPerHour: settings?.max_sends_per_hour ?? 20,
     alreadySent: (u) => sb.alreadySent(clientId, u),
-    logSentMessage: (u, msg, status, campaignId, messageGroupId) =>
-      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId),
+    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId) =>
+      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId),
     getDailyStats: () => sb.getDailyStats(clientId),
     getHourlySent: () => sb.getHourlySent(clientId),
     getControl: () => sb.getControl(clientId),
@@ -730,6 +730,7 @@ async function runBotMultiTenant() {
       campaignId: work.campaignId,
       campaignLeadId: work.campaignLeadId,
       messageGroupId: work.messageGroupId,
+      messageGroupMessageId: work.messageGroupMessageId,
       dailySendLimit: work.dailySendLimit,
       hourlySendLimit: work.hourlySendLimit,
       minDelaySec: work.minDelaySec,
