@@ -27,7 +27,7 @@ const SCRAPE_DELAY_MIN_MS = 2000;
 const SCRAPE_DELAY_MAX_MS = 5000;
 const SCROLL_PAUSE_MS = 1500;
 const LOAD_WAIT_MS = 4000;
-const LOAD_WAIT_RETRIES = 8;
+const LOAD_WAIT_RETRIES = 3;
 const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
 const SCROLL_CHUNK_DELAY_MS = 600;
@@ -274,37 +274,30 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     });
     await delay(1500);
 
-    const saveLoginDismissed = await page.evaluate(function () {
+    const saveLoginHandled = await page.evaluate(function () {
       const dialogs = document.querySelectorAll('[role="dialog"]');
       let saveLoginDialog = null;
-      let followersDialog = null;
       for (let i = 0; i < dialogs.length; i++) {
         const d = dialogs[i];
         const txt = (d.textContent || '').toLowerCase();
-        const profileLinks = d.querySelectorAll('a[href^="/"]');
-        const validLinks = Array.from(profileLinks).filter((a) => {
-          const h = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-          return h && h[1].length >= 2 && h[1].length <= 30 && /^[a-z0-9._]+$/.test(h[1].toLowerCase());
-        });
         if (txt.indexOf('save your login info') !== -1 && txt.indexOf('not now') !== -1) {
           saveLoginDialog = d;
-        } else if (validLinks.length >= 10) {
-          followersDialog = d;
+          break;
         }
       }
-      if (saveLoginDialog && followersDialog && saveLoginDialog !== followersDialog) {
-        const notNow = Array.from(saveLoginDialog.querySelectorAll('span, div[role="button"], button')).find(function (el) {
-          return (el.textContent || '').trim().toLowerCase() === 'not now';
+      if (saveLoginDialog) {
+        const saveInfo = Array.from(saveLoginDialog.querySelectorAll('span, div[role="button"], button')).find(function (el) {
+          return (el.textContent || '').trim().toLowerCase() === 'save info';
         });
-        if (notNow) {
-          const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+        if (saveInfo) {
+          const btn = saveInfo.closest('[role="button"]') || saveInfo.closest('button') || saveInfo;
           if (btn) { btn.click(); return true; }
         }
       }
       return false;
     });
-    if (saveLoginDismissed) {
-      logger.log('[Scraper] Dismissed Save login info dialog');
+    if (saveLoginHandled) {
+      logger.log('[Scraper] Clicked Save info on login dialog');
       await delay(randomDelay(1000, 2000));
     }
 
