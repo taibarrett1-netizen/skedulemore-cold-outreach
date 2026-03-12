@@ -401,22 +401,6 @@ async function setControl(clientId, pause) {
 }
 
 /**
- * Pause all clients on worker startup. Ensures that after pm2 restart (or any worker restart),
- * no client sends until the user explicitly clicks Start on a campaign in the dashboard.
- */
-async function pauseAllClientsOnWorkerStart() {
-  const sb = getSupabase();
-  if (!sb) return;
-  try {
-    const { error } = await sb.from('cold_dm_control').update({ pause: 1, updated_at: new Date().toISOString() });
-    if (error) throw error;
-    console.log('[Supabase] Paused all clients on worker start (user must click Start on campaign to resume).');
-  } catch (e) {
-    console.warn('[Supabase] pauseAllClientsOnWorkerStart failed:', e?.message || e);
-  }
-}
-
-/**
  * Set a human-readable status message for this client (e.g. "Sending…", "Hourly limit reached. Next send in ~60 min.").
  * Dashboard can display this for running campaigns.
  */
@@ -1228,7 +1212,6 @@ module.exports = {
   getHourlySent,
   getControl,
   setControl,
-  pauseAllClientsOnWorkerStart,
   setClientStatusMessage,
   getClientStatusMessage,
   getRecentSent,
