@@ -771,33 +771,41 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
               }
             }
           }
-          if (!scrollTarget) {
-            return {
-              scrolled: false,
-              debug: {
-                scrollTargetFound: false,
-                scrollHeight: null,
-                clientHeight: null,
-                scrollTop: null,
-                noOverflow: true,
-                targetInfo: null,
-              },
-            };
+          const scrollables = [];
+          if (scrollTarget) scrollables.push(scrollTarget);
+          for (const div of dialog.querySelectorAll('div')) {
+            if (div.scrollHeight > div.clientHeight && div.clientHeight > 80 && !scrollables.includes(div)) {
+              scrollables.push(div);
+            }
           }
-          const prev = scrollTarget.scrollTop;
-          const newTop = Math.min(scrollTarget.scrollTop + chunkPx, scrollTarget.scrollHeight);
-          scrollTarget.scrollTop = newTop;
-          const didScroll = scrollTarget.scrollTop !== prev;
+          let didScroll = false;
+          let debugTarget = scrollTarget;
+          for (const el of scrollables) {
+            const prev = el.scrollTop;
+            el.scrollBy(0, chunkPx);
+            if (el.scrollTop !== prev) {
+              didScroll = true;
+              debugTarget = el;
+              break;
+            }
+          }
+          if (!didScroll && scrollTarget) {
+            const prevTop = scrollTarget.scrollTop;
+            scrollTarget.focus();
+            scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaY: chunkPx, bubbles: true, cancelable: true }));
+            if (scrollTarget.scrollTop !== prevTop) didScroll = true;
+          }
+          if (!debugTarget) debugTarget = scrollTarget;
           return {
             scrolled: didScroll,
             debug: {
-              scrollTargetFound: true,
-              scrollHeight: scrollTarget.scrollHeight,
-              clientHeight: scrollTarget.clientHeight,
-              scrollTopBefore: prev,
-              scrollTopAfter: scrollTarget.scrollTop,
-              noOverflow: scrollTarget.scrollHeight <= scrollTarget.clientHeight,
-              targetInfo: { tagName: scrollTarget.tagName, className: (scrollTarget.className || '').slice(0, 80), id: scrollTarget.id || null },
+              scrollTargetFound: !!scrollTarget,
+              scrollHeight: debugTarget ? debugTarget.scrollHeight : null,
+              clientHeight: debugTarget ? debugTarget.clientHeight : null,
+              scrollTopBefore: null,
+              scrollTopAfter: debugTarget ? debugTarget.scrollTop : null,
+              noOverflow: debugTarget ? debugTarget.scrollHeight <= debugTarget.clientHeight : true,
+              targetInfo: debugTarget ? { tagName: debugTarget.tagName, className: (debugTarget.className || '').slice(0, 80), id: debugTarget.id || null } : null,
             },
           };
         }, SCROLL_CHUNK_PX);
@@ -1115,7 +1123,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           logger.log(
             `[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries. ` +
               `Dialog: h=${finalDbg.ok ? finalDbg.dialogScrollHeight : '?'} ch=${finalDbg.ok ? finalDbg.dialogClientHeight : '?'}. ` +
-              `Scrollables: ${finalDbg.scrollables.length}`
+              `Scrollables: ${finalDbg.scrollables.length}. ` +
+              `Tip: Try SCRAPER_USE_DESKTOP=1 if mobile scroll keeps failing.`
           );
           if (hadNoNewThisIter) noNewCount++;
           break;
