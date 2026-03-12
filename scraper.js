@@ -310,6 +310,19 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
     let firstNoScrollTargetDumped = false;
+    let firstAtBottomScreenshot = false;
+
+    const saveDebugScreenshot = async (label) => {
+      if (!SCRAPER_DEBUG) return;
+      try {
+        const fs = require('fs');
+        const screenshotPath = path.join(process.cwd(), `scraper-debug-${label}.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: false });
+        logger.log(`[Scraper] DEBUG: Screenshot saved to ${screenshotPath}`);
+      } catch (e) {
+        logger.warn('[Scraper] DEBUG: Could not save screenshot: ' + e.message);
+      }
+    };
 
     const getScrollablesDomSummary = () =>
       page.evaluate(() => {
@@ -404,6 +417,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     };
 
     await logScrollDebug('Initial modal state');
+    await saveDebugScreenshot('01-modal-opened');
 
     let totalScraped = 0;
     const seenUsernames = new Set();
@@ -835,6 +849,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       if (!anyScrollThisIter) {
+        if (SCRAPER_DEBUG && !firstAtBottomScreenshot) {
+          firstAtBottomScreenshot = true;
+          await saveDebugScreenshot('02-at-bottom');
+        }
         const dbg = await getScrollDebug();
           logger.log(
             `[Scraper] At bottom (iter ${scrollCount}): dialog h=${dbg.ok ? dbg.dialogScrollHeight : '?'} ch=${dbg.ok ? dbg.dialogClientHeight : '?'}` +
@@ -1057,6 +1075,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           loadRetries++;
         }
         if (!anyScrollThisIter) {
+          await saveDebugScreenshot('03-exhausted-retries');
           const finalDbg = await getScrollDebug();
           logger.log(
             `[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries. ` +
