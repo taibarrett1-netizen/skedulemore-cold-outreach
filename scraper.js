@@ -101,12 +101,13 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
-    const useDesktop = process.env.SCRAPER_USE_DESKTOP === '1' || process.env.SCRAPER_USE_DESKTOP === 'true';
-    if (useDesktop) {
-      await page.setViewport({ width: 1280, height: 800 });
-      logger.log('[Scraper] Using desktop viewport (SCRAPER_USE_DESKTOP=1)');
-    } else {
+    const useMobile = process.env.SCRAPER_USE_MOBILE === '1' || process.env.SCRAPER_USE_MOBILE === 'true';
+    if (useMobile) {
       await applyMobileEmulation(page);
+      logger.log('[Scraper] Using mobile viewport (SCRAPER_USE_MOBILE=1)');
+    } else {
+      await page.setViewport({ width: 1280, height: 800 });
+      logger.log('[Scraper] Using desktop viewport for follower scrape (mobile scroll fails)');
     }
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
