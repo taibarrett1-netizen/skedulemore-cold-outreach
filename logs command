@@ -7,3 +7,6 @@ For both dashboard and bot:
 pm2 logs --lines 0
 
 cd ~/ColdDMs && git pull origin main && npm install && pm2 restart all
+
+cd /root/ColdDMs
+python3 -m http.server 8080

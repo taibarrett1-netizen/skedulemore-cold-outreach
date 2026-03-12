@@ -803,7 +803,49 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         }, SCROLL_CHUNK_PX);
 
       let anyScrollThisIter = false;
+      const scrollLastIntoView = async () => {
+        const rect = await page.evaluate(() => {
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
+          let root = null;
+          let bestCount = 0;
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              root = d;
+            }
+          }
+          if (bestCount < 5) return null;
+          const links = root.querySelectorAll('a[href^="/"]');
+          const lastLink = links[links.length - 1];
+          if (!lastLink) return null;
+          lastLink.scrollIntoView({ block: 'end', behavior: 'instant' });
+          const r = lastLink.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        });
+        return rect;
+      };
       for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
+        const lastRect = await scrollLastIntoView();
+        if (lastRect) {
+          await delay(200);
+          try {
+            await page.mouse.move(lastRect.x, lastRect.y);
+            for (let w = 0; w < 3; w++) {
+              await page.mouse.wheel({ deltaY: 300 });
+              await delay(100);
+            }
+            anyScrollThisIter = true;
+          } catch (e) {
+          }
+        }
         const result = await scrollIncrementally();
         const scrolled = result.scrolled;
         if (scrolled) anyScrollThisIter = true;
