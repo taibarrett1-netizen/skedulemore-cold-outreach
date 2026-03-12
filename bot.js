@@ -435,35 +435,11 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
   }
 
-  const displayNameFromPage = await page.evaluate(() => {
-    const body = document.body && document.body.innerText;
-    if (!body) return null;
-    const words = body.split(/\s+/).filter(Boolean);
-    for (let i = 0; i < words.length; i++) {
-      const w = words[i];
-      if (w.length >= 2 && w.length <= 30 && w === w.toLowerCase() && /^[a-z0-9._]+$/.test(w) && !/^https?:\/\//.test(w)) {
-        const before = words.slice(Math.max(0, i - 10), i);
-        if (before.length === 0) return null;
-        const fullName = before.join(' ');
-        const first = before[0] || '';
-        const last = before.length > 1 ? before.slice(1).join(' ') : '';
-        return { full_name: fullName, first_name: first, last_name: last };
-      }
-    }
-    return null;
-  });
-
-  const first = displayNameFromPage?.first_name ?? nameFallback.first_name ?? null;
-  const last = displayNameFromPage?.last_name ?? nameFallback.last_name ?? null;
-  const fullName =
-    displayNameFromPage?.full_name ??
-    (nameFallback.first_name || nameFallback.last_name ? [nameFallback.first_name, nameFallback.last_name].filter(Boolean).join(' ') : null) ??
-    null;
   const leadFromPage = {
     username: u,
-    first_name: first,
-    last_name: last,
-    full_name: fullName,
+    first_name: nameFallback.first_name ?? null,
+    last_name: nameFallback.last_name ?? null,
+    display_name: nameFallback.display_name ?? null,
   };
   const msg = substituteVariables(messageTemplate, leadFromPage);
 
@@ -551,7 +527,11 @@ async function sendDM(page, username, adapter, options = {}) {
   const logSent = (status, finalMsg) => adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId);
 
   let lastError;
-  const nameFallback = { first_name: options.first_name, last_name: options.last_name };
+  const nameFallback = {
+    first_name: options.first_name,
+    last_name: options.last_name,
+    display_name: options.display_name,
+  };
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback);
@@ -750,6 +730,7 @@ async function runBotMultiTenant() {
       maxDelaySec: work.maxDelaySec,
       first_name: work.first_name,
       last_name: work.last_name,
+      display_name: work.display_name,
     };
     sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
     const sendResult = await sendDM(page, work.username, adapter, options);

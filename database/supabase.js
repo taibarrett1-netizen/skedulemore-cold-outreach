@@ -972,12 +972,13 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
     let last_name = null;
     if (displayName && typeof displayName === 'string') {
       const trimmed = displayName.trim();
+      const firstWord = trimmed.split(/\s+/)[0] || null;
       const spaceIdx = trimmed.indexOf(' ');
       if (spaceIdx > 0) {
-        first_name = trimmed.slice(0, spaceIdx).trim();
+        first_name = firstWord;
         last_name = trimmed.slice(spaceIdx + 1).trim();
       } else {
-        first_name = trimmed;
+        first_name = firstWord;
       }
     }
     const row = {
@@ -987,6 +988,7 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
       added_at: new Date().toISOString(),
     };
     if (leadGroupId) row.lead_group_id = leadGroupId;
+    if (displayName && typeof displayName === 'string') row.display_name = displayName;
     if (first_name != null) row.first_name = first_name;
     if (last_name != null) row.last_name = last_name;
     return row;
@@ -1133,7 +1135,7 @@ async function getNextPendingCampaignLead(clientId) {
       if (error || !pendingRow?.lead_id) break;
       const { data: leadData } = await sb
         .from('cold_dm_leads')
-        .select('username, first_name, last_name')
+        .select('username, first_name, last_name, display_name')
         .eq('id', pendingRow.lead_id)
         .eq('client_id', clientId)
         .maybeSingle();
@@ -1165,6 +1167,7 @@ async function getNextPendingCampaignLead(clientId) {
       username: normalizeUsername(leadRow.username),
       first_name: leadRow.first_name ?? null,
       last_name: leadRow.last_name ?? null,
+      display_name: leadRow.display_name ?? null,
       messageText,
       messageGroupId: camp.message_group_id || null,
       messageGroupMessageId: messageGroupMessageId || null,
