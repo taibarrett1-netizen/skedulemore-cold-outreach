@@ -115,7 +115,7 @@ app.get('/api/status', (req, res) => {
         ]);
         send(200, {
           processRunning,
-          statusMessage: statusMessage ?? null,
+          statusMessage: processRunning ? (statusMessage ?? null) : 'Stopped',
           todaySent: stats.total_sent,
           todayFailed: stats.total_failed,
           leadsTotal: leadsCounts.total,
