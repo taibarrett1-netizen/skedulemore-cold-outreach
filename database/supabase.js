@@ -1222,6 +1222,55 @@ async function getNextPendingCampaignLead(clientId) {
   return null;
 }
 
+/**
+ * Add all leads from the campaign's lead groups into cold_dm_campaign_leads (status pending).
+ * Only inserts when no row exists (ignores existing sent/failed). Returns count of rows inserted.
+ */
+async function addCampaignLeadsFromGroups(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return 0;
+
+  const { data: camp } = await sb
+    .from('cold_dm_campaigns')
+    .select('id')
+    .eq('id', campaignId)
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (!camp) return 0;
+
+  const { data: leadGroupRows } = await sb
+    .from('cold_dm_campaign_lead_groups')
+    .select('lead_group_id')
+    .eq('campaign_id', campaignId);
+  const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+  if (leadGroupIds.length === 0) return 0;
+
+  const { data: leadRows } = await sb
+    .from('cold_dm_leads')
+    .select('id')
+    .eq('client_id', clientId)
+    .in('lead_group_id', leadGroupIds);
+  if (!leadRows || leadRows.length === 0) return 0;
+
+  let added = 0;
+  for (const lead of leadRows) {
+    const { data: existing } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('id')
+      .eq('campaign_id', campaignId)
+      .eq('lead_id', lead.id)
+      .maybeSingle();
+    if (!existing) {
+      const { error } = await sb.from('cold_dm_campaign_leads').upsert(
+        { campaign_id: campaignId, lead_id: lead.id, status: 'pending' },
+        { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
+      );
+      if (!error) added += 1;
+    }
+  }
+  return added;
+}
+
 async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = null) {
   const sb = getSupabase();
   if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
@@ -1305,4 +1354,5 @@ module.exports = {
   getClientNoWorkResumeAt,
   getNoWorkHint,
   getFirstNameBlocklist,
+  addCampaignLeadsFromGroups,
 };

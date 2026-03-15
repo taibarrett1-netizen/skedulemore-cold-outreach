@@ -25,6 +25,7 @@ const {
   cancelScrapeJob,
   pickScraperSessionForJob,
   savePlatformScraperSession,
+  addCampaignLeadsFromGroups,
 } = require('./database/supabase');
 const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
@@ -397,6 +398,24 @@ app.post('/api/reset-failed', async (req, res) => {
     res.json({ ok: true, cleared });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Add all leads from the campaign's lead groups into cold_dm_campaign_leads (pending). Dashboard can call this when user clicks "Add all leads from groups".
+app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  const { campaignId, clientId } = req.body || {};
+  if (!campaignId || !clientId) {
+    return res.status(400).json({ ok: false, error: 'campaignId and clientId are required' });
+  }
+  try {
+    const added = await addCampaignLeadsFromGroups(clientId, campaignId);
+    return res.json({ ok: true, added });
+  } catch (e) {
+    console.error('[API] add-leads-from-groups', e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
