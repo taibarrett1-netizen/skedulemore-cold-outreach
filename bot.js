@@ -9,7 +9,7 @@ const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getContro
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
-const { substituteVariables } = require('./utils/message-variables');
+const { substituteVariables, normalizeName } = require('./utils/message-variables');
 
 puppeteer.use(StealthPlugin());
 
@@ -493,11 +493,47 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
   }
 
+  // When lead has no display_name/first_name in DB but template uses {{first_name}}/{{full_name}}, get name from thread page (e.g. "AI Setter Test 8 aisettertest8")
+  const templateUsesName = /\{\{\s*(first_name|full_name)\s*\}\}/i.test(messageTemplate);
+  let displayNameForSubst = nameFallback.display_name ?? nameFallback.first_name ?? null;
+  if (templateUsesName && !displayNameForSubst && (!nameFallback.display_name || !nameFallback.first_name)) {
+    try {
+      const extracted = await page.evaluate((username) => {
+        const body = document.body ? document.body.innerText : '';
+        const needle = username.replace(/^@/, '').toLowerCase();
+        const idx = body.toLowerCase().indexOf(needle);
+        if (idx > 0) {
+          const before = body.slice(0, idx).trim();
+          const lines = before.split(/\n/);
+          const lastPart = (lines[lines.length - 1] || '').trim();
+          const candidate = lastPart.length > 0 && lastPart.length <= 80 && !/^https?:\/\//i.test(lastPart) ? lastPart : (before.length > 0 && before.length <= 80 ? before : null);
+          if (candidate && !/^\d+$/.test(candidate)) return candidate;
+        }
+        return null;
+      }, u);
+      if (extracted) {
+        const firstWord = extracted.trim().split(/\s+/)[0] || '';
+        const normalizedFirst = normalizeName(firstWord);
+        const blocklist = sendOpts.firstNameBlocklist || new Set();
+        if (!normalizedFirst) {
+          logger.log(`Display name from thread for @${u} not used: first word normalized to empty`);
+        } else if (blocklist.has(normalizedFirst.toLowerCase())) {
+          logger.log(`Display name from thread for @${u} not used: first name "${normalizedFirst}" is blocklisted`);
+        } else {
+          displayNameForSubst = extracted;
+          logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
   const leadFromPage = {
     username: u,
     first_name: nameFallback.first_name ?? null,
     last_name: nameFallback.last_name ?? null,
-    display_name: nameFallback.display_name ?? null,
+    display_name: displayNameForSubst ?? nameFallback.display_name ?? null,
   };
   const msg = substituteVariables(messageTemplate, leadFromPage, {
     firstNameBlocklist: sendOpts.firstNameBlocklist || new Set(),
