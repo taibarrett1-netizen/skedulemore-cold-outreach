@@ -491,8 +491,7 @@ async function getNextPendingWorkAnyClient() {
 async function getClientOutsideScheduleStatus(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const [campaigns, settings] = await Promise.all([getActiveCampaigns(clientId), getSettings(clientId)]);
-  const settingsTz = settings?.timezone ?? null;
+  const campaigns = await getActiveCampaigns(clientId);
   let firstWindow = null;
   let tzLabel = 'UTC';
   let hasPending = false;
@@ -505,7 +504,7 @@ async function getClientOutsideScheduleStatus(clientId) {
       .eq('status', 'pending');
     if (err || (count ?? 0) === 0) continue;
     hasPending = true;
-    const campaignTz = camp.timezone ?? settingsTz ?? null;
+    const campaignTz = camp.timezone ?? null;
     const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
     if (inSchedule) {
       allOutside = false;
@@ -554,7 +553,6 @@ async function getClientNoWorkResumeAt(clientId) {
       : { count: 0 };
   if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending', resumeAt: null };
 
-  const settingsTz = settings?.timezone ?? null;
   let earliestScheduleResume = null;
   let firstWindow = null;
   let tzLabel = 'UTC';
@@ -566,7 +564,7 @@ async function getClientNoWorkResumeAt(clientId) {
       .eq('campaign_id', camp.id)
       .eq('status', 'pending');
     if ((campPending ?? 0) === 0) continue;
-    const campaignTz = camp.timezone ?? settingsTz ?? null;
+    const campaignTz = camp.timezone ?? null;
     const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
     if (inSchedule) {
       allOutside = false;
@@ -1086,9 +1084,8 @@ async function getNextPendingCampaignLead(clientId) {
   if (!sb || !clientId) return null;
   const settings = await getSettings(clientId);
   const campaigns = await getActiveCampaigns(clientId);
-  const settingsTz = settings?.timezone ?? null;
   for (const camp of campaigns) {
-    const campaignTz = camp.timezone ?? settingsTz ?? null;
+    const campaignTz = camp.timezone ?? null;
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     let messageText = null;
     let messageGroupMessageId = null;

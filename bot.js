@@ -32,6 +32,37 @@ async function humanDelay() {
   await delay(500 + Math.floor(Math.random() * 1500));
 }
 
+/** Extract Instagram thread id from direct URL (e.g. /direct/t/17843804841623833/). */
+function getInstagramThreadIdFromUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  const m = url.match(/\/direct\/t\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+/** Call cold-dm-on-send Edge Function so dashboard creates conversation with tag cold-outreach. */
+async function coldDmOnSend(payload) {
+  const baseUrl = process.env.SUPABASE_URL;
+  const apiKey = process.env.COLD_DM_API_KEY;
+  if (!baseUrl || !apiKey) return;
+  const url = `${baseUrl.replace(/\/$/, '')}/functions/v1/cold-dm-on-send`;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      logger.warn('cold-dm-on-send failed: ' + res.status + ' ' + errText);
+    }
+  } catch (e) {
+    logger.warn('cold-dm-on-send request error: ' + e.message);
+  }
+}
+
 function getHourlySent() {
   const { db } = require('./database/db');
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
@@ -487,7 +518,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       await humanDelay();
       await page.keyboard.press('Enter');
       await delay(1500);
-      return { ok: true, finalMessage: msg };
+      const threadId = getInstagramThreadIdFromUrl(page.url());
+      return { ok: true, finalMessage: msg, instagramThreadId: threadId };
     }
     await composeEl.dispose();
     logger.warn('Compose element not found after selector matched');
@@ -506,7 +538,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await humanDelay();
     await page.keyboard.press('Enter');
     await delay(1500);
-    return { ok: true, finalMessage: msg };
+    const threadId = getInstagramThreadIdFromUrl(page.url());
+    return { ok: true, finalMessage: msg, instagramThreadId: threadId };
   }
 
   return { ok: false, reason: noComposeReason || 'no_compose' };
@@ -557,6 +590,17 @@ async function sendDM(page, username, adapter, options = {}) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : messageTemplate;
         await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
+        if (options.clientId && result.instagramThreadId) {
+          coldDmOnSend({
+            client_id: options.clientId,
+            instagram_thread_id: result.instagramThreadId,
+            username: u,
+            message_text: finalMessage || undefined,
+            sent_at: new Date().toISOString(),
+            message_group_id: messageGroupId || undefined,
+            message_group_message_id: messageGroupMessageId || undefined,
+          }).catch(() => {});
+        }
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
       }
@@ -620,11 +664,9 @@ async function buildAdapterForClient(clientId) {
   return { adapter, minDelayMs, maxDelayMs };
 }
 
-// When there's no work we exit; user starts the bot again from the dashboard when they want to run.
-
 /**
- * Multi-tenant always-on loop: one worker serves all clients with pause=0 and pending work.
- * Never exits; sleeps and re-checks when no work.
+ * Multi-tenant loop: one worker serves all clients with pause=0 and pending work.
+ * Exits when there is no work; start again from the dashboard when you have a campaign to run.
  */
 async function runBotMultiTenant() {
   logger.log('Starting multi-tenant sender loop (always-on).');
