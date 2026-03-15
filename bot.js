@@ -43,7 +43,10 @@ function getInstagramThreadIdFromUrl(url) {
 async function coldDmOnSend(payload) {
   const baseUrl = process.env.SUPABASE_URL;
   const apiKey = process.env.COLD_DM_API_KEY;
-  if (!baseUrl || !apiKey) return;
+  if (!baseUrl || !apiKey) {
+    logger.warn('cold-dm-on-send skipped: SUPABASE_URL or COLD_DM_API_KEY not set');
+    return;
+  }
   const url = `${baseUrl.replace(/\/$/, '')}/functions/v1/cold-dm-on-send`;
   try {
     const res = await fetch(url, {
@@ -54,7 +57,9 @@ async function coldDmOnSend(payload) {
       },
       body: JSON.stringify(payload),
     });
-    if (!res.ok) {
+    if (res.ok) {
+      logger.log('cold-dm-on-send: ' + res.status + ' (conversation created or updated)');
+    } else {
       const errText = await res.text();
       if (res.status === 404) {
         logger.warn('cold-dm-on-send 404: Edge Function not deployed. Deploy "cold-dm-on-send" in your Supabase project so the dashboard can create cold-outreach conversations and match GHL contacts. See COLD_DM_HANDOFF.md §2a.');
