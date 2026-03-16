@@ -307,6 +307,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let totalScraped = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
+    // To avoid hammering one account with huge follower scrapes, insert a long cooldown
+    // after scraping a large chunk. Defaults: pause after each 1000 new leads.
+    const COOLDOWN_CHUNK = parseInt(process.env.SCRAPER_FOLLOWER_COOLDOWN_CHUNK || '1000', 10);
+    const COOLDOWN_MIN_MS = 45 * 60 * 1000;
+    const COOLDOWN_MAX_MS = 70 * 60 * 1000;
+    let scrapedSinceCooldown = 0;
     const MAX_NO_NEW = profileFollowerCount != null && profileFollowerCount > 100 ? 12 : 6;
     const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
       getConversationParticipantUsernames(clientId),
@@ -478,6 +484,17 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         await updateScrapeJob(jobId, { scraped_count: totalScraped });
         noNewCount = 0;
         logger.log(`[Scraper] Batch: +${newLeads.length} new, total ${totalScraped}`);
+        scrapedSinceCooldown += newLeads.length;
+        if (!effectiveMax && COOLDOWN_CHUNK > 0 && scrapedSinceCooldown >= COOLDOWN_CHUNK) {
+          const pauseMs = randomDelay(COOLDOWN_MIN_MS, COOLDOWN_MAX_MS);
+          logger.log(
+            `[Scraper] Long cooldown after ${scrapedSinceCooldown} new leads (total ${totalScraped}). Pausing for ${Math.round(
+              pauseMs / 60000
+            )} minutes before continuing.`
+          );
+          scrapedSinceCooldown = 0;
+          await delay(pauseMs);
+        }
         if (effectiveMax && totalScraped >= effectiveMax) {
           logger.log(`[Scraper] Reached limit (${effectiveMax}). Stopping.`);
           break;
