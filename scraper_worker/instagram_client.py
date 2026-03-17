@@ -1,6 +1,9 @@
+import base64
 import logging
 import os
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
 from instagrapi import Client
 from instagrapi.exceptions import ClientError
 from requests.cookies import create_cookie
@@ -23,12 +26,24 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
   proxy_url = (os.getenv("SCRAPER_PROXY_URL") or "").strip()
   if proxy_url:
     cl.set_proxy(proxy_url)
-    # Force both sessions to use the full proxy URL (with user:pass) so Proxy-Authorization is sent.
-    for session_attr in ("private", "public"):
-      sess = getattr(cl, session_attr, None)
-      if sess is not None and hasattr(sess, "proxies"):
-        sess.proxies = {"http": proxy_url, "https": proxy_url}
-        logger.info("Set proxy on %s (auth in URL)", session_attr)
+    # Set proxy on both sessions and add explicit Proxy-Authorization header (requests/urllib3
+    # sometimes drop auth from the URL on HTTPS CONNECT, causing 407).
+    try:
+      parsed = urlparse(proxy_url)
+      user, passwd = parsed.username or "", parsed.password or ""
+      auth_header = None
+      if user or passwd:
+        token = base64.b64encode(f"{user}:{passwd}".encode()).decode("ascii")
+        auth_header = f"Basic {token}"
+      for session_attr in ("private", "public"):
+        sess = getattr(cl, session_attr, None)
+        if sess is not None and hasattr(sess, "proxies"):
+          sess.proxies = {"http": proxy_url, "https": proxy_url}
+          if auth_header and hasattr(sess, "headers"):
+            sess.headers["Proxy-Authorization"] = auth_header
+          logger.info("Set proxy on %s (auth in URL + header)", session_attr)
+    except Exception as e:
+      logger.warning("Proxy auth setup failed: %s", e)
 
   cookies = (session_data or {}).get("cookies") or []
   if not cookies:
