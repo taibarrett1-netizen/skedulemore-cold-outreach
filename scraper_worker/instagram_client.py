@@ -35,6 +35,8 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
 
   jar = None
   for base, path in (
+    (getattr(cl, "private", None), ("cookies",)),  # instagrapi 2.x: private is Session with .cookies
+    (getattr(cl, "public", None), ("cookies",)),
     (cl, ("http", "cookies")),
     (getattr(cl, "private", None), ("session", "cookies")),
     (getattr(cl, "private", None), ("_session", "cookies")),
@@ -54,7 +56,13 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
       "Your instagrapi version may use a different structure; try upgrading: pip install -U instagrapi"
     )
 
-  # Map basic cookies into the underlying requests session.
+  # Collect all cookie jars we should update (instagrapi 2.x has private + public).
+  jars = [jar]
+  other = _get_jar(getattr(cl, "public", None), "cookies") if getattr(cl, "private", None) is not None else None
+  if other is not None and other is not jar and getattr(other, "set_cookie", None) is not None:
+    jars.append(other)
+
+  # Map basic cookies into the underlying requests session(s).
   for c in cookies:
     name = c.get("name")
     value = c.get("value")
@@ -62,7 +70,8 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
       continue
     domain = c.get("domain") or ".instagram.com"
     cookie = create_cookie(name=name, value=value, domain=domain)
-    jar.set_cookie(cookie)
+    for j in jars:
+      j.set_cookie(cookie)
 
   # Lightweight validation – ensure session is still valid.
   try:
