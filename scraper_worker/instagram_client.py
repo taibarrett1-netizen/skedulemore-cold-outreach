@@ -26,10 +26,35 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
   if not cookies:
     raise RuntimeError("No cookies found in session_data for scraper session.")
 
-  # Map basic cookies into the underlying requests session. This is a best-effort
-  # mapping; if IG changes cookie requirements you may need to adjust which cookies
-  # are set here.
-  jar = cl.http.cookies
+  # Find the requests session's cookie jar. Instagrapi 2.x uses different internal
+  # structure (e.g. private.session) so try several possible paths.
+  def _get_jar(obj, *attrs):
+    for attr in attrs:
+      obj = getattr(obj, attr, None) if obj is not None else None
+    return obj
+
+  jar = None
+  for base, path in (
+    (cl, ("http", "cookies")),
+    (getattr(cl, "private", None), ("session", "cookies")),
+    (getattr(cl, "private", None), ("_session", "cookies")),
+    (getattr(cl, "public", None), ("session", "cookies")),
+    (cl, ("_session", "cookies")),
+    (cl, ("session", "cookies")),
+  ):
+    if base is None:
+      continue
+    candidate = _get_jar(base, *path)
+    if candidate is not None and getattr(candidate, "set_cookie", None) is not None:
+      jar = candidate
+      break
+  if jar is None:
+    raise RuntimeError(
+      "Could not find requests session on instagrapi Client. "
+      "Your instagrapi version may use a different structure; try upgrading: pip install -U instagrapi"
+    )
+
+  # Map basic cookies into the underlying requests session.
   for c in cookies:
     name = c.get("name")
     value = c.get("value")
