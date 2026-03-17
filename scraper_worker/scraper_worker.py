@@ -432,7 +432,10 @@ def main(argv: List[str]) -> int:
       return 0
     except Exception as e:
       msg = str(e)
-      logger.exception("Job %s failed: %s", job["id"], msg)
+      # Log a single, grep-friendly line that always includes the job id and reason,
+      # then let logger.exception print the full traceback on the next lines.
+      logger.error("Job %s failed: %s", job["id"], msg)
+      logger.exception("Traceback for failed job %s", job["id"])
       try:
         update_scrape_job(conn, job["id"], status="failed", error_message=msg[:500])
       except Exception as update_err:
