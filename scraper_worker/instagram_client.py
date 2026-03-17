@@ -1,7 +1,6 @@
 import logging
 import os
 from typing import Any, Dict, Optional
-
 from instagrapi import Client
 from instagrapi.exceptions import ClientError
 from requests.cookies import create_cookie
@@ -21,10 +20,15 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
   """
   cl = Client()
 
-  proxy_url = os.getenv("SCRAPER_PROXY_URL")
+  proxy_url = (os.getenv("SCRAPER_PROXY_URL") or "").strip()
   if proxy_url:
-    # Optional proxy support stub
     cl.set_proxy(proxy_url)
+    # Force both sessions to use the full proxy URL (with user:pass) so Proxy-Authorization is sent.
+    for session_attr in ("private", "public"):
+      sess = getattr(cl, session_attr, None)
+      if sess is not None and hasattr(sess, "proxies"):
+        sess.proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info("Set proxy on %s (auth in URL)", session_attr)
 
   cookies = (session_data or {}).get("cookies") or []
   if not cookies:
