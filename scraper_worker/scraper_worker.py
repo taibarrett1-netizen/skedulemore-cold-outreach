@@ -112,6 +112,12 @@ def scrape_followers(conn, job: dict):
 
   logger.info("Follower scrape started: target=@%s job_id=%s", target_username, job.get("id"))
 
+   # Respect cancellation immediately, before warm-up or any API calls.
+  if _should_cancel(conn, job["id"]):
+    logger.info("Job cancelled before start. Exiting without API calls.")
+    update_scrape_job(conn, job["id"], status="cancelled", scraped_count=int(job.get("scraped_count") or 0))
+    return
+
   _sleep_warmup()
 
   platform_session_id = job.get("platform_scraper_session_id")
@@ -280,6 +286,11 @@ def scrape_followers_via_graphql(conn, job: dict):
     target_username,
     job.get("id"),
   )
+
+  if _should_cancel(conn, job["id"]):
+    logger.info("[GraphQL] Job cancelled before start. Exiting without API calls.")
+    update_scrape_job(conn, job["id"], status="cancelled", scraped_count=int(job.get("scraped_count") or 0))
+    return
 
   _sleep_warmup()
 
