@@ -13,6 +13,7 @@ require('dotenv').config();
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const path = require('path');
+const fs = require('fs');
 const {
   getScraperSession,
   saveScraperSession,
@@ -242,7 +243,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }, cleanTarget);
 
     if (!followersLinkClicked) {
-      logger.error('[Scraper] Could not open followers modal');
+      // Capture a screenshot to debug new layouts/popups blocking the followers modal.
+      try {
+        const debugDir = path.join(process.cwd(), 'scraper-debug');
+        if (!fs.existsSync(debugDir)) {
+          fs.mkdirSync(debugDir, { recursive: true });
+        }
+        const screenshotPath = path.join(
+          debugDir,
+          `followers_modal_fail_${String(jobId)}.png`
+        );
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        logger.error('[Scraper] Could not open followers modal – screenshot saved at %s', screenshotPath);
+      } catch (screenshotErr) {
+        logger.error('[Scraper] Failed to capture screenshot on followers modal error: %s', screenshotErr.message);
+      }
       await updateScrapeJob(jobId, {
         status: 'failed',
         error_message: 'Could not open followers list. Profile may be private or link not found.',
