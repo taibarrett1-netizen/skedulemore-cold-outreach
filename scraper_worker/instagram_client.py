@@ -3,6 +3,7 @@ from typing import Any, Dict, Optional
 
 from instagrapi import Client
 from instagrapi.exceptions import ClientError
+from requests.cookies import create_cookie
 
 
 def build_client_from_session(session_data: Dict[str, Any], instagram_username: Optional[str] = None) -> Client:
@@ -25,15 +26,18 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
   if not cookies:
     raise RuntimeError("No cookies found in session_data for scraper session.")
 
-  # Map basic cookies into the client. This is a best-effort mapping; if IG changes
-  # cookie requirements you may need to adjust which cookies are set here.
+  # Map basic cookies into the underlying requests session. This is a best-effort
+  # mapping; if IG changes cookie requirements you may need to adjust which cookies
+  # are set here.
+  jar = cl.http.cookies
   for c in cookies:
     name = c.get("name")
     value = c.get("value")
     if not name or value is None:
       continue
     domain = c.get("domain") or ".instagram.com"
-    cl.set_cookie(name=name, value=value, domain=domain)
+    cookie = create_cookie(name=name, value=value, domain=domain)
+    jar.set_cookie(cookie)
 
   # Lightweight validation – ensure session is still valid.
   try:

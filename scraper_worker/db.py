@@ -93,7 +93,8 @@ def update_scrape_job(conn, job_id, **fields):
   # If status is terminal, also set finished_at.
   status = fields.get("status")
   if status in ("completed", "failed", "cancelled") and "finished_at" not in fields:
-    fields["finished_at"] = psycopg2.extras.TimestampFromTicks(0)  # replaced by NOW()
+    # Use a simple sentinel; the actual value is always set to NOW() in the SQL.
+    fields["finished_at"] = True
 
   set_clauses = []
   values = []
