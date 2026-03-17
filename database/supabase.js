@@ -293,16 +293,17 @@ async function getSessionsForCampaign(clientId, campaignId) {
 async function saveSession(clientId, sessionData, instagramUsername) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const username = (instagramUsername || '').trim().replace(/^@/, '');
   const { error } = await sb
     .from('cold_dm_instagram_sessions')
     .upsert(
       {
         client_id: clientId,
         session_data: sessionData,
-        instagram_username: instagramUsername || null,
+        instagram_username: username || null,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'client_id' }
+      { onConflict: 'client_id,instagram_username' }
     );
   if (error) throw error;
 }

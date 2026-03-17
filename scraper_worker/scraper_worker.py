@@ -159,7 +159,28 @@ def scrape_followers(conn, job: dict):
     raise RuntimeError(f"Failed to resolve user_id for @{target_username}: {e}") from e
 
   _sleep_between_calls()
-  followers_dict = cl.user_followers(user_id, amount=0)
+
+  # Fetch only a conservative slice of followers per job, not the whole account.
+  # - For small jobs, use a small multiple of max_leads.
+  # - For large jobs, cap the API load per run so we don't hammer Instagram.
+  SAFE_FETCH_CAP = int(_float_env("SCRAPER_SAFE_FETCH_CAP", 800.0))
+  if SAFE_FETCH_CAP <= 0:
+    SAFE_FETCH_CAP = 800
+  if max_leads is not None and max_leads > 0:
+    # Up to 2x max_leads, but never more than SAFE_FETCH_CAP.
+    amount = min(int(max_leads * 2), SAFE_FETCH_CAP)
+  else:
+    # No max_leads: still respect a cap so we don't pull everything.
+    amount = SAFE_FETCH_CAP
+
+  logger.info(
+    "Requesting up to %d followers for @%s this job (SAFE_FETCH_CAP=%d, max_leads=%s)",
+    amount,
+    target_username,
+    SAFE_FETCH_CAP,
+    max_leads,
+  )
+  followers_dict = cl.user_followers(user_id, amount=amount)
   followers = list(followers_dict.values())
   logger.info("Fetched %d followers for @%s", len(followers), target_username)
 
