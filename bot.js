@@ -10,8 +10,6 @@ const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
-const { spawn } = require('child_process');
-
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -349,138 +347,6 @@ async function login(page, credentials) {
 }
 
 const MAX_SEND_RETRIES = 3;
-
-async function sendDMViaInstagrapiWorker(username, adapter, options = {}) {
-  const u = normalizeUsername(username);
-  const {
-    clientId,
-    campaignId,
-    campaignLeadId,
-    messageGroupId,
-    messageGroupMessageId,
-    dailySendLimit,
-    hourlySendLimit,
-    messageOverride,
-    session,
-  } = options;
-
-  const sent = await Promise.resolve(adapter.alreadySent(u));
-  if (sent) {
-    logger.warn(`Already sent to @${u}, skipping (instagrapi).`);
-    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', 'already_sent').catch(() => {});
-    return { ok: false, reason: 'already_sent' };
-  }
-
-  const stats = await Promise.resolve(adapter.getDailyStats());
-  const dailyLimit = dailySendLimit ?? adapter.dailyLimit ?? DAILY_LIMIT;
-  if (stats.total_sent >= dailyLimit) {
-    logger.warn(`Daily limit reached (${dailyLimit}). Skipping (instagrapi).`);
-    return { ok: false, reason: 'daily_limit' };
-  }
-
-  const hourlySent = await Promise.resolve(adapter.getHourlySent());
-  const maxPerHour = options.hourlySendLimit ?? adapter.maxPerHour ?? MAX_PER_HOUR;
-  if (hourlySent >= maxPerHour) {
-    logger.warn(`Hourly limit reached (${maxPerHour}). Skipping (instagrapi).`);
-    return { ok: false, reason: 'hourly_limit' };
-  }
-
-  const messageTemplate = messageOverride || adapter.getRandomMessage();
-  const logSent = (status, finalMsg, failureReason = null) =>
-    adapter.logSentMessage(
-      u,
-      finalMsg != null ? finalMsg : messageTemplate,
-      status,
-      campaignId,
-      messageGroupId,
-      messageGroupMessageId,
-      failureReason
-    );
-
-  if (!session || !session.id) {
-    logger.warn('No session.id provided to instagrapi worker, falling back to Puppeteer send.');
-    return { ok: false, reason: 'no_session' };
-  }
-
-  const scriptPath = path.join(process.cwd(), 'scraper_worker', 'send_dm_worker.py');
-  const args = [
-    scriptPath,
-    '--client-id',
-    String(clientId),
-    '--session-id',
-    String(session.id),
-    '--username',
-    String(u),
-    '--message',
-    String(messageTemplate),
-  ];
-
-  const child = spawn('python3', args, {
-    cwd: process.cwd(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-
-  let stdout = '';
-  let stderr = '';
-  child.stdout.on('data', (chunk) => {
-    stdout += chunk.toString();
-  });
-  child.stderr.on('data', (chunk) => {
-    stderr += chunk.toString();
-  });
-
-  const result = await new Promise((resolve) => {
-    child.on('close', () => {
-      if (!stdout.trim()) {
-        if (stderr.trim()) logger.error('[instagrapi send worker stderr]', stderr.trim());
-        return resolve({ success: false, reason: 'worker_no_output', error: stderr.trim() || null });
-      }
-      try {
-        const lastLine = stdout.trim().split('\n').filter(Boolean).slice(-1)[0];
-        const parsed = JSON.parse(lastLine);
-        resolve(parsed);
-      } catch (e) {
-        logger.error('Failed to parse instagrapi worker output', e, stdout);
-        resolve({ success: false, reason: 'worker_parse_error', error: String(e) });
-      }
-    });
-    child.on('error', (err) => {
-      logger.error('Failed to start instagrapi send worker', err);
-      resolve({ success: false, reason: 'worker_spawn_error', error: err.message || String(err) });
-    });
-  });
-
-  if (!result.success) {
-    const failureReason = result.reason || result.error_type || 'send_failed';
-    await Promise.resolve(logSent('failed', null, failureReason));
-    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', failureReason).catch(() => {});
-    logger.warn(
-      `Instagrapi send failed for @${u}: ${failureReason}` +
-        (result.error ? ' (' + String(result.error).slice(0, 200) + ')' : '')
-    );
-    return { ok: false, reason: failureReason };
-  }
-
-  const sentAt = result.sent_at || new Date().toISOString();
-  await Promise.resolve(logSent('success', messageTemplate));
-  if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
-
-  if (clientId && result.thread_id) {
-    const payload = {
-      client_id: clientId,
-      instagram_thread_id: result.thread_id,
-      username: u,
-      message_text: messageTemplate,
-      sent_at: sentAt,
-      message_group_id: messageGroupId || undefined,
-      message_group_message_id: messageGroupMessageId || undefined,
-    };
-    coldDmOnSend(payload).catch(() => {});
-  }
-
-  logger.log(`Sent via instagrapi to @${u}: ${messageTemplate.slice(0, 30)}...`);
-  return { ok: true };
-}
 
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
@@ -995,16 +861,7 @@ async function runBotMultiTenant() {
       display_name: work.display_name,
     };
     sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
-    let sendResult;
-    const useInstagrapiSender = process.env.USE_INSTAGRAPI_SENDER === '1' || process.env.USE_INSTAGRAPI_SENDER === 'true';
-    if (useInstagrapiSender) {
-      sendResult = await sendDMViaInstagrapiWorker(work.username, adapter, { ...options, session });
-      if (!sendResult.ok && sendResult.reason === 'no_session') {
-        sendResult = await sendDM(page, work.username, adapter, options);
-      }
-    } else {
-      sendResult = await sendDM(page, work.username, adapter, options);
-    }
+    const sendResult = await sendDM(page, work.username, adapter, options);
 
     let delayMs;
     if (!sendResult.ok && sendResult.reason === 'hourly_limit') {

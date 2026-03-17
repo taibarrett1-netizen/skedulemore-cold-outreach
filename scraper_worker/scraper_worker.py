@@ -32,35 +32,71 @@ def _float_env(name: str, default: float) -> float:
 
 
 def _sleep_between_batches():
-  lo = _float_env("SCRAPER_DELAY_BATCH_MIN", 6.0)
-  hi = _float_env("SCRAPER_DELAY_BATCH_MAX", 14.0)
+  lo = _float_env("SCRAPER_DELAY_BATCH_MIN", 15.0)
+  hi = _float_env("SCRAPER_DELAY_BATCH_MAX", 35.0)
   if hi < lo:
     hi = lo
   time.sleep(random.uniform(lo, hi))
 
 
 def _sleep_before_first():
-  lo = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MIN", 3.0)
-  hi = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MAX", 8.0)
+  lo = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MIN", 10.0)
+  hi = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MAX", 25.0)
   if hi < lo:
     hi = lo
   time.sleep(random.uniform(lo, hi))
 
 
 def _sleep_between_calls():
-  lo = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MIN", 4.0)
-  hi = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MAX", 10.0)
+  lo = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MIN", 12.0)
+  hi = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MAX", 28.0)
   if hi < lo:
     hi = lo
   time.sleep(random.uniform(lo, hi))
 
 
 def _sleep_per_item():
-  lo = _float_env("SCRAPER_DELAY_PER_ITEM_MIN", 0.4)
-  hi = _float_env("SCRAPER_DELAY_PER_ITEM_MAX", 1.2)
+  lo = _float_env("SCRAPER_DELAY_PER_ITEM_MIN", 0.8)
+  hi = _float_env("SCRAPER_DELAY_PER_ITEM_MAX", 2.2)
   if hi < lo:
     hi = lo
   time.sleep(random.uniform(lo, hi))
+
+
+def _sleep_warmup():
+  """Long delay before any API call to avoid burst-on-connect detection."""
+  lo = _float_env("SCRAPER_WARMUP_MIN", 45.0)
+  hi = _float_env("SCRAPER_WARMUP_MAX", 90.0)
+  if hi < lo:
+    hi = lo
+  t = random.uniform(lo, hi)
+  logger.info("Warm-up delay %.0fs before first request (SCRAPER_WARMUP_*)", t)
+  time.sleep(t)
+
+
+def _sleep_chunk_cooldown():
+  """Long pause every N items to mimic human session breaks (avoids sustained automation)."""
+  every = int(_float_env("SCRAPER_CHUNK_COOLDOWN_EVERY", 200.0))
+  if every <= 0:
+    return
+  lo = _float_env("SCRAPER_CHUNK_COOLDOWN_MIN", 120.0)
+  hi = _float_env("SCRAPER_CHUNK_COOLDOWN_MAX", 300.0)
+  if hi < lo:
+    hi = lo
+  t = random.uniform(lo, hi)
+  logger.info("Chunk cooldown %.0fs (every %s items)", t, every)
+  time.sleep(t)
+
+
+def _sleep_jitter():
+  """Random extra delay occasionally to break predictable patterns."""
+  lo = _float_env("SCRAPER_JITTER_EXTRA_MIN", 15.0)
+  hi = _float_env("SCRAPER_JITTER_EXTRA_MAX", 45.0)
+  if hi < lo:
+    hi = lo
+  t = random.uniform(lo, hi)
+  logger.info("Jitter delay +%.0fs", t)
+  time.sleep(t)
 
 
 def _should_cancel(conn, job_id: str) -> bool:
@@ -75,6 +111,8 @@ def scrape_followers(conn, job: dict):
     raise RuntimeError("target_username missing on scrape job.")
 
   logger.info("Follower scrape started: target=@%s job_id=%s", target_username, job.get("id"))
+
+  _sleep_warmup()
 
   platform_session_id = job.get("platform_scraper_session_id")
   session_row = fetch_scraper_session(conn, client_id, platform_session_id)
@@ -145,6 +183,17 @@ def scrape_followers(conn, job: dict):
 
     _sleep_per_item()
 
+    chunk_every = max(1, int(_float_env("SCRAPER_CHUNK_COOLDOWN_EVERY", 200.0)))
+    jitter_every = max(1, int(_float_env("SCRAPER_JITTER_EVERY", 500.0)))
+    if idx > 0 and idx % chunk_every == 0:
+      if _should_cancel(conn, job["id"]):
+        logger.info("Job cancelled during cooldown. Scraped %d new leads", scraped_new)
+        update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
+        return
+      _sleep_chunk_cooldown()
+    if idx > 0 and idx % jitter_every == 0:
+      _sleep_jitter()
+
     if idx % 50 == 0:
       update_scrape_job(conn, job["id"], scraped_count=scraped_new)
       logger.info("Progress: %d/%d followers processed, %d new leads so far", idx, len(followers), scraped_new)
@@ -189,6 +238,8 @@ def scrape_comments(conn, job: dict):
     raise RuntimeError("post_urls must be a non-empty array on comment scrape jobs.")
 
   logger.info("Comment scrape started: %d post(s) job_id=%s", len(post_urls), job.get("id"))
+
+  _sleep_warmup()
 
   platform_session_id = job.get("platform_scraper_session_id")
   session_row = fetch_scraper_session(conn, client_id, platform_session_id)
@@ -276,6 +327,17 @@ def scrape_comments(conn, job: dict):
         return
 
       _sleep_per_item()
+
+      chunk_every = max(1, int(_float_env("SCRAPER_CHUNK_COOLDOWN_EVERY", 200.0)))
+      jitter_every = max(1, int(_float_env("SCRAPER_JITTER_EVERY", 500.0)))
+      if idx > 0 and idx % chunk_every == 0:
+        if _should_cancel(conn, job["id"]):
+          logger.info("Job cancelled during cooldown. Scraped %d new leads", scraped_new)
+          update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
+          return
+        _sleep_chunk_cooldown()
+      if idx > 0 and idx % jitter_every == 0:
+        _sleep_jitter()
 
       if idx % 50 == 0:
         update_scrape_job(conn, job["id"], scraped_count=scraped_new)

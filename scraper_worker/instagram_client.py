@@ -108,8 +108,9 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
     except (TypeError, ValueError):
       return default
 
-  delay_min = _float_env("SCRAPER_DELAY_MIN", 2.0)
-  delay_max = _float_env("SCRAPER_DELAY_MAX", 6.0)
+  # Conservative defaults to avoid detection (every API request gets a random delay in this range).
+  delay_min = _float_env("SCRAPER_DELAY_MIN", 5.0)
+  delay_max = _float_env("SCRAPER_DELAY_MAX", 15.0)
   if delay_max < delay_min:
     delay_max = delay_min
   cl.delay_range = [delay_min, delay_max]
