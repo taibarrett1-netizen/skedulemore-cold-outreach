@@ -548,7 +548,7 @@ app.post('/api/scraper/status', async (req, res) => {
 });
 
 app.post('/api/scraper/start', async (req, res) => {
-  const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls, preferred_method } = req.body || {};
+  const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls } = req.body || {};
   const scrapeType = scrape_type === 'comments' ? 'comments' : 'followers';
 
   if (!clientId) {
@@ -565,53 +565,11 @@ app.post('/api/scraper/start', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'post_urls must be an array of strings' });
     }
   }
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
   try {
-    const picked = await pickScraperSessionForJob(clientId);
-    if (!picked?.session?.session_data?.cookies?.length) {
-      return res.status(400).json({ ok: false, error: 'Scraper not connected. Connect a scraper or add platform scraper accounts.' });
-    }
-
-    const pickedUsername = picked.session?.instagram_username || null;
-    const pickedSource = picked.source || 'unknown';
-    console.log(
-      '[Scraper] Starting job with scraper account:',
-      pickedUsername || '(no username)',
-      'source=',
-      pickedSource
-    );
-
     const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
 
-    // Per-account max leads cap (front-end max_leads can be higher; this clamps what one account does in a single job).
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
-    const perAccountCapEnv = process.env.SCRAPER_MAX_LEADS_PER_ACCOUNT;
-    const perAccountCap =
-      perAccountCapEnv != null && perAccountCapEnv !== ''
-        ? Math.max(1, parseInt(perAccountCapEnv, 10) || 0)
-        : null;
-    const effectiveMaxLeads =
-      requestedMaxLeads && perAccountCap
-        ? Math.min(requestedMaxLeads, perAccountCap)
-        : (requestedMaxLeads || perAccountCap || null);
-
-    if (requestedMaxLeads && effectiveMaxLeads && effectiveMaxLeads < requestedMaxLeads) {
-      console.log(
-        '[Scraper] Clamping requested max_leads',
-        requestedMaxLeads,
-        'to per-account cap',
-        effectiveMaxLeads
-      );
-    }
-
-    // Default to GraphQL for follower scrapes unless explicitly overridden.
-    let preferredMethod = 'graphql';
-    if (preferred_method === 'instagrapi') preferredMethod = 'instagrapi';
-    if (preferred_method === 'graphql') preferredMethod = 'graphql';
-    const effectiveMethod =
-      scrapeType === 'followers' && preferredMethod === 'graphql' ? 'graphql' : 'instagrapi';
+    const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
 
     const jobId = await createScrapeJob(
       clientId,
@@ -619,67 +577,29 @@ app.post('/api/scraper/start', async (req, res) => {
       lead_group_id || null,
       scrapeType,
       scrapeType === 'comments' ? post_urls : null,
-      picked.platformSessionId || null,
+      null, // platformScraperSessionId not used in legacy Puppeteer mode
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
-      effectiveMethod
+      'instagrapi' // legacy value; worker is not used when Puppeteer path is active
     );
 
-    const args = [
-      '-m',
-      'scraper_worker.scraper_worker',
-      '--job-id',
-      String(jobId),
-      '--client-id',
-      String(clientId),
-      '--scrape-type',
-      scrapeType,
-    ];
+    // Kick off legacy Puppeteer scraper in the background (do not await).
     if (scrapeType === 'followers') {
-      args.push('--target-username', String(targetForJob));
-    } else if (scrapeType === 'comments') {
-      args.push('--post-urls', JSON.stringify(post_urls || []));
-    }
-    if (effectiveMaxLeads != null && effectiveMaxLeads > 0) {
-      args.push('--max-leads', String(effectiveMaxLeads));
-    }
-    if (lead_group_id) {
-      args.push('--lead-group-id', String(lead_group_id));
+      runFollowerScrape(String(clientId), String(jobId), targetForJob, {
+        maxLeads: effectiveMaxLeads,
+        leadGroupId: lead_group_id || null,
+      }).catch((err) => {
+        console.error('[API] runFollowerScrape error', err);
+      });
+    } else {
+      runCommentScrape(String(clientId), String(jobId), post_urls || [], {
+        maxLeads: effectiveMaxLeads,
+        leadGroupId: lead_group_id || null,
+      }).catch((err) => {
+        console.error('[API] runCommentScrape error', err);
+      });
     }
 
-    // Spawn Python worker; it will handle scraping via instagrapi and update the job row directly.
-    const child = spawn('python3', args, {
-      cwd: projectRoot,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-
-    const MAX_CHILD_LOG_LEN = 800;
-    const isNoise = (s) => s.length > 2000 || /^\s*</.test(s) || /data-sjs|data-btmanifest|cdninstagram\.com/.test(s);
-    const trimChunk = (raw) => {
-      const s = raw.toString().trim();
-      if (isNoise(s)) return null;
-      return s.length > MAX_CHILD_LOG_LEN ? s.slice(0, MAX_CHILD_LOG_LEN) + '...' : s;
-    };
-    child.stdout.on('data', (chunk) => {
-      const line = trimChunk(chunk);
-      if (line) console.log(`[ScraperWorker ${jobId}]`, line);
-    });
-    child.stderr.on('data', (chunk) => {
-      const line = trimChunk(chunk);
-      if (line) console.log(`[ScraperWorker ${jobId}]`, line);
-    });
-    child.on('error', async (err) => {
-      console.error('[API] Failed to start Python scraper worker', err);
-      try {
-        await updateScrapeJob(jobId, {
-          status: 'failed',
-          error_message: `Python worker failed to start: ${err.message || String(err)}`,
-        });
-      } catch (e) {
-        console.error('[API] Failed to mark scrape job as failed after worker start error', e);
-      }
-    });
-
-    res.json({ ok: true, jobId });
+    res.json({ ok: true, jobId, mode: 'puppeteer_legacy' });
   } catch (e) {
     console.error('[API] Scraper start error', e);
     res.status(500).json({ ok: false, error: e.message });
