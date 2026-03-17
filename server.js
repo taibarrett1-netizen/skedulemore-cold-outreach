@@ -613,11 +613,20 @@ app.post('/api/scraper/start', async (req, res) => {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
+    const MAX_CHILD_LOG_LEN = 800;
+    const isNoise = (s) => s.length > 2000 || /^\s*</.test(s) || /data-sjs|data-btmanifest|cdninstagram\.com/.test(s);
+    const trimChunk = (raw) => {
+      const s = raw.toString().trim();
+      if (isNoise(s)) return null;
+      return s.length > MAX_CHILD_LOG_LEN ? s.slice(0, MAX_CHILD_LOG_LEN) + '...' : s;
+    };
     child.stdout.on('data', (chunk) => {
-      console.log(`[ScraperWorker ${jobId}]`, chunk.toString().trim());
+      const line = trimChunk(chunk);
+      if (line) console.log(`[ScraperWorker ${jobId}]`, line);
     });
     child.stderr.on('data', (chunk) => {
-      console.error(`[ScraperWorker ${jobId} ERROR]`, chunk.toString().trim());
+      const line = trimChunk(chunk);
+      if (line) console.error(`[ScraperWorker ${jobId} ERROR]`, line);
     });
     child.on('error', async (err) => {
       console.error('[API] Failed to start Python scraper worker', err);

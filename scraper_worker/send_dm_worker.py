@@ -1,7 +1,10 @@
 import argparse
 import json
 import logging
+import os
+import random
 import sys
+import time
 from typing import Any, Dict, List
 
 from instagrapi.exceptions import (
@@ -35,6 +38,17 @@ def _load_sender_session(conn, session_id: int) -> Dict[str, Any]:
     "session_data": session_data or {},
     "instagram_username": instagram_username,
   }
+
+
+def _delay_seconds(env_min: str, env_max: str, default_min: float, default_max: float) -> None:
+  try:
+    lo = float(os.getenv(env_min) or default_min)
+    hi = float(os.getenv(env_max) or default_max)
+  except (TypeError, ValueError):
+    lo, hi = default_min, default_max
+  if hi < lo:
+    hi = lo
+  time.sleep(random.uniform(lo, hi))
 
 
 def _map_error(e: Exception) -> Dict[str, Any]:
@@ -79,6 +93,7 @@ def send_dm(conn, client_id: str, session_id: int, username: str, message: str) 
   if not clean_username:
     raise RuntimeError("username is required")
 
+  _delay_seconds("SCRAPER_DELAY_BEFORE_FIRST_MIN", "SCRAPER_DELAY_BEFORE_FIRST_MAX", 2.0, 5.0)
   logger.info("Resolving user_id for @%s", clean_username)
   try:
     user_id = cl.user_id_from_username(clean_username)
@@ -86,6 +101,7 @@ def send_dm(conn, client_id: str, session_id: int, username: str, message: str) 
     logger.warning("Resolve @%s failed: %s", clean_username, e)
     return _map_error(e)
 
+  _delay_seconds("SCRAPER_DELAY_BETWEEN_CALLS_MIN", "SCRAPER_DELAY_BETWEEN_CALLS_MAX", 3.0, 8.0)
   logger.info("Sending DM to @%s (user_id=%s)", clean_username, user_id)
   try:
     dm = cl.direct_send(text=message, user_ids=[user_id])

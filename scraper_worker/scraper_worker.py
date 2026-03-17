@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 import time
@@ -22,8 +23,44 @@ from .db import (
 from .instagram_client import build_client_from_session
 
 
+def _float_env(name: str, default: float) -> float:
+  try:
+    v = os.getenv(name)
+    return float(v) if v not in (None, "") else default
+  except (TypeError, ValueError):
+    return default
+
+
 def _sleep_between_batches():
-  time.sleep(random.uniform(2.0, 5.0))
+  lo = _float_env("SCRAPER_DELAY_BATCH_MIN", 6.0)
+  hi = _float_env("SCRAPER_DELAY_BATCH_MAX", 14.0)
+  if hi < lo:
+    hi = lo
+  time.sleep(random.uniform(lo, hi))
+
+
+def _sleep_before_first():
+  lo = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MIN", 3.0)
+  hi = _float_env("SCRAPER_DELAY_BEFORE_FIRST_MAX", 8.0)
+  if hi < lo:
+    hi = lo
+  time.sleep(random.uniform(lo, hi))
+
+
+def _sleep_between_calls():
+  lo = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MIN", 4.0)
+  hi = _float_env("SCRAPER_DELAY_BETWEEN_CALLS_MAX", 10.0)
+  if hi < lo:
+    hi = lo
+  time.sleep(random.uniform(lo, hi))
+
+
+def _sleep_per_item():
+  lo = _float_env("SCRAPER_DELAY_PER_ITEM_MIN", 0.4)
+  hi = _float_env("SCRAPER_DELAY_PER_ITEM_MAX", 1.2)
+  if hi < lo:
+    hi = lo
+  time.sleep(random.uniform(lo, hi))
 
 
 def _should_cancel(conn, job_id: str) -> bool:
@@ -69,11 +106,13 @@ def scrape_followers(conn, job: dict):
 
   scraped_new = int(job.get("scraped_count") or 0)
 
+  _sleep_before_first()
   try:
     user_id = cl.user_id_from_username(target_username)
   except ClientError as e:
     raise RuntimeError(f"Failed to resolve user_id for @{target_username}: {e}") from e
 
+  _sleep_between_calls()
   followers_dict = cl.user_followers(user_id, amount=0)
   followers = list(followers_dict.values())
   logger.info("Fetched %d followers for @%s", len(followers), target_username)
@@ -103,6 +142,8 @@ def scrape_followers(conn, job: dict):
       logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
       update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
       return
+
+    _sleep_per_item()
 
     if idx % 50 == 0:
       update_scrape_job(conn, job["id"], scraped_count=scraped_new)
@@ -159,6 +200,8 @@ def scrape_comments(conn, job: dict):
     session_row["session_data"], session_row.get("instagram_username")
   )
 
+  _sleep_before_first()
+
   max_leads = job.get("max_leads") or None
   if max_leads is not None:
     try:
@@ -187,6 +230,7 @@ def scrape_comments(conn, job: dict):
     url = str(raw_url).strip()
     if not url:
       continue
+    _sleep_between_calls()
     shortcode = _extract_shortcode_from_url(url)
     logger.info("Processing post: %s", url[:60] + "..." if len(url) > 60 else url)
     try:
@@ -230,6 +274,8 @@ def scrape_comments(conn, job: dict):
         logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
         update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
         return
+
+      _sleep_per_item()
 
       if idx % 50 == 0:
         update_scrape_job(conn, job["id"], scraped_count=scraped_new)
@@ -283,6 +329,9 @@ def main(argv: List[str]) -> int:
     format="[%(name)s] %(levelname)s: %(message)s",
     stream=sys.stderr,
   )
+  # Silence noisy third-party loggers (instagrapi/urllib3 dump URLs and sometimes response bodies)
+  for name in ("instagrapi", "urllib3", "requests", "instagrapi.mixins.private", "private_request"):
+    logging.getLogger(name).setLevel(logging.WARNING)
 
   logger.info("Starting job_id=%s scrape_type=%s", args.job_id, args.scrape_type)
   with get_connection() as conn:

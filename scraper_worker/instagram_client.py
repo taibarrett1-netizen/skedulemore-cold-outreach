@@ -100,6 +100,21 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
     set_count += 1
   logger.info("Set %d cookies on client", set_count)
 
+  # Rate-limit: random delay between every API request (reduces ban/challenge risk).
+  def _float_env(name: str, default: float) -> float:
+    try:
+      v = os.getenv(name)
+      return float(v) if v not in (None, "") else default
+    except (TypeError, ValueError):
+      return default
+
+  delay_min = _float_env("SCRAPER_DELAY_MIN", 2.0)
+  delay_max = _float_env("SCRAPER_DELAY_MAX", 6.0)
+  if delay_max < delay_min:
+    delay_max = delay_min
+  cl.delay_range = [delay_min, delay_max]
+  logger.info("Request delay_range=[%.1f, %.1f]s (set SCRAPER_DELAY_MIN/MAX to override)", delay_min, delay_max)
+
   # Validation: use private API only (account_info) to avoid public web_profile_info which is heavily rate-limited (429).
   # Set SKIP_SESSION_VALIDATION=1 to skip this and go straight to scrape (session checked on first real request).
   if os.getenv("SKIP_SESSION_VALIDATION", "").strip().lower() in ("1", "true", "yes"):
