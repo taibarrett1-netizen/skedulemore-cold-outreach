@@ -832,7 +832,8 @@ async function createScrapeJob(
   scrapeType = 'followers',
   postUrls = null,
   platformScraperSessionId = null,
-  maxLeads = null
+  maxLeads = null,
+  scrapeMethod = 'instagrapi'
 ) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
@@ -850,6 +851,9 @@ async function createScrapeJob(
    // max_leads is an optional column on cold_dm_scrape_jobs used by the Python worker
   if (maxLeads != null && !Number.isNaN(Number(maxLeads))) {
     payload.max_leads = Number(maxLeads);
+  }
+  if (scrapeMethod) {
+    payload.scrape_method = scrapeMethod;
   }
   const { data, error } = await sb
     .from('cold_dm_scrape_jobs')

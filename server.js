@@ -548,7 +548,7 @@ app.post('/api/scraper/status', async (req, res) => {
 });
 
 app.post('/api/scraper/start', async (req, res) => {
-  const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls } = req.body || {};
+  const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls, preferred_method } = req.body || {};
   const scrapeType = scrape_type === 'comments' ? 'comments' : 'followers';
 
   if (!clientId) {
@@ -606,6 +606,13 @@ app.post('/api/scraper/start', async (req, res) => {
       );
     }
 
+    // Default to GraphQL for follower scrapes unless explicitly overridden.
+    let preferredMethod = 'graphql';
+    if (preferred_method === 'instagrapi') preferredMethod = 'instagrapi';
+    if (preferred_method === 'graphql') preferredMethod = 'graphql';
+    const effectiveMethod =
+      scrapeType === 'followers' && preferredMethod === 'graphql' ? 'graphql' : 'instagrapi';
+
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
@@ -613,7 +620,8 @@ app.post('/api/scraper/start', async (req, res) => {
       scrapeType,
       scrapeType === 'comments' ? post_urls : null,
       picked.platformSessionId || null,
-      effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null
+      effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
+      effectiveMethod
     );
 
     const args = [

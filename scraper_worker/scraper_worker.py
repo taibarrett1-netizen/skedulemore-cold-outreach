@@ -236,6 +236,275 @@ def scrape_followers(conn, job: dict):
   update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
 
 
+def _sleep_graphql_page_delay():
+  """
+  Long delay between GraphQL page requests.
+  Defaults are higher than instagrapi's internal delays to reduce rate-limit risk.
+  """
+  lo = _float_env("SCRAPER_GRAPHQL_PAGE_DELAY_MIN", 45.0)
+  hi = _float_env("SCRAPER_GRAPHQL_PAGE_DELAY_MAX", 120.0)
+  if hi < lo:
+    hi = lo
+  t = random.uniform(lo, hi)
+  logger.info("GraphQL page delay %.0fs", t)
+  time.sleep(t)
+
+
+def scrape_followers_via_graphql(conn, job: dict):
+  """
+  Follower scrape using Instagram's web GraphQL endpoint (edge_followed_by)
+  instead of instagrapi.user_followers().
+
+  This is an additive fallback path. It keeps:
+    - The same platform scraper rotation / session loading
+    - The same lead filtering + upsert logic
+    - Similar cancellation and progress updates
+
+  IMPORTANT: Instagram rotates the followers query_hash / doc_id periodically.
+  To update:
+    1. Open a real browser, log into the same account used for scraping.
+    2. Go to https://www.instagram.com/<username>/ and click "followers".
+    3. In DevTools → Network, find the GraphQL request whose response contains "edge_followed_by".
+    4. Copy its "query_hash" (or "doc_id") value and update SCRAPER_GRAPHQL_FOLLOWERS_QUERY_HASH
+       in the environment, or hard-code it below if needed.
+  """
+  import requests
+
+  client_id = job["client_id"]
+  target_username = (job.get("target_username") or "").strip().lstrip("@").lower()
+  if not target_username:
+    raise RuntimeError("target_username missing on scrape job.")
+
+  logger.info(
+    "GraphQL follower scrape started: target=@%s job_id=%s",
+    target_username,
+    job.get("id"),
+  )
+
+  _sleep_warmup()
+
+  platform_session_id = job.get("platform_scraper_session_id")
+  session_row = fetch_scraper_session(conn, client_id, platform_session_id)
+  if not session_row or not (session_row.get("session_data") or {}).get("cookies"):
+    raise RuntimeError("Scraper session not found or expired for this job.")
+
+  session_data = session_row["session_data"] or {}
+  cookies = session_data.get("cookies") or []
+
+  logger.info(
+    "Session loaded (platform_session_id=%s), building instagrapi client for user id resolution",
+    platform_session_id,
+  )
+  cl = build_client_from_session(session_data, session_row.get("instagram_username"))
+
+  lead_group_id = job.get("lead_group_id")
+  source = f"followers:{target_username}"
+
+  (
+    in_conversations,
+    sent_usernames,
+    blocklist_usernames,
+    existing_leads,
+  ) = load_filter_sets(conn, client_id)
+
+  scraped_new = int(job.get("scraped_count") or 0)
+
+  max_leads = job.get("max_leads") or None
+  if max_leads is not None:
+    try:
+      max_leads = int(max_leads)
+    except (TypeError, ValueError):
+      max_leads = None
+  if max_leads is not None:
+    logger.info(
+      "[GraphQL] Job has max_leads=%s (already scraped=%d). Will stop when new leads reach this count.",
+      max_leads,
+      scraped_new,
+    )
+  else:
+    logger.info("[GraphQL] Job has no max_leads; will scrape all available followers.")
+
+  _sleep_before_first()
+  try:
+    user_id = cl.user_id_from_username(target_username)
+  except ClientError as e:
+    raise RuntimeError(
+      f"[GraphQL] Failed to resolve user_id for @{target_username}: {e}"
+    ) from e
+
+  # Build a requests session with the same cookies and proxy settings as the platform scraper.
+  session = requests.Session()
+  for c in cookies:
+    name = c.get("name")
+    value = c.get("value")
+    if not name or value is None:
+      continue
+    domain = c.get("domain") or ".instagram.com"
+    session.cookies.set(name, value, domain=domain)
+
+  # Environment variable SCRAPER_GRAPHQL_PROXY overrides proxy for GraphQL mode; otherwise, rely on system/requests defaults.
+  proxy_url = os.getenv("SCRAPER_GRAPHQL_PROXY") or None
+  if proxy_url:
+    session.proxies.update({"http": proxy_url, "https": proxy_url})
+    logger.info("[GraphQL] Using proxy %s", proxy_url)
+
+  # Web headers to mimic a normal logged-in browser session.
+  session.headers.update(
+    {
+      "User-Agent": os.getenv(
+        "SCRAPER_GRAPHQL_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      ),
+      "Accept": "*/*",
+      "Referer": f"https://www.instagram.com/{target_username}/",
+      "X-Requested-With": "XMLHttpRequest",
+    }
+  )
+
+  # Followers GraphQL query hash.
+  # NOTE: Instagram may rotate this over time.
+  # The default below is a known followers edge_followed_by hash as of early 2026.
+  # You can override it via SCRAPER_GRAPHQL_FOLLOWERS_QUERY_HASH in the environment if it stops working.
+  default_query_hash = "c76146de99bb02f6415203be841dd25a"
+  query_hash = os.getenv("SCRAPER_GRAPHQL_FOLLOWERS_QUERY_HASH") or default_query_hash
+
+  page_size_env = os.getenv("SCRAPER_GRAPHQL_PAGE_SIZE") or ""
+  try:
+    page_size = int(page_size_env) if page_size_env else 40
+  except ValueError:
+    page_size = 40
+  if page_size <= 0:
+    page_size = 40
+
+  end_cursor = None
+  no_new_pages = 0
+  MAX_NO_NEW_PAGES = 5
+
+  while True:
+    if _should_cancel(conn, job["id"]):
+      logger.info("[GraphQL] Job cancelled before page fetch. Scraped %d new leads", scraped_new)
+      update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
+      return
+
+    variables = {
+      "id": str(user_id),
+      "include_reel": True,
+      "fetch_mutual": False,
+      "first": page_size,
+    }
+    if end_cursor:
+      variables["after"] = end_cursor
+
+    params = {
+      "query_hash": query_hash,
+      "variables": json.dumps(variables, separators=(",", ":")),
+    }
+
+    logger.info(
+      "[GraphQL] Fetching followers page (first=%d, after=%s)",
+      page_size,
+      end_cursor or "None",
+    )
+    try:
+      resp = session.get(
+        "https://www.instagram.com/graphql/query/",
+        params=params,
+        timeout=30,
+      )
+    except Exception as e:
+      raise RuntimeError(f"[GraphQL] Request error: {e}") from e
+
+    if resp.status_code == 429 or "Please wait a few minutes" in (resp.text or ""):
+      raise RuntimeError(
+        "[GraphQL] Rate limited (429 / 'Please wait a few minutes'). Back off this account."
+      )
+    if resp.status_code != 200:
+      raise RuntimeError(
+        f"[GraphQL] Unexpected status {resp.status_code}: {resp.text[:300]}"
+      )
+
+    try:
+      data = resp.json()
+    except ValueError as e:
+      raise RuntimeError(f"[GraphQL] Failed to decode JSON: {e}") from e
+
+    user_data = (
+      (data.get("data") or {})
+      .get("user")
+      or {}
+    )
+    edge = user_data.get("edge_followed_by") or {}
+    edges = edge.get("edges") or []
+    page_info = edge.get("page_info") or {}
+    has_next_page = bool(page_info.get("has_next_page"))
+    end_cursor = page_info.get("end_cursor") or None
+
+    logger.info("[GraphQL] Got %d edges (has_next_page=%s)", len(edges), has_next_page)
+
+    batch_new = 0
+    for node_wrapper in edges:
+      node = node_wrapper.get("node") or {}
+      username = (node.get("username") or "").strip().lstrip("@").lower()
+      if not username:
+        continue
+
+      if (
+        username in existing_leads
+        or username in in_conversations
+        or username in sent_usernames
+        or username in blocklist_usernames
+        or username == target_username
+      ):
+        continue
+
+      is_new = insert_lead_if_new(conn, client_id, username, source, lead_group_id)
+      if is_new:
+        existing_leads.add(username)
+        scraped_new += 1
+        batch_new += 1
+
+      if max_leads is not None and scraped_new >= max_leads:
+        logger.info(
+          "[GraphQL] Reached max_leads=%s, completing job. Total new leads: %d",
+          max_leads,
+          scraped_new,
+        )
+        update_scrape_job(
+          conn, job["id"], status="completed", scraped_count=scraped_new
+        )
+        return
+
+      _sleep_per_item()
+
+    if batch_new == 0:
+      no_new_pages += 1
+    else:
+      no_new_pages = 0
+
+    update_scrape_job(conn, job["id"], scraped_count=scraped_new)
+    logger.info(
+      "[GraphQL] Page processed: +%d new, total %d", batch_new, scraped_new
+    )
+
+    if not has_next_page or (max_leads is not None and scraped_new >= max_leads):
+      break
+    if no_new_pages >= MAX_NO_NEW_PAGES:
+      logger.info(
+        "[GraphQL] Stopping after %d pages with no new leads.", no_new_pages
+      )
+      break
+
+    _sleep_graphql_page_delay()
+
+  logger.info(
+    "[GraphQL] Follower scrape completed: %d new leads for @%s",
+    scraped_new,
+    target_username,
+  )
+  update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
+
+
 def _extract_shortcode_from_url(url: str) -> str:
   url = (url or "").strip()
   if not url:
@@ -446,7 +715,12 @@ def main(argv: List[str]) -> int:
 
     try:
       if args.scrape_type == "followers":
-        scrape_followers(conn, job)
+        method = (job.get("scrape_method") or "instagrapi").lower()
+        logger.info("Using scrape_method=%s for job %s", method, job["id"])
+        if method == "graphql":
+          scrape_followers_via_graphql(conn, job)
+        else:
+          scrape_followers(conn, job)
       else:
         scrape_comments(conn, job)
       logger.info("Job %s finished successfully", job["id"])
