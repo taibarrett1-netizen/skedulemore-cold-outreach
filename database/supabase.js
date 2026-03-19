@@ -303,7 +303,9 @@ async function saveSession(clientId, sessionData, instagramUsername) {
         instagram_username: username || null,
         updated_at: new Date().toISOString(),
       },
-      { onConflict: 'client_id,instagram_username' }
+      // Unique constraint is (client_id), so the conflict target must match
+      // or Postgres will treat this like a plain insert and throw 23505.
+      { onConflict: 'client_id' }
     );
   if (error) throw error;
 }
