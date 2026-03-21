@@ -10,9 +10,79 @@
 const { closeDmComposerOverlays } = require('./instagram-modals');
 const { captureFollowUpScreenshot, isFollowUpScreenshotsEnabled } = require('./follow-up-screenshots');
 
+/** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
+const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
+
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Rough metrics inside the main thread area (before/after voice send).
+ * Instagram DOM changes often; we look for list growth or new <audio>.
+ */
+function threadDomMetricsScript() {
+  return function collectThreadDomMetrics() {
+    const root =
+      document.querySelector('section[role="main"]') ||
+      document.querySelector('[role="main"]') ||
+      document.querySelector('main') ||
+      document.body;
+    const audios = root.querySelectorAll('audio');
+    const listItems = root.querySelectorAll('[role="listitem"]');
+    const rows = root.querySelectorAll('[role="row"]');
+    return {
+      audio: audios.length,
+      listItems: listItems.length,
+      rows: rows.length,
+    };
+  };
+}
+
+/**
+ * After clicking Send, poll until we see a new message row / list item / audio vs snapshot.
+ */
+async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
+  const { timeoutMs = 18000, pollMs = 450, logger = null } = opts;
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const after = await page.evaluate(threadDomMetricsScript()).catch(() => null);
+    if (after) {
+      const gained =
+        after.audio > before.audio ||
+        after.listItems > before.listItems ||
+        after.rows > before.rows;
+      if (gained) {
+        if (logger) {
+          logger.log(
+            `Voice verify: thread DOM changed (audio ${before.audio}→${after.audio}, listItems ${before.listItems}→${after.listItems}, rows ${before.rows}→${after.rows})`
+          );
+        }
+        return true;
+      }
+    }
+    await delay(pollMs);
+  }
+  if (logger) {
+    logger.warn(
+      `Voice verify: no thread change within ${timeoutMs}ms (audio ${before.audio}, listItems ${before.listItems}, rows ${before.rows})`
+    );
+  }
+  return false;
+}
+
+/** Best-effort: recording UI often shows a mm:ss timer. */
+function recordingUiHintScript() {
+  return function recordingUiHint() {
+    const t = document.body.innerText || '';
+    const m = t.match(/\b(\d{1,2}:\d{2})\b/);
+    return {
+      hasTimerLike: !!m,
+      timerSample: m ? m[1] : '',
+      composerLower: (t || '').toLowerCase().includes('message'),
+    };
+  };
 }
 
 /**
@@ -335,10 +405,26 @@ function clickSendAfterRecordingScript() {
  * Mobile web: press-and-hold on the mic for the duration (older mobile IG pattern).
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
-  const { holdMs = 7000, logger = null, correlationId = '' } = opts;
+  const {
+    holdMs = 7000,
+    logger = null,
+    correlationId = '',
+    strictVerify = VOICE_NOTE_STRICT_VERIFY,
+  } = opts;
   const shotMeta = { correlationId, logger };
 
   await closeDmComposerOverlays(page);
+
+  const metricsBefore = await page.evaluate(threadDomMetricsScript()).catch(() => ({
+    audio: 0,
+    listItems: 0,
+    rows: 0,
+  }));
+  if (logger) {
+    logger.log(
+      `Voice: thread snapshot before mic (audio=${metricsBefore.audio}, listItems=${metricsBefore.listItems}, rows=${metricsBefore.rows})`
+    );
+  }
 
   const finder = buildMicFinderScript();
   const viewport = page.viewport();
@@ -375,6 +461,12 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (isFollowUpScreenshotsEnabled()) {
       await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
     }
+    const recHint = await page.evaluate(recordingUiHintScript()).catch(() => ({}));
+    if (logger) {
+      logger.log(
+        `Voice: after mic click hint timerLike=${recHint.hasTimerLike || false} sample=${recHint.timerSample || '-'}`
+      );
+    }
     await delay(Math.max(0, holdMs - afterShotMs));
   } else {
     if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(holdMs)} ms`);
@@ -398,8 +490,25 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   }
   if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
 
-  await delay(1200);
+  if (logger) logger.log('Voice: send control clicked; waiting for thread to update…');
+  await delay(800);
+
+  if (strictVerify) {
+    const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
+    if (!verified) {
+      return { ok: false, reason: 'voice_not_confirmed_in_thread' };
+    }
+  } else if (logger) {
+    logger.log('Voice: VOICE_NOTE_STRICT_VERIFY=false — skipping post-send DOM check');
+  }
+
+  await delay(400);
   return { ok: true };
 }
 
-module.exports = { sendVoiceNoteInThread, prepareVoiceNoteUi, grantMicrophoneForInstagram };
+module.exports = {
+  sendVoiceNoteInThread,
+  prepareVoiceNoteUi,
+  grantMicrophoneForInstagram,
+  VOICE_NOTE_STRICT_VERIFY,
+};

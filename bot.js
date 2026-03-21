@@ -12,7 +12,12 @@ const logger = require('./utils/logger');
 const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
-const { sendVoiceNoteInThread, prepareVoiceNoteUi, grantMicrophoneForInstagram } = require('./utils/instagram-voice-note');
+const {
+  sendVoiceNoteInThread,
+  prepareVoiceNoteUi,
+  grantMicrophoneForInstagram,
+  VOICE_NOTE_STRICT_VERIFY,
+} = require('./utils/instagram-voice-note');
 const { dismissInstagramHomeModals } = require('./utils/instagram-modals');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
@@ -22,6 +27,16 @@ const MIN_DELAY_MS = (parseInt(process.env.MIN_DELAY_MINUTES, 10) || 5) * 60 * 1
 const MAX_DELAY_MS = (parseInt(process.env.MAX_DELAY_MINUTES, 10) || 30) * 60 * 1000;
 const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
 const HEADLESS = process.env.HEADLESS_MODE !== 'false';
+/** When set (e.g. 80), slows Puppeteer operations for debugging voice/UI (all launch paths that use applyPuppeteerSlowMo). */
+function getPuppeteerSlowMo() {
+  const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+function applyPuppeteerSlowMo(launchOpts) {
+  const sm = getPuppeteerSlowMo();
+  if (sm > 0) launchOpts.slowMo = sm;
+  return launchOpts;
+}
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
@@ -834,7 +849,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 }
 
 function buildFollowUpLaunchOptions() {
-  return {
+  const opts = {
     headless: HEADLESS,
     args: [
       '--no-sandbox',
@@ -845,6 +860,8 @@ function buildFollowUpLaunchOptions() {
     ],
     env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
   };
+  applyPuppeteerSlowMo(opts);
+  return opts;
 }
 
 function followUpReasonToError(reason, pageSnippet) {
@@ -858,6 +875,7 @@ function followUpReasonToError(reason, pageSnippet) {
     voice_permission_denied: 'Microphone permission denied',
     voice_send_button_not_found: 'Could not send voice note',
     voice_note_failed: 'Voice note failed',
+    voice_not_confirmed_in_thread: 'Voice send was not confirmed in the thread (DOM did not update). Try debug screenshots, VNC, or PUPPETEER_SLOW_MO_MS',
     empty_message: 'Empty message',
   };
   let msg = map[reason] || reason || 'Send failed';
@@ -929,6 +947,11 @@ async function sendFollowUp(body) {
   logger.log(
     `[follow-up] start clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername} mode=${modeLabel} sessionUser=${session.instagram_username || 'n/a'}${cLog}`
   );
+  if (hasAudio) {
+    logger.log(
+      `[follow-up] voice debug: VOICE_NOTE_STRICT_VERIFY=${VOICE_NOTE_STRICT_VERIFY} slowMo=${getPuppeteerSlowMo() || 0}ms HEADLESS=${HEADLESS}`
+    );
+  }
 
   if (hasAudio && !isFfmpegAvailable()) {
     return fail(
@@ -1193,6 +1216,8 @@ async function runBotMultiTenant() {
     ],
   };
   if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
+  applyPuppeteerSlowMo(launchOpts);
+  if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
   let browser;
   try {
     browser = await puppeteer.launch(launchOpts);
@@ -1402,6 +1427,8 @@ async function runBot() {
     ],
   };
   if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
+  applyPuppeteerSlowMo(launchOpts);
+  if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
   const useSessionCookies = false;
   if (!useSessionCookies) {
     try {
@@ -1526,7 +1553,7 @@ async function runBot() {
 async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null) {
   const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
   if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
-  const browser = await puppeteer.launch({
+  const connectLaunch = {
     headless: true,
     args: [
       '--no-sandbox',
@@ -1536,7 +1563,9 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--autoplay-policy=no-user-gesture-required',
     ],
     env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
-  });
+  };
+  applyPuppeteerSlowMo(connectLaunch);
+  const browser = await puppeteer.launch(connectLaunch);
   let keepBrowserOpen = false;
   try {
     const page = await browser.newPage();

@@ -2,6 +2,10 @@
 cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
 BASE=http://178.62.52.200:3000 KEY='paste_key_here' node scripts/download-follow-up-screenshots.js
 
+# Watch IG in the VPS browser (Xvfb + VNC): see DEPLOYMENT.md "Watching the browser on a VPS"
+# ssh -L 5900:127.0.0.1:5900 root@YOUR_IP
+# VNC Viewer -> localhost:5900  |  .env: HEADLESS_MODE=false DISPLAY=:99 PUPPETEER_SLOW_MO_MS=80
+
 Logs
 pm2 logs ig-dm-bot --lines 50
 Stream logs in real time:

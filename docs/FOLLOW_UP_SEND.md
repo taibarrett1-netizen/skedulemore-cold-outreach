@@ -38,6 +38,14 @@ Exactly **one** of:
 
 Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
 
+### Watch the browser on the VPS (VNC + Xvfb)
+
+See **`DEPLOYMENT.md`** → *Watching the browser on a VPS*. Set `HEADLESS_MODE=false`, `DISPLAY=:99` (or your Xvfb display), run `x11vnc`, tunnel with SSH, connect VNC to `localhost:5900`. Use **`PUPPETEER_SLOW_MO_MS=80`** so actions are easier to follow.
+
+### Stricter success criteria
+
+By default **`VOICE_NOTE_STRICT_VERIFY`** is **on**: after clicking Send, the worker polls the thread until it sees a DOM change (e.g. new `audio` / list rows). If Instagram returns “success” in logs but no bubble appears, you should see a **`voice_not_confirmed_in_thread`** error instead of a false **`sent ok`**. Set **`VOICE_NOTE_STRICT_VERIFY=false`** only if this check causes false failures on your layout.
+
 **Note:** Sending **Escape** after recording was closing Instagram’s voice UI before “Send” — that is no longer done between record and send.
 
 **Recording gesture:** On **desktop Chrome** the mic is usually a **single click** to start; the worker waits for the audio duration (ffmpeg), then clicks **Send**. **Mobile web** viewports use **press-and-hold** on the mic. The VPS resolves the mic via layout (to the right of the message field, leftmost of the three trailing icons) and uses **`element.click()`** on that node so the right control is hit.

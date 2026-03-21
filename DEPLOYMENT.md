@@ -61,6 +61,45 @@ Set these in `.env`:
 
 **If logs say `Could not find voice recorder control`:** the DM composer must show the mic (desktop layout). The worker focuses the message box, matches aria-labels when present, and falls back to the bottom-right icon row `[mic][gallery][heart]`. If it persists, run with `HEADLESS_MODE=false` temporarily to confirm the UI.
 
+### Watching the browser on a VPS (Xvfb + VNC)
+
+`HEADLESS_MODE=false` on Linux still needs a **display**. Use a virtual framebuffer and optionally VNC so you can see the same session Puppeteer drives.
+
+1. **Install:** `sudo apt install -y xvfb x11vnc fluxbox`
+2. **Start Xvfb** (e.g. display `:99`):  
+   `Xvfb :99 -screen 0 1280x800x24 &`  
+   `export DISPLAY=:99`
+3. **Optional:** `fluxbox &` (some sites behave better with a WM)
+4. **VNC** (view from your Mac): bind to localhost and tunnel (do **not** expose 5900 publicly without a password).
+
+   **Option A — no VNC password** (fine **only** with SSH tunnel):
+
+   ```bash
+   x11vnc -display :99 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 -securitytypes none &
+   ```
+
+   **Option B — VNC password** (works with picky clients; RealVNC often needs this):
+
+   ```bash
+   mkdir -p ~/.vnc
+   x11vnc -storepasswd ~/.vnc/passwd
+   x11vnc -display :99 -forever -shared -listen 127.0.0.1 -rfbport 5900 -rfbauth ~/.vnc/passwd &
+   ```
+
+   (Use **`-rfbauth` only** — Ubuntu’s `x11vnc` often rejects `-securitytypes VncAuth` as an unknown option; the password file still enables standard VNC auth.)
+
+   **SSH tunnel:** `ssh -L 5900:127.0.0.1:5900 user@YOUR_VPS_IP` — then connect to **`127.0.0.1:5900`** (or `localhost:5900`).
+
+   **Mac client (free):** `brew install --cask tigervnc-viewer` (note: **`tigervnc-viewer`**, not `tiger-vnc-viewer`). Or download from [TigerVNC releases](https://github.com/TigerVNC/tigervnc/releases). **Finder → Connect to Server** can use `vnc://127.0.0.1:5900` but is fussy with x11vnc; TigerVNC Viewer is more reliable.
+
+   If the viewer says **“no matching security types”**, use **Option B** above or add **`-securitytypes none`** to Option A’s `x11vnc` line.
+
+5. **Bot:** In `.env` set `HEADLESS_MODE=false` and `DISPLAY=:99`, restart PM2. `cli.js` loads `.env` via `dotenv`, so `DISPLAY` is picked up by Chromium.
+
+**Debug:** `PUPPETEER_SLOW_MO_MS=80` slows Puppeteer (easier to follow in VNC). **Post-send check:** by default `VOICE_NOTE_STRICT_VERIFY` is on — the worker waits for the thread DOM to change after Send; set `VOICE_NOTE_STRICT_VERIFY=false` only if you get false failures and need to compare behaviour.
+
+Do **not** expose an unauthenticated VNC port to the public internet; use SSH tunnel or firewall + VNC password.
+
 ## 5. Get the project onto the server
 
 Repo name is **ColdDMs**; on your Mac the folder may be **Cold DMs V1**. On the server, `cd` into whatever the folder is actually called there.
