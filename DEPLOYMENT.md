@@ -31,12 +31,21 @@ Puppeteer needs these on minimal Linux for headless Chrome:
 sudo apt install -y libgbm1 libasound2 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2
 ```
 
-### Voice notes prerequisites (optional)
+### Voice notes (required for voice follow-ups and cold-DM voice)
 
-If you want Instagram voice-note sending from VPS:
+**`ffmpeg` and `ffprobe` must be installed** (voice pipeline runs `ffmpeg` to play audio into PulseAudio). If you see `spawn ffmpeg ENOENT` in logs, install:
 
 ```bash
-sudo apt install -y pulseaudio-utils pulseaudio ffmpeg
+sudo apt install -y ffmpeg
+ffmpeg -version && ffprobe -version
+```
+
+Optional: set `FFMPEG_PATH` / `FFPROBE_PATH` in `.env` if the binaries are not on `PATH`.
+
+Then configure PulseAudio virtual sink (for routing audio into the browser “mic”):
+
+```bash
+sudo apt install -y pulseaudio-utils pulseaudio
 pactl load-module module-null-sink sink_name=ColdDMsVoice sink_properties=device.description=ColdDMsVoice
 pactl list short sources | rg "ColdDMsVoice.*monitor"
 ```

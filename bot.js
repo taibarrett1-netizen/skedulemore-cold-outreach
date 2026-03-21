@@ -11,7 +11,7 @@ const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
-const { startVoiceNotePlayback } = require('./utils/voice-note-audio');
+const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
 const { sendVoiceNoteInThread } = require('./utils/instagram-voice-note');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
@@ -390,6 +390,9 @@ const MAX_SEND_RETRIES = 3;
 
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
   const voiceCfg = buildVoiceSendConfig(sendOpts);
+  if (wantsVoiceNotes(voiceCfg) && !isFfmpegAvailable()) {
+    return { ok: false, reason: 'ffmpeg_missing', pageSnippet: 'Install ffmpeg on the VPS: sudo apt install ffmpeg' };
+  }
   if (wantsVoiceNotes(voiceCfg)) await applyDesktopEmulation(page);
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
@@ -927,6 +930,16 @@ async function sendFollowUp(body) {
     `[follow-up] start clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername} mode=${modeLabel} sessionUser=${session.instagram_username || 'n/a'}`
   );
 
+  if (hasAudio && !isFfmpegAvailable()) {
+    return logFollowUpFailure(
+      clientId,
+      instagramSessionId,
+      recipientUsername,
+      'ffmpeg/ffprobe not installed on this server (required for voice follow-ups). Run: sudo apt install ffmpeg',
+      503
+    );
+  }
+
   const launchOpts = buildFollowUpLaunchOptions();
   let browser;
   try {
@@ -1099,6 +1112,7 @@ async function sendDM(page, username, adapter, options = {}) {
         'voice_send_button_not_found',
         'voice_note_file_not_found',
         'voice_note_download_failed',
+        'ffmpeg_missing',
       ];
       if (terminalReasons.includes(result.reason)) {
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));

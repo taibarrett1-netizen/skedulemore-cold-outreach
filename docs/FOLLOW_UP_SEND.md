@@ -11,6 +11,11 @@ SkeduleMore **follow-ups** are triggered by the dashboard when a scheduled follo
   - `caption` (optional): sent as a text DM before the voice note, in the same thread
 - **VPS behavior:** Downloads the file from `audioUrl`, plays it into the virtual Pulse sink, and drives Instagram Web’s mic UI (same helpers as cold-DM voice notes). Session comes from `clientId` + `instagramSessionId` (`cold_dm_instagram_sessions` row).
 
+## VPS requirements (voice)
+
+- **`ffmpeg` and `ffprobe`** must be installed (`sudo apt install ffmpeg`). Without them the dashboard process can crash with `spawn ffmpeg ENOENT` when sending voice.
+- **PulseAudio** null sink + `VOICE_NOTE_*` env (see `DEPLOYMENT.md`) for piping audio into the browser capture device.
+
 ## Logging
 
 - **Dashboard (`server.js`):** Each request logs `[API] follow-up/send request …` and a line for `response ok=true/false` (see `pm2 logs ig-dm-dashboard` or `logs/bot.log` — same logger writes to stdout and `logs/bot.log`).
