@@ -159,6 +159,14 @@ Valid names (same order as default attempts):
 
 After playback stops, the worker resolves the Send control, moves the mouse **slightly right** (default **14px**, **`VOICE_SEND_CLICK_NUDGE_X`**), then clicks with Puppeteer (falls back to in-page `el.click()` if needed).
 
+### Why per-method screenshots say `recordingUI=no` but `voice-recording-ui-missed.png` shows a blue bar
+
+Headless Chromium often **does not get a working mic** from the OS. Instagram then **does not arm recording** until `getUserMedia` succeeds. Our **per-method** PNG is taken **right after** each ~4s wait — the UI can still be idle.
+
+**Defaults (VPS):** the worker sets **`PULSE_SOURCE`** to **`${VOICE_NOTE_SINK}.monitor`** (e.g. `ColdDMsVoice.monitor`) and **does not** enable `--use-fake-device-for-media-stream`, so Chrome captures **real** audio from ffmpeg → sink → monitor. If you have **no** Pulse sink, set **`VOICE_SKIP_PULSE_SOURCE=true`** or **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=true`** so headless uses the fake stream (UI may work; audio will not be your file). Override with **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=false`** / **`true`** when you need explicit control.
+
+After all gestures, we also **wait ~2s** and poll once (`VOICE_LATE_RECORDING_UI_MS`) to catch a **delayed** recording strip.
+
 ### Recording UI not detected (but screenshots show the blue bar)
 
 Headless Chromium sometimes **does not match** our DOM/`getComputedStyle` heuristics even when **`voice-recording-ui-missed.png`** shows an active recording strip (timing or paint differences).

@@ -265,11 +265,11 @@ If **no** chromium process:
 
 - **Not because of “Chromium”** — Puppeteer uses **Chrome for Testing** (normal Chromium). Same WebRTC stack as Chrome.  
 - **Permission “Allow” ≠ a working device.** On a bare VPS there is often **no real capture device**. `getUserMedia({ audio: true })` can **fail** even when site permissions say Allow; Instagram may then do **nothing** on mic click.  
-- **Fix for manual / VNC testing:** set **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=true`** in `.env`, **`pm2 restart`**, open the debug browser again. That adds **`--use-fake-device-for-media-stream`** (silent fake mic) so capture succeeds and the **recording UI** can appear. **Turn this off** when sending real voice notes with PulseAudio / `PULSE_SOURCE`.  
+- **Headless follow-up sends (VPS):** `bot.js` sets **`PULSE_SOURCE=<VOICE_NOTE_SINK>.monitor`** by default and **does not** enable the fake media device (real audio). **VNC / headed** debug: if the mic UI still does nothing, try **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=true`** or confirm Pulse has the sink/monitor (`pactl list short sources`).  
 - **Desktop Instagram** usually expects **press and hold** on the mic (~**0.5–1 s**), not a single click.  
 - The bot re-runs **`overridePermissions(microphone)`** after load — check **`pm2 logs`** for **`[voice] Microphone permission granted`**.  
 - To confirm errors: **DevTools → Console** (right‑click → Inspect) and click the mic; look for `getUserMedia` / `NotFoundError` / `NotReadableError`.  
-- Real sends: PulseAudio null sink + monitor + `PULSE_SOURCE` (see **`docs/FOLLOW_UP_SEND.md`**).
+- Real sends: PulseAudio null sink + monitor + automatic `PULSE_SOURCE` (see **`docs/FOLLOW_UP_SEND.md`**).
 
 ### G2. How long the window stays open
 

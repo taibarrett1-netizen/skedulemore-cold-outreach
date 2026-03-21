@@ -77,21 +77,55 @@ function applyPuppeteerSlowMo(launchOpts) {
   return launchOpts;
 }
 
-/** VPS often has no real mic; getUserMedia(audio) fails even when site permission is Allow → IG mic does nothing. */
+/**
+ * Headless: without a capture device getUserMedia fails → Instagram never shows recording during mic gestures.
+ * Defaults (no env spam):
+ * - Pulse capture source defaults to `${VOICE_NOTE_SINK}.monitor` (ffmpeg plays into the sink; Chrome captures the monitor).
+ * - With that default set, we do NOT add `--use-fake-device-for-media-stream` so the recording UI + real audio align.
+ * Local dev without Pulse: set VOICE_SKIP_PULSE_SOURCE=1 (restores headless fake device) or CHROMIUM_USE_FAKE_MEDIA_DEVICE=true.
+ */
+function voicePulseDefaultsDisabled() {
+  const v = process.env.VOICE_SKIP_PULSE_SOURCE;
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+const VOICE_NOTE_SINK = (process.env.VOICE_NOTE_SINK || 'ColdDMsVoice').trim();
+const VOICE_NOTE_PULSE_SOURCE_OVERRIDE = (process.env.VOICE_NOTE_PULSE_SOURCE || '').trim();
+
+/** Pulse source Chromium should capture (typically monitor of the sink ffmpeg writes to). */
+function getEffectiveVoicePulseSource() {
+  if (voicePulseDefaultsDisabled()) return '';
+  if (VOICE_NOTE_PULSE_SOURCE_OVERRIDE) return VOICE_NOTE_PULSE_SOURCE_OVERRIDE;
+  return `${VOICE_NOTE_SINK}.monitor`;
+}
+
+function buildBrowserEnvWithPulse() {
+  const src = getEffectiveVoicePulseSource();
+  if (!src) return undefined;
+  return { ...process.env, PULSE_SOURCE: src };
+}
+
 function appendOptionalFakeMediaDeviceArg(args) {
   if (!Array.isArray(args)) return;
-  const on =
+  if (args.some((a) => a === '--use-fake-device-for-media-stream')) return;
+  const explicitFalse =
+    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === 'false' ||
+    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === '0';
+  const explicitTrue =
     process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === '1' ||
     process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === 'true';
-  if (on && !args.some((a) => a === '--use-fake-device-for-media-stream')) {
-    args.push('--use-fake-device-for-media-stream');
-  }
+  const headless = process.env.HEADLESS_MODE !== 'false';
+  const hasPulseSource = !!getEffectiveVoicePulseSource();
+  let useFake;
+  if (explicitTrue) useFake = true;
+  else if (explicitFalse) useFake = false;
+  else if (hasPulseSource) useFake = false;
+  else useFake = headless;
+  if (useFake) args.push('--use-fake-device-for-media-stream');
 }
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
-const VOICE_NOTE_SINK = (process.env.VOICE_NOTE_SINK || 'ColdDMsVoice').trim();
-const VOICE_NOTE_PULSE_SOURCE = (process.env.VOICE_NOTE_PULSE_SOURCE || '').trim();
 
 function wantsVoiceNotes(sendOpts = {}) {
   return !!((sendOpts.voiceNotePath || '').trim());
@@ -907,8 +941,9 @@ function buildFollowUpLaunchOptions() {
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
   };
+  const pulseEnv = buildBrowserEnvWithPulse();
+  if (pulseEnv) opts.env = pulseEnv;
   appendOptionalFakeMediaDeviceArg(opts.args);
   applyPuppeteerSlowMo(opts);
   applyHeadedChromeWindowToLaunchOpts(opts);
@@ -1385,7 +1420,10 @@ async function runBotMultiTenant() {
     ],
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
+  {
+    const pulseEnv = buildBrowserEnvWithPulse();
+    if (pulseEnv) launchOpts.env = pulseEnv;
+  }
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1598,7 +1636,10 @@ async function runBot() {
     ],
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
+  {
+    const pulseEnv = buildBrowserEnvWithPulse();
+    if (pulseEnv) launchOpts.env = pulseEnv;
+  }
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1735,8 +1776,11 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
   };
+  {
+    const pulseEnv = buildBrowserEnvWithPulse();
+    if (pulseEnv) connectLaunch.env = pulseEnv;
+  }
   appendOptionalFakeMediaDeviceArg(connectLaunch.args);
   applyPuppeteerSlowMo(connectLaunch);
   const browser = await puppeteer.launch(connectLaunch);

@@ -33,6 +33,12 @@ const VOICE_RECORDING_UI_CONFIRM_STREAK = Math.min(
   Math.max(1, parseInt(process.env.VOICE_RECORDING_UI_CONFIRM_STREAK, 10) || 2)
 );
 
+/** After all mic attempts fail, wait this long and poll once — IG often paints recording UI slightly after the last gesture. */
+const VOICE_LATE_RECORDING_UI_MS = Math.min(
+  8000,
+  Math.max(0, parseInt(process.env.VOICE_LATE_RECORDING_UI_MS, 10) || 2000)
+);
+
 /** Max wait after mic click for Instagram recording strip (blue bar / 0:xx timer). */
 const VOICE_RECORDING_UI_TIMEOUT_MS = Math.min(
   Math.max(parseInt(process.env.VOICE_RECORDING_UI_TIMEOUT_MS, 10) || 12000, 3000),
@@ -1274,6 +1280,16 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         .catch(() => {});
 
       let act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta);
+      if (!act.ok && VOICE_LATE_RECORDING_UI_MS > 0) {
+        await delay(VOICE_LATE_RECORDING_UI_MS);
+        const late = await evaluateRecordingUiOnce(page);
+        if (late && late.ok) {
+          if (logger) {
+            logger.log(`Voice: recording UI detected after mic attempts (late poll, ${late.why})`);
+          }
+          act = { ok: true, why: late.why, method: 'late_poll_after_mic_attempts' };
+        }
+      }
       if (!act.ok && VOICE_ASSUME_RECORDING_AFTER_MIC) {
         if (logger) {
           logger.warn(
