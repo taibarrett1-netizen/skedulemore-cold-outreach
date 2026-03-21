@@ -74,7 +74,9 @@ The worker tries **several mic gestures in order**, and after **each** one polls
 
 Composer-scoped detection uses the **same composer discovery** as focus/mic prep (`p[contenteditable]`, “add/write a message”, then first visible textbox) so logs are less likely to show **`lastWhy=no_composer`** when the dock is non-English or the placeholder omits the word “message”.
 
-**ffmpeg → Pulse** starts only after that check passes (timer **`0:xx`/`1:xx`**, pause/delete **aria**, or a **wide** blue strip in the dock — not a bubble). If all attempts fail → **`voice_recording_ui_not_detected`**.
+**ffmpeg → Pulse** starts only after that check passes: timer **`0:xx`/`1:xx`**, pause/delete **aria**, or a **thin blue strip** whose bottom edge sits **at the composer seam** (wide outgoing bubbles no longer count — they caused false “recording started”). The worker also requires **two matching detection polls** in a row so a one-frame glitch doesn’t start playback.
+
+Mic gestures include a normal click, then **`mouse_hold_to_start_recording`** (long press, **`VOICE_MIC_START_HOLD_MS`** ~550 ms by default) for builds that behave more like “press to arm” in headless. If all attempts fail → **`voice_recording_ui_not_detected`**.
 
 Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOICE_RECORDING_UI_TIMEOUT_MS`** still influences the default when unset; **`VOICE_MIC_PRESS_HOLD_MS`** for the press-hold attempt.
 

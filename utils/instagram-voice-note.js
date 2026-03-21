@@ -294,8 +294,10 @@ function detectInstagramVoiceRecordingUiScript() {
       );
     };
 
-    /** Pause / delete recording — only in composer dock. */
-    for (const el of document.querySelectorAll('[aria-label], [title], button, [role="button"]')) {
+    /** Pause / delete recording — only in composer dock (IG often uses div[tabindex="0"], not role=button). */
+    for (const el of document.querySelectorAll(
+      '[aria-label], [title], button, [role="button"], div[tabindex], span[tabindex], a[tabindex]'
+    )) {
       let r;
       try {
         r = el.getBoundingClientRect();
@@ -326,7 +328,8 @@ function detectInstagramVoiceRecordingUiScript() {
     }
 
     /**
-     * Blue recording strip: must sit in dock, be **wider than tall** (not a bubble), bounded height.
+     * Blue “recording” strip: must hug the composer seam (outgoing bubbles also match RGB + wide+short).
+     * Without strict placement we get false positives → ffmpeg runs while IG never left idle composer.
      */
     for (const el of document.querySelectorAll('div, span')) {
       let r;
@@ -336,8 +339,10 @@ function detectInstagramVoiceRecordingUiScript() {
         continue;
       }
       if (!centerInDock(r)) continue;
-      if (r.width < 160 || r.height < 12 || r.height > 64) continue;
-      if (r.width < r.height * 2.2) continue;
+      if (r.width < 180 || r.height < 10 || r.height > 36) continue;
+      if (r.width < r.height * 3) continue;
+      /** Bottom edge of strip sits at/just above the message field top (not a bubble higher in the thread). */
+      if (r.bottom > cr.top + 14 || r.top < cr.top - 52) continue;
       const bg = window.getComputedStyle(el).backgroundColor;
       const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
       if (!mm) continue;
@@ -364,13 +369,27 @@ async function evaluateRecordingUiOnce(page) {
 async function waitForRecordingUiAfterAttempt(page, maxMs, pollMs, logger, methodLabel) {
   const start = Date.now();
   let lastWhy = 'none';
+  /** Require two matching polls so a one-frame false positive does not start ffmpeg. */
+  let lastOkSig = '';
+  let streak = 0;
   while (Date.now() - start < maxMs) {
     const res = await evaluateRecordingUiOnce(page);
     if (res && res.ok) {
-      if (logger) logger.log(`Voice: recording UI (${res.why}) after ${methodLabel}`);
-      return { ok: true, why: res.why, method: methodLabel };
+      const sig = `${res.why}`;
+      if (sig === lastOkSig) streak += 1;
+      else {
+        lastOkSig = sig;
+        streak = 1;
+      }
+      if (streak >= 2) {
+        if (logger) logger.log(`Voice: recording UI (${res.why}) after ${methodLabel} (confirmed x2)`);
+        return { ok: true, why: res.why, method: methodLabel };
+      }
+    } else {
+      lastOkSig = '';
+      streak = 0;
+      lastWhy = (res && res.why) || 'none';
     }
-    lastWhy = (res && res.why) || 'none';
     await delay(pollMs);
   }
   if (logger) logger.log(`Voice: no recording UI after ${methodLabel} (lastWhy=${lastWhy})`);
@@ -396,6 +415,12 @@ const VOICE_MIC_PRESS_HOLD_MS = Math.min(
   400
 );
 
+/** Longer press on mic to *start* recording (ms) when a normal click does not open the recording UI. */
+const VOICE_MIC_START_HOLD_MS = Math.min(
+  Math.max(parseInt(process.env.VOICE_MIC_START_HOLD_MS, 10) || 550, 350),
+  2500
+);
+
 /**
  * Try several click paths; only proceed to the next if recording UI did not appear.
  */
@@ -409,6 +434,21 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
         } catch {
           await page.mouse.click(cx, cy, { delay: 40 });
         }
+      },
+    },
+    {
+      /**
+       * Point at mic center and hold (mobile-style start). Desktop Web is usually tap-to-toggle, but
+       * headless/IG sometimes only arms recording after a longer press.
+       */
+      name: 'mouse_hold_to_start_recording',
+      run: async () => {
+        await page.mouse.move(Math.round(cx), Math.round(cy));
+        await delay(100);
+        await page.mouse.down();
+        await delay(VOICE_MIC_START_HOLD_MS);
+        await page.mouse.up();
+        await delay(80);
       },
     },
     {
@@ -852,9 +892,23 @@ function voiceSendResolveScript(opts) {
       return cx >= dockLeft && cx <= dockRight && cy >= dockTop && cy <= dockBottom;
     };
 
-    const clickables = Array.from(
-      document.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"]')
-    );
+    /** IG composer icons are often focusable divs without role="button" → docked was 0 before. */
+    const clickSet = new Set();
+    for (const sel of [
+      'button',
+      '[role="button"]',
+      'a[role="button"]',
+      'div[tabindex="0"]',
+      'span[tabindex="0"]',
+      'a[tabindex="0"]',
+    ]) {
+      try {
+        document.querySelectorAll(sel).forEach((n) => clickSet.add(n));
+      } catch {
+        /* ignore */
+      }
+    }
+    const clickables = Array.from(clickSet);
 
     const docked = clickables.filter((el) => visible(el) && !inStickerNoise(el) && centerInDock(el));
 
