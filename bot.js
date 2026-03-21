@@ -934,11 +934,12 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
     const launchOpts = buildFollowUpLaunchOptions();
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
-    await grantMicrophoneForInstagram(page);
+    await grantMicrophoneForInstagram(page, logger);
     await applyDesktopEmulation(page);
     await page.setCookie(...cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
+    await grantMicrophoneForInstagram(page, logger);
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
     if (page.url().includes('/accounts/login')) {
@@ -956,6 +957,8 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
         logger.warn(
           `[debug] follow-up/browser: could not open DM @${u} (${nav.reason || 'unknown'}) — staying on current page`
         );
+      } else {
+        await grantMicrophoneForInstagram(page, logger);
       }
     }
 
@@ -1113,13 +1116,14 @@ async function sendFollowUp(body) {
   try {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
-    if (hasAudio) await grantMicrophoneForInstagram(page);
+    if (hasAudio) await grantMicrophoneForInstagram(page, logger);
     await page.setCookie(...cookies);
     if (hasAudio) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
+    if (hasAudio) await grantMicrophoneForInstagram(page, logger);
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
     if (page.url().includes('/accounts/login')) {
@@ -1132,6 +1136,7 @@ async function sendFollowUp(body) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
       return fail(errMsg, 400);
     }
+    if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
       const sent = await sendPlainTextInThread(page, String(body.text).trim());
@@ -1398,7 +1403,7 @@ async function runBotMultiTenant() {
 
   try {
     page = await browser.newPage();
-    await grantMicrophoneForInstagram(page);
+    await grantMicrophoneForInstagram(page, logger);
     if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
   } catch (err) {
@@ -1623,7 +1628,7 @@ async function runBot() {
 
   try {
     page = await browser.newPage();
-    await grantMicrophoneForInstagram(page);
+    await grantMicrophoneForInstagram(page, logger);
     if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
     if (useSessionCookies) {

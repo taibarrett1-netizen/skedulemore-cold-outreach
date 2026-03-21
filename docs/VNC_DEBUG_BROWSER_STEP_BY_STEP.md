@@ -134,6 +134,20 @@ Connect to:
 **You should see the grey `xterm` from Part D.**  
 If VNC connects but is **still** all black, go back to Part B/C/D — do **not** continue until `xterm` is visible.
 
+### E2b — See the **whole** Chrome window (no VNC panning)
+
+The remote screen is a **fixed** Xvfb size. If it’s bigger than your TigerVNC window, you scroll/pan. Two approaches:
+
+1. **Match your Mac (1:1, no scroll)**  
+   - On Mac: **System Settings → Displays** — note resolution (e.g. **1512×982** or **1728×1117**).  
+   - In VPS `.env`: set `DESKTOP_VIEWPORT_WIDTH` / `DESKTOP_VIEWPORT_HEIGHT` to that (or slightly smaller). Keep `DESKTOP_WINDOW_PAD_Y` (~220) so `--window-size` is **taller** than the viewport.  
+   - **Xvfb** width = viewport width; height ≥ viewport height + `DESKTOP_WINDOW_PAD_Y` + ~40 (slack). Example: viewport **1512×982**, pad 220 → `Xvfb :98 -screen 0 1512x1242x24`.  
+   - Restart Xvfb / fluxbox / x11vnc / PM2, open debug browser again. The remote desktop should fit your Mac viewer without horizontal/vertical pan.
+
+2. **Scale to fit (blurrier)**  
+   - TigerVNC: try **Full screen** (menu **View**, or shortcut depending on build) so the whole framebuffer is visible on your Mac.  
+   - Or enlarge the TigerVNC window to your screen; some builds have **zoom / fit to window**.
+
 ### E3. If TigerVNC says “no matching security types”
 
 Use a VNC password instead of `-nopw`:
@@ -220,6 +234,12 @@ If **no** chromium process:
 
 - `pm2 logs --lines 100` and search for `[debug] follow-up/browser`
 - Common messages: session expired (login page), missing cookies, Supabase error, or **409** if a debug session is already “active” → **restart PM2** (Part A2) and call the endpoint again.
+
+### G1b — Manual mic in DMs (“nothing happens” / popup at top)
+
+- **Desktop Instagram** usually expects **press and hold** on the mic (~**0.5–1 s**), not a single click. Release after the recording UI (timer / blue bar) appears.  
+- The bot re-runs **`overridePermissions(microphone)`** after Instagram loads and after opening a thread — check **`pm2 logs`** for **`[voice] Microphone permission granted`**. If you see **overridePermissions failed**, Chrome may show an **infobar above the page** (easy to miss if the window is clipped). **Scroll the VNC view to y=0** or look at the **very top** of the Chrome window (above instagram.com).  
+- Real audio capture on the VPS needs **PulseAudio** / `PULSE_SOURCE` etc.; for UI-only checks, `--use-fake-ui-for-media-stream` is already enabled in launch args.
 
 ### G2. How long the window stays open
 

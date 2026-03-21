@@ -543,17 +543,35 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
 
 /**
  * Grant mic for instagram.com so getUserMedia succeeds without a permission prompt.
- * Safe to call once per page/context.
+ * Call **after** at least one navigation to instagram.com if prompts still appear (some Chromium builds
+ * ignore early overrides). Safe to call multiple times per context.
+ *
+ * @param {import('puppeteer').Page} page
+ * @param {{ log?: Function, warn?: Function } | null} [logger]
  */
-async function grantMicrophoneForInstagram(page) {
-  const origins = ['https://www.instagram.com', 'https://instagram.com'];
+async function grantMicrophoneForInstagram(page, logger) {
+  const origins = [
+    'https://www.instagram.com',
+    'https://instagram.com',
+    'https://www.instagram.com/',
+  ];
   for (const origin of origins) {
     try {
       await page.browserContext().overridePermissions(origin, ['microphone']);
+      if (logger && typeof logger.log === 'function') {
+        logger.log(`[voice] Microphone permission granted for ${origin}`);
+      }
       return true;
-    } catch {
-      /* try next origin */
+    } catch (e) {
+      if (logger && typeof logger.warn === 'function') {
+        logger.warn(`[voice] overridePermissions failed for ${origin}: ${e && e.message ? e.message : e}`);
+      }
     }
+  }
+  if (logger && typeof logger.warn === 'function') {
+    logger.warn(
+      '[voice] Could not grant microphone via overridePermissions — Chrome may show a top infobar or block recording. Check PulseAudio / PULSE_SOURCE on the VPS.'
+    );
   }
   return false;
 }
