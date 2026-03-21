@@ -88,6 +88,20 @@
         <option value="true">Yes</option>
         <option value="false">No</option>
       </select>
+      <label>Voice note file path (VPS)</label>
+      <input type="text" id="env-voice-note-file" placeholder="/root/ColdDMs/voice-notes/demo.wav">
+      <label>Voice note mode</label>
+      <select id="env-voice-note-mode">
+        <option value="after_text">Send text then voice note</option>
+        <option value="voice_only">Voice note only</option>
+      </select>
+      <label>Pulse sink name</label>
+      <input type="text" id="env-voice-note-sink" placeholder="ColdDMsVoice">
+      <label>Pulse source (optional)</label>
+      <input type="text" id="env-voice-note-source" placeholder="ColdDMsVoice.monitor">
+      <label>Upload a voice note to VPS</label>
+      <input type="file" id="voice-file" accept=".wav,.mp3,.m4a,.ogg,.webm,audio/*">
+      <button id="btn-upload-voice">Upload voice note</button>
       <button id="btn-save-settings">Save settings</button>
     </div>
     <div class="card">
@@ -241,6 +255,10 @@
         document.getElementById('env-min-delay').value = d.MIN_DELAY_MINUTES || 5;
         document.getElementById('env-max-delay').value = d.MAX_DELAY_MINUTES || 30;
         document.getElementById('env-headless').value = (d.HEADLESS_MODE || 'true') === 'true' ? 'true' : 'false';
+        document.getElementById('env-voice-note-file').value = d.VOICE_NOTE_FILE || '';
+        document.getElementById('env-voice-note-mode').value = d.VOICE_NOTE_MODE || 'after_text';
+        document.getElementById('env-voice-note-sink').value = d.VOICE_NOTE_SINK || 'ColdDMsVoice';
+        document.getElementById('env-voice-note-source').value = d.VOICE_NOTE_PULSE_SOURCE || '';
       });
       fetch('/api/messages').then(r => r.json()).then(d => {
         document.getElementById('messages-list').value = (d.messages || []).join('\n');
@@ -254,7 +272,11 @@
         DAILY_SEND_LIMIT: document.getElementById('env-daily-limit').value,
         MIN_DELAY_MINUTES: document.getElementById('env-min-delay').value,
         MAX_DELAY_MINUTES: document.getElementById('env-max-delay').value,
-        HEADLESS_MODE: document.getElementById('env-headless').value
+        HEADLESS_MODE: document.getElementById('env-headless').value,
+        VOICE_NOTE_FILE: document.getElementById('env-voice-note-file').value.trim(),
+        VOICE_NOTE_MODE: document.getElementById('env-voice-note-mode').value,
+        VOICE_NOTE_SINK: document.getElementById('env-voice-note-sink').value.trim(),
+        VOICE_NOTE_PULSE_SOURCE: document.getElementById('env-voice-note-source').value.trim(),
       };
       if (payload.INSTAGRAM_PASSWORD === '********') delete payload.INSTAGRAM_PASSWORD;
       fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
@@ -269,6 +291,22 @@
       fetch('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages }) })
         .then(r => r.json()).then(() => { showMsg('messages-msg', 'Messages saved.', true); })
         .catch(() => { showMsg('messages-msg', 'Failed to save.', false); });
+    });
+
+    document.getElementById('btn-upload-voice').addEventListener('click', () => {
+      const input = document.getElementById('voice-file');
+      if (!input.files || !input.files[0]) { showMsg('settings-msg', 'Choose an audio file first.', false); return; }
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      fetch('/api/voice/upload', { method: 'POST', body: fd })
+        .then(r => r.json())
+        .then((d) => {
+          if (!d.ok) throw new Error(d.error || 'Upload failed');
+          document.getElementById('env-voice-note-file').value = d.path || '';
+          showMsg('settings-msg', 'Voice note uploaded. Click Save settings.', true);
+          input.value = '';
+        })
+        .catch((e) => showMsg('settings-msg', e.message || 'Upload failed.', false));
     });
 
     function showMsg(id, text, success) {

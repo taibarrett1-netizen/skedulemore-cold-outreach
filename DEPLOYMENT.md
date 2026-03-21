@@ -31,6 +31,23 @@ Puppeteer needs these on minimal Linux for headless Chrome:
 sudo apt install -y libgbm1 libasound2 libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libpango-1.0-0 libcairo2
 ```
 
+### Voice notes prerequisites (optional)
+
+If you want Instagram voice-note sending from VPS:
+
+```bash
+sudo apt install -y pulseaudio-utils pulseaudio ffmpeg
+pactl load-module module-null-sink sink_name=ColdDMsVoice sink_properties=device.description=ColdDMsVoice
+pactl list short sources | rg "ColdDMsVoice.*monitor"
+```
+
+Set these in `.env`:
+
+- `VOICE_NOTE_FILE=/absolute/path/to/voice.wav`
+- `VOICE_NOTE_MODE=after_text` or `voice_only`
+- `VOICE_NOTE_SINK=ColdDMsVoice`
+- `VOICE_NOTE_PULSE_SOURCE=ColdDMsVoice.monitor` (optional but recommended)
+
 ## 5. Get the project onto the server
 
 Repo name is **ColdDMs**; on your Mac the folder may be **Cold DMs V1**. On the server, `cd` into whatever the folder is actually called there.
@@ -60,6 +77,7 @@ No inbound firewall ports are needed for the bot; it only makes outbound connect
 ## 6. Configure on the server
 
 - Create `.env` (same variables as local). Set `HEADLESS_MODE=true`.
+- For voice notes, use WAV PCM mono 48kHz when possible; compressed formats also work but can be less reliable for waveform duration.
 - Add `leads.csv` in the project folder (or set `LEADS_CSV` in `.env`).
 - The SQLite DB at `database/bot.db` is created on first run; ensure the `database/` directory is writable.
 

@@ -13,10 +13,18 @@ function getRandomMobileUA() {
 }
 
 const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 };
+const DESKTOP_VIEWPORT = { width: 1280, height: 800, isMobile: false, hasTouch: false, deviceScaleFactor: 1 };
+const DESKTOP_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
 async function applyMobileEmulation(page) {
   await page.setUserAgent(getRandomMobileUA());
   await page.setViewport(MOBILE_VIEWPORT);
 }
 
-module.exports = { getRandomMobileUA, MOBILE_VIEWPORT, applyMobileEmulation };
+async function applyDesktopEmulation(page) {
+  await page.setUserAgent(DESKTOP_UA);
+  await page.setViewport(DESKTOP_VIEWPORT);
+}
+
+module.exports = { getRandomMobileUA, MOBILE_VIEWPORT, DESKTOP_VIEWPORT, applyMobileEmulation, applyDesktopEmulation };

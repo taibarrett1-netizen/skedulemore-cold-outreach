@@ -28,7 +28,7 @@ const {
   savePlatformScraperSession,
   addCampaignLeadsFromGroups,
 } = require('./database/supabase');
-const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA } = require('./bot');
+const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA, sendFollowUp } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 
@@ -37,10 +37,13 @@ const PORT = process.env.DASHBOARD_PORT || 3000;
 const projectRoot = path.join(__dirname);
 const envPath = path.join(projectRoot, '.env');
 const leadsPath = path.join(projectRoot, process.env.LEADS_CSV || 'leads.csv');
+const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+if (!fs.existsSync(voiceNotesDir)) fs.mkdirSync(voiceNotesDir, { recursive: true });
+app.use('/voice-notes', express.static(voiceNotesDir));
 
 // Optional API key for external clients (e.g. Lovable). Set COLD_DM_API_KEY in .env to enable.
 const API_KEY = process.env.COLD_DM_API_KEY;
@@ -55,6 +58,7 @@ if (API_KEY) {
 }
 
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
+const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 * 1024 } });
 
 const BOT_PM2_NAME = 'ig-dm-bot';
 
@@ -173,6 +177,10 @@ const ENV_KEYS = [
   'MAX_SENDS_PER_HOUR',
   'HEADLESS_MODE',
   'LEADS_CSV',
+  'VOICE_NOTE_FILE',
+  'VOICE_NOTE_MODE',
+  'VOICE_NOTE_SINK',
+  'VOICE_NOTE_PULSE_SOURCE',
 ];
 
 function readEnv() {
@@ -267,6 +275,44 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
   const body = usernames.join('\n') + (usernames.length ? '\n' : '');
   fs.writeFileSync(leadsPath, header + body, 'utf8');
   res.json({ ok: true, count: usernames.length });
+});
+
+/**
+ * SkeduleMore follow-up send (browser session). Auth: Bearer COLD_DM_API_KEY (same as other /api routes when set).
+ * Body: { clientId, instagramSessionId, recipientUsername, text? | messages? | audioUrl?, caption? }
+ * Follow-up voice: `audioUrl` = signed HTTPS URL (e.g. Storage voice-notes); no cold_dm_campaigns / message_group columns.
+ */
+app.post('/api/follow-up/send', async (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const result = await sendFollowUp(req.body || {});
+    if (result.ok) return res.json({ ok: true });
+    const status = result.statusCode && result.statusCode >= 400 && result.statusCode < 600 ? result.statusCode : 400;
+    return res.status(status).json({ ok: false, error: result.error || 'Send failed' });
+  } catch (e) {
+    console.error('[API] follow-up/send failed', e);
+    return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
+  }
+});
+
+app.post('/api/voice/upload', uploadVoice.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
+  const ext = path.extname(req.file.originalname || '').toLowerCase();
+  const allowed = new Set(['.wav', '.mp3', '.m4a', '.ogg', '.webm']);
+  if (!allowed.has(ext)) {
+    fs.unlinkSync(req.file.path);
+    return res.status(400).json({ ok: false, error: 'Only wav/mp3/m4a/ogg/webm audio is allowed' });
+  }
+  const safeBase = path.basename(req.file.originalname, ext).replace(/[^a-z0-9_-]+/gi, '_').slice(0, 60) || 'voice_note';
+  const finalName = `${Date.now()}_${safeBase}${ext}`;
+  const finalPath = path.join(voiceNotesDir, finalName);
+  fs.renameSync(req.file.path, finalPath);
+  const env = readEnv();
+  env.VOICE_NOTE_FILE = finalPath;
+  writeEnv(env);
+  res.json({ ok: true, path: finalPath, publicUrl: `/voice-notes/${finalName}` });
 });
 
 // Pending 2FA sessions: id -> { page, browser, username, clientId, createdAt }. Cleared when code is submitted or after TTL.

@@ -247,6 +247,20 @@ async function getSession(clientId) {
   return data;
 }
 
+/** Instagram session row for a specific id; must belong to clientId (follow-up send). */
+async function getInstagramSessionByIdForClient(clientId, sessionId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !sessionId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select('id, client_id, session_data, instagram_username')
+    .eq('id', sessionId)
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
 /** All sessions for a client. Used when campaign has no assigned sessions. */
 async function getSessions(clientId) {
   const sb = getSupabase();
@@ -1039,16 +1053,27 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
 async function getActiveCampaigns(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
-  const { data, error } = await sb
-    .from('cold_dm_campaigns')
-    .select(
-      'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
-    )
-    .eq('client_id', clientId)
-    .eq('status', 'active')
-    .order('created_at', { ascending: true });
-  if (error) throw error;
-  return data || [];
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_campaigns')
+      .select(
+        'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
+      )
+      .eq('client_id', clientId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    const { data, error } = await sb
+      .from('cold_dm_campaigns')
+      .select('id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec')
+      .eq('client_id', clientId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return (data || []).map((r) => ({ ...r, send_voice_note: false, voice_note_storage_path: null, voice_note_mode: 'after_text' }));
+  }
 }
 
 /**
@@ -1109,14 +1134,30 @@ function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
 async function getRandomMessageFromGroup(messageGroupId) {
   const sb = getSupabase();
   if (!sb || !messageGroupId) return null;
-  const { data, error } = await sb
-    .from('cold_dm_message_group_messages')
-    .select('id, message_text')
-    .eq('message_group_id', messageGroupId)
-    .order('sort_order', { ascending: true });
-  if (error || !data || data.length === 0) return null;
-  const row = data[Math.floor(Math.random() * data.length)];
-  return { id: row.id, message_text: row.message_text };
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_message_group_messages')
+      .select('id, message_text, send_voice_note, voice_note_storage_path')
+      .eq('message_group_id', messageGroupId)
+      .order('sort_order', { ascending: true });
+    if (error || !data || data.length === 0) return null;
+    const row = data[Math.floor(Math.random() * data.length)];
+    return {
+      id: row.id,
+      message_text: row.message_text,
+      send_voice_note: row.send_voice_note === true,
+      voice_note_storage_path: row.voice_note_storage_path || null,
+    };
+  } catch (e) {
+    const { data, error } = await sb
+      .from('cold_dm_message_group_messages')
+      .select('id, message_text')
+      .eq('message_group_id', messageGroupId)
+      .order('sort_order', { ascending: true });
+    if (error || !data || data.length === 0) return null;
+    const row = data[Math.floor(Math.random() * data.length)];
+    return { id: row.id, message_text: row.message_text, send_voice_note: false, voice_note_storage_path: null };
+  }
 }
 
 async function getMessageTemplateById(templateId) {
@@ -1141,15 +1182,23 @@ async function getNextPendingCampaignLead(clientId) {
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     let messageText = null;
     let messageGroupMessageId = null;
+    let voiceNotePath = null;
+    let voiceNoteMode = camp.voice_note_mode || 'after_text';
     if (camp.message_group_id) {
       const groupMsg = await getRandomMessageFromGroup(camp.message_group_id);
       if (groupMsg) {
         messageText = groupMsg.message_text;
         messageGroupMessageId = groupMsg.id;
+        if (groupMsg.send_voice_note && groupMsg.voice_note_storage_path) {
+          voiceNotePath = groupMsg.voice_note_storage_path;
+        }
       }
     }
     if (!messageText && camp.message_template_id) {
       messageText = await getMessageTemplateById(camp.message_template_id);
+    }
+    if (!voiceNotePath && camp.send_voice_note && camp.voice_note_storage_path) {
+      voiceNotePath = camp.voice_note_storage_path;
     }
     if (!messageText) continue;
 
@@ -1236,6 +1285,8 @@ async function getNextPendingCampaignLead(clientId) {
       hourlySendLimit: camp.hourly_send_limit,
       minDelaySec: camp.min_delay_sec,
       maxDelaySec: camp.max_delay_sec,
+      voiceNotePath,
+      voiceNoteMode,
     };
   }
   return null;
@@ -1330,6 +1381,7 @@ module.exports = {
   getLeads,
   getLeadsTotalAndRemaining,
   getSession,
+  getInstagramSessionByIdForClient,
   getSessions,
   getSessionsForCampaign,
   saveSession,

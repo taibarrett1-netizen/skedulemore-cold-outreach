@@ -3,13 +3,17 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const csv = require('csv-parser');
 const { getRandomMessage } = require('./config/messages');
 const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getControl, setControl } = require('./database/db');
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
-const { applyMobileEmulation } = require('./utils/mobile-viewport');
+const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
+const { startVoiceNotePlayback } = require('./utils/voice-note-audio');
+const { sendVoiceNoteInThread } = require('./utils/instagram-voice-note');
+const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -18,6 +22,42 @@ const MAX_DELAY_MS = (parseInt(process.env.MAX_DELAY_MINUTES, 10) || 30) * 60 * 
 const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
 const HEADLESS = process.env.HEADLESS_MODE !== 'false';
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
+const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
+const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
+const VOICE_NOTE_SINK = (process.env.VOICE_NOTE_SINK || 'ColdDMsVoice').trim();
+const VOICE_NOTE_PULSE_SOURCE = (process.env.VOICE_NOTE_PULSE_SOURCE || '').trim();
+
+function wantsVoiceNotes(sendOpts = {}) {
+  return !!((sendOpts.voiceNotePath || '').trim());
+}
+
+function buildVoiceSendConfig(sendOpts = {}) {
+  const modeRaw = String(sendOpts.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').toLowerCase();
+  const mode = modeRaw === 'voice_only' ? 'voice_only' : 'after_text';
+  return {
+    voiceNotePath: (sendOpts.voiceNotePath || '').trim(),
+    mode,
+  };
+}
+
+/** Download HTTPS URL to temp file (Supabase Storage signed URLs, follow-up audioUrl, etc.) or pass through local path. */
+async function resolveVoiceNotePath(rawPath) {
+  const p = (rawPath || '').trim();
+  if (!p) return { localPath: '', cleanup: async () => {} };
+  if (!/^https?:\/\//i.test(p)) return { localPath: p, cleanup: async () => {} };
+  const res = await fetch(p);
+  if (!res.ok) throw new Error('voice_note_download_failed');
+  const ab = await res.arrayBuffer();
+  const ext = path.extname(new URL(p).pathname || '').toLowerCase() || '.wav';
+  const outPath = path.join(os.tmpdir(), `voice-note-${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`);
+  await fs.promises.writeFile(outPath, Buffer.from(ab));
+  return {
+    localPath: outPath,
+    cleanup: async () => {
+      await fs.promises.unlink(outPath).catch(() => {});
+    },
+  };
+}
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -349,6 +389,8 @@ async function login(page, credentials) {
 const MAX_SEND_RETRIES = 3;
 
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
+  const voiceCfg = buildVoiceSendConfig(sendOpts);
+  if (wantsVoiceNotes(voiceCfg)) await applyDesktopEmulation(page);
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
 
@@ -658,6 +700,37 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     firstNameBlocklist: sendOpts.firstNameBlocklist || new Set(),
     onFirstNameEmpty: (reason) => logger.warn(`First name empty for @${u}: ${reason}`),
   });
+  const shouldSendText = voiceCfg.mode !== 'voice_only';
+  const shouldSendVoice = wantsVoiceNotes(voiceCfg);
+  let textSent = false;
+  let voiceSent = false;
+  let voiceFailure = null;
+  const threadId = getInstagramThreadIdFromUrl(page.url());
+
+  const attemptVoiceSend = async () => {
+    if (!shouldSendVoice) return;
+    let playback = null;
+    let resolved = null;
+    try {
+      resolved = await resolveVoiceNotePath(voiceCfg.voiceNotePath);
+      playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
+      const holdMs = Math.round(playback.durationSec * 1000 + 700);
+      const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
+      if (!voiceResult.ok) {
+        voiceFailure = voiceResult.reason || 'voice_note_failed';
+        logger.warn(`Voice note send failed for @${u}: ${voiceFailure}`);
+        return;
+      }
+      voiceSent = true;
+      logger.log(`Voice note sent to @${u}.`);
+    } catch (e) {
+      voiceFailure = e.message || 'voice_note_failed';
+      logger.warn(`Voice note send error for @${u}: ${voiceFailure}`);
+    } finally {
+      if (playback) playback.stop();
+      if (resolved) await resolved.cleanup();
+    }
+  };
 
   if (composeFound) {
     const diag = await composeDiagnostic().catch(() => ({}));
@@ -682,7 +755,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return null;
     });
     const compose = composeEl.asElement();
-    if (compose) {
+    if (compose && shouldSendText) {
       await delay(500);
       await compose.click();
       await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
@@ -691,31 +764,217 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       await humanDelay();
       await page.keyboard.press('Enter');
       await delay(1500);
-      const threadId = getInstagramThreadIdFromUrl(page.url());
-      return { ok: true, finalMessage: msg, instagramThreadId: threadId, display_name: leadFromPage.display_name || undefined };
+      textSent = true;
+    } else if (compose) {
+      await compose.dispose();
+      await composeEl.dispose();
+      logger.log(`Skipping text send for @${u} (voice_only mode).`);
+    } else {
+      await composeEl.dispose();
+      logger.warn('Compose element not found after selector matched');
     }
-    await composeEl.dispose();
-    logger.warn('Compose element not found after selector matched');
+
+    await attemptVoiceSend();
+    if (textSent || voiceSent) {
+      return {
+        ok: true,
+        finalMessage: textSent ? msg : null,
+        instagramThreadId: threadId,
+        display_name: leadFromPage.display_name || undefined,
+      };
+    }
+    if (voiceFailure) return { ok: false, reason: voiceFailure };
   }
 
-  const keyboardSent = await page.evaluate((text) => {
+  const keyboardSent = shouldSendText ? await page.evaluate((text) => {
     const focusable = document.querySelector('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]');
     if (!focusable || focusable.offsetParent === null) return false;
     focusable.focus();
     focusable.click();
     return true;
-  }, msg);
+  }, msg) : false;
   if (keyboardSent) {
     await delay(300);
     await page.keyboard.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
     await humanDelay();
     await page.keyboard.press('Enter');
     await delay(1500);
-    const threadId = getInstagramThreadIdFromUrl(page.url());
-    return { ok: true, finalMessage: msg, instagramThreadId: threadId, display_name: leadFromPage.display_name || undefined };
+    textSent = true;
+    await attemptVoiceSend();
+    return {
+      ok: true,
+      finalMessage: msg,
+      instagramThreadId: threadId,
+      display_name: leadFromPage.display_name || undefined,
+    };
   }
 
+  await attemptVoiceSend();
+  if (voiceSent) {
+    return {
+      ok: true,
+      finalMessage: null,
+      instagramThreadId: threadId,
+      display_name: leadFromPage.display_name || undefined,
+    };
+  }
+  if (voiceFailure) return { ok: false, reason: voiceFailure };
+
   return { ok: false, reason: noComposeReason || 'no_compose' };
+}
+
+function buildFollowUpLaunchOptions() {
+  return {
+    headless: HEADLESS,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--use-fake-ui-for-media-stream',
+      '--autoplay-policy=no-user-gesture-required',
+    ],
+    env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
+  };
+}
+
+function followUpReasonToError(reason, pageSnippet) {
+  const map = {
+    user_not_found: 'Recipient not found in Instagram search',
+    account_private: 'Instagram account is private or unavailable',
+    rate_limited: 'Instagram rate limited. Try again later',
+    no_compose: 'Could not open DM compose',
+    messages_restricted: 'Messaging restricted for this thread',
+    voice_mic_not_found: 'Could not find voice recorder control',
+    voice_permission_denied: 'Microphone permission denied',
+    voice_send_button_not_found: 'Could not send voice note',
+    voice_note_failed: 'Voice note failed',
+    empty_message: 'Empty message',
+  };
+  let msg = map[reason] || reason || 'Send failed';
+  if (pageSnippet) msg += ` (${String(pageSnippet).slice(0, 120)})`;
+  return msg;
+}
+
+/**
+ * SkeduleMore follow-up send (HTTP-triggered). Does not write to Supabase messages tables.
+ *
+ * Voice: pass `audioUrl` (HTTPS signed URL from Supabase Storage `voice-notes` or similar) and optional `caption`.
+ * Follow-up audio is configured in dashboard `bot_config.follow_ups[]`; this handler does not read campaigns or
+ * `cold_dm_message_group_messages` / migration 010 columns — only the request body + `cold_dm_instagram_sessions`.
+ */
+async function sendFollowUp(body) {
+  const clientId = (body.clientId || '').trim();
+  const instagramSessionId = (body.instagramSessionId || '').trim();
+  const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
+  if (!clientId || !instagramSessionId || !recipientUsername) {
+    return { ok: false, error: 'clientId, instagramSessionId, and recipientUsername are required', statusCode: 400 };
+  }
+
+  const captionRaw = body.caption != null ? String(body.caption).trim() : '';
+  const hasCaption = captionRaw !== '';
+
+  const textSingle = body.text != null && String(body.text).trim() !== '';
+  let messageLines = null;
+  if (Array.isArray(body.messages)) {
+    messageLines = body.messages.map((m) => String(m).trim()).filter(Boolean);
+  }
+  const hasMessages = messageLines && messageLines.length > 0;
+  const audioUrlRaw = body.audioUrl != null ? String(body.audioUrl).trim() : '';
+  const hasAudio = audioUrlRaw !== '';
+
+  if (hasCaption && !hasAudio) {
+    return { ok: false, error: 'caption is only valid with audioUrl', statusCode: 400 };
+  }
+
+  const modeCount = [textSingle, hasMessages, hasAudio].filter(Boolean).length;
+  if (modeCount !== 1) {
+    return { ok: false, error: 'Specify exactly one of: text, messages (non-empty strings), or audioUrl', statusCode: 400 };
+  }
+  if (hasAudio && !/^https:\/\//i.test(audioUrlRaw)) {
+    return { ok: false, error: 'audioUrl must be an HTTPS URL', statusCode: 400 };
+  }
+
+  const session = await sb.getInstagramSessionByIdForClient(clientId, instagramSessionId);
+  if (!session) {
+    return { ok: false, error: 'Instagram session not found for this client', statusCode: 404 };
+  }
+  const cookies = session.session_data?.cookies;
+  if (!cookies?.length) {
+    return { ok: false, error: 'Session has no cookies; reconnect Instagram', statusCode: 400 };
+  }
+
+  const launchOpts = buildFollowUpLaunchOptions();
+  let browser;
+  try {
+    browser = await puppeteer.launch(launchOpts);
+    const page = await browser.newPage();
+    await page.setCookie(...cookies);
+    if (hasAudio) await applyDesktopEmulation(page);
+    else await applyMobileEmulation(page);
+
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await delay(2000);
+    if (page.url().includes('/accounts/login')) {
+      return { ok: false, error: 'Instagram session expired', statusCode: 401 };
+    }
+
+    const u = normalizeUsername(recipientUsername);
+    const nav = await navigateToDmThread(page, u);
+    if (!nav.ok) {
+      return { ok: false, error: followUpReasonToError(nav.reason, nav.pageSnippet), statusCode: 400 };
+    }
+
+    if (textSingle) {
+      const sent = await sendPlainTextInThread(page, String(body.text).trim());
+      if (!sent.ok) return { ok: false, error: followUpReasonToError(sent.reason), statusCode: 400 };
+      return { ok: true };
+    }
+
+    if (hasMessages) {
+      for (const line of messageLines) {
+        const sent = await sendPlainTextInThread(page, line);
+        if (!sent.ok) return { ok: false, error: followUpReasonToError(sent.reason), statusCode: 400 };
+        await delay(2000);
+      }
+      return { ok: true };
+    }
+
+    if (hasAudio) {
+      if (hasCaption) {
+        const cap = await sendPlainTextInThread(page, captionRaw);
+        if (!cap.ok) return { ok: false, error: followUpReasonToError(cap.reason), statusCode: 400 };
+        await delay(1200);
+      }
+      let playback = null;
+      let resolved = null;
+      try {
+        resolved = await resolveVoiceNotePath(audioUrlRaw);
+        if (!resolved.localPath) return { ok: false, error: 'Could not download audio file', statusCode: 400 };
+        playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
+        const holdMs = Math.round(playback.durationSec * 1000 + 700);
+        const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
+        if (!voiceResult.ok) {
+          return { ok: false, error: followUpReasonToError(voiceResult.reason || 'voice_note_failed'), statusCode: 400 };
+        }
+        return { ok: true };
+      } catch (e) {
+        if (e.message === 'voice_note_download_failed') {
+          return { ok: false, error: 'Could not download audio from audioUrl', statusCode: 400 };
+        }
+        throw e;
+      } finally {
+        if (playback) playback.stop();
+        if (resolved) await resolved.cleanup();
+      }
+    }
+
+    return { ok: false, error: 'No delivery mode', statusCode: 400 };
+  } catch (e) {
+    logger.warn('sendFollowUp error: ' + e.message);
+    return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 async function sendDM(page, username, adapter, options = {}) {
@@ -743,6 +1002,8 @@ async function sendDM(page, username, adapter, options = {}) {
   }
 
   const messageTemplate = messageOverride || adapter.getRandomMessage();
+  const resolvedVoicePath = (options.voice_note_path || options.voiceNotePath || VOICE_NOTE_FILE || '').trim();
+  const resolvedVoiceMode = (options.voice_note_mode || options.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
   const logSent = (status, finalMsg, failureReason = null) =>
     adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId, failureReason);
 
@@ -759,9 +1020,13 @@ async function sendDM(page, username, adapter, options = {}) {
   }
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
-      const result = await sendDMOnce(page, u, messageTemplate, nameFallback, { firstNameBlocklist });
+      const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
+        firstNameBlocklist,
+        voiceNotePath: resolvedVoicePath,
+        voiceNoteMode: resolvedVoiceMode,
+      });
       if (result.ok) {
-        const finalMessage = result.finalMessage != null ? result.finalMessage : messageTemplate;
+        const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
         if (options.clientId && result.instagramThreadId) {
@@ -780,7 +1045,19 @@ async function sendDM(page, username, adapter, options = {}) {
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
       }
-      const terminalReasons = ['user_not_found', 'no_compose', 'account_private', 'rate_limited', 'messages_restricted'];
+      const terminalReasons = [
+        'user_not_found',
+        'no_compose',
+        'account_private',
+        'rate_limited',
+        'messages_restricted',
+        'voice_note_failed',
+        'voice_mic_not_found',
+        'voice_permission_denied',
+        'voice_send_button_not_found',
+        'voice_note_file_not_found',
+        'voice_note_download_failed',
+      ];
       if (terminalReasons.includes(result.reason)) {
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason).catch(() => {});
@@ -849,8 +1126,15 @@ async function runBotMultiTenant() {
   logger.log('Starting multi-tenant sender loop (always-on).');
   const launchOpts = {
     headless: HEADLESS,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--use-fake-ui-for-media-stream',
+      '--autoplay-policy=no-user-gesture-required',
+    ],
   };
+  if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
   let browser;
   try {
     browser = await puppeteer.launch(launchOpts);
@@ -886,7 +1170,8 @@ async function runBotMultiTenant() {
 
   try {
     page = await browser.newPage();
-    await applyMobileEmulation(page);
+    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+    else await applyMobileEmulation(page);
   } catch (err) {
     logger.error('Page setup failed', err);
     await browser.close().catch(() => {});
@@ -979,6 +1264,8 @@ async function runBotMultiTenant() {
       first_name: work.first_name,
       last_name: work.last_name,
       display_name: work.display_name,
+      voice_note_path: work.voiceNotePath || VOICE_NOTE_FILE || null,
+      voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
     };
     sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
     const sendResult = await sendDM(page, work.username, adapter, options);
@@ -1047,8 +1334,15 @@ async function runBot() {
 
   const launchOpts = {
     headless: HEADLESS,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--use-fake-ui-for-media-stream',
+      '--autoplay-policy=no-user-gesture-required',
+    ],
   };
+  if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
   const useSessionCookies = false;
   if (!useSessionCookies) {
     try {
@@ -1097,7 +1391,8 @@ async function runBot() {
 
   try {
     page = await browser.newPage();
-    await applyMobileEmulation(page);
+    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+    else await applyMobileEmulation(page);
     if (useSessionCookies) {
       const session = await sb.getSession(clientId);
       const cookies = session?.session_data?.cookies;
@@ -1135,7 +1430,10 @@ async function runBot() {
       process.exit(0);
     }
     const work = { type: 'lead', username: leads[index] };
-    const options = {};
+    const options = {
+      voice_note_path: VOICE_NOTE_FILE || null,
+      voice_note_mode: VOICE_NOTE_MODE || 'after_text',
+    };
 
     const result = await sendDM(page, work.username, adapter, options);
     if (result.ok) index += 1;
@@ -1170,13 +1468,20 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
   if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--use-fake-ui-for-media-stream',
+      '--autoplay-policy=no-user-gesture-required',
+    ],
+    env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
   });
   let keepBrowserOpen = false;
   try {
     const page = await browser.newPage();
-    if (useMobile) await applyMobileEmulation(page);
-    else await page.setViewport({ width: 1280, height: 800 });
+    if (useMobile && !VOICE_NOTE_FILE) await applyMobileEmulation(page);
+    else await applyDesktopEmulation(page);
     await login(page, {
       username: instagramUsername,
       password: instagramPassword,
@@ -1320,4 +1625,4 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
   return { cookies, username: instagramUsername };
 }
 
-module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, login, connectInstagram, completeInstagram2FA };
+module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, sendFollowUp, login, connectInstagram, completeInstagram2FA };
