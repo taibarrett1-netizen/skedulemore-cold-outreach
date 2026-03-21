@@ -757,8 +757,13 @@ async function prepareVoiceNoteUi(page, opts = {}) {
   return { ok: false, reason: 'voice_mic_not_found' };
 }
 
-function clickSendAfterRecordingScript() {
-  return function clickSendVoice() {
+/**
+ * Resolve (and optionally click) the voice-note Send control. Single implementation for click + debug coords.
+ * @param {{ click: boolean }} opts
+ */
+function voiceSendResolveScript(opts) {
+  const doClick = !!(opts && opts.click);
+  return function voiceSendResolve() {
     const lower = (s) => (s || '').toLowerCase();
     const visible = (el) => {
       if (!el) return false;
@@ -827,7 +832,7 @@ function clickSendAfterRecordingScript() {
 
     const compose = findComposerForDock();
     if (!compose) {
-      return { ok: false, why: 'no_composer' };
+      return { ok: false, why: 'no_composer', dockedCount: 0 };
     }
     const cr = compose.getBoundingClientRect();
     const dockTop = Math.max(cr.top - 160, window.innerHeight * 0.52);
@@ -853,15 +858,55 @@ function clickSendAfterRecordingScript() {
 
     const docked = clickables.filter((el) => visible(el) && !inStickerNoise(el) && centerInDock(el));
 
-    const tryClick = (el, via) => {
+    const finish = (el, via) => {
+      let r;
       try {
-        el.click();
-        const label = (el.getAttribute && el.getAttribute('aria-label')) || '';
-        return { ok: true, via, label: label.slice(0, 120) };
+        r = el.getBoundingClientRect();
       } catch {
-        return { ok: false, why: 'click_throw' };
+        return { ok: false, why: 'bad_rect', dockedCount: docked.length };
       }
+      const label = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const out = {
+        ok: true,
+        via,
+        label: label.slice(0, 120),
+        x: r.left + r.width / 2,
+        y: r.top + r.height / 2,
+        dockedCount: docked.length,
+      };
+      if (doClick) {
+        try {
+          el.click();
+        } catch {
+          return { ok: false, why: 'click_throw', dockedCount: docked.length };
+        }
+      }
+      return out;
     };
+
+    for (const el of docked) {
+      const tid = lower(el.getAttribute('data-testid') || '');
+      if (tid.includes('send') && tid.includes('voice')) {
+        const res = finish(el, 'dock_data_testid_voice_send');
+        if (res.ok) return res;
+      }
+    }
+    for (const el of clickables) {
+      if (!visible(el) || inStickerNoise(el)) continue;
+      const tid = lower(el.getAttribute('data-testid') || '');
+      if (!tid.includes('send')) continue;
+      try {
+        const r = el.getBoundingClientRect();
+        const cy = r.top + r.height / 2;
+        if (cy < dockTop - 20 || cy > dockBottom) continue;
+      } catch {
+        continue;
+      }
+      const lab = lower(el.getAttribute('aria-label') || '');
+      if (isDefinitelyNotSend(lab, '', '')) continue;
+      const res = finish(el, 'dock_data_testid_send');
+      if (res.ok) return res;
+    }
 
     for (const el of docked) {
       const label = lower(el.getAttribute('aria-label') || '');
@@ -875,8 +920,8 @@ function clickSendAfterRecordingScript() {
         label === 'send' ||
         title === 'send'
       ) {
-        const r = tryClick(el, 'dock_aria_voice_or_send');
-        if (r.ok) return r;
+        const res = finish(el, 'dock_aria_voice_or_send');
+        if (res.ok) return res;
       }
     }
 
@@ -887,14 +932,13 @@ function clickSendAfterRecordingScript() {
       if (isDefinitelyNotSend(label, title, txt)) continue;
       if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) continue;
       if (label.includes('send') || title.includes('send') || txt === 'send') {
-        const r = tryClick(el, 'dock_aria_send_generic');
-        if (r.ok) return r;
+        const res = finish(el, 'dock_aria_send_generic');
+        if (res.ok) return res;
       }
     }
 
     /**
-     * Recording strip: paper-plane Send is usually the rightmost icon **in the dock** with an SVG,
-     * not the thread “heart” (which sits in the same row when idle — must stay excluded).
+     * Recording strip: allow slight vertical overlap with composer row (IG layout varies).
      */
     const stripCandidates = docked
       .filter((el) => {
@@ -905,20 +949,49 @@ function clickSendAfterRecordingScript() {
         if (isDefinitelyNotSend(label, title, txt)) return false;
         const r = el.getBoundingClientRect();
         if (r.width < 14 || r.height < 14 || r.width > 96 || r.height > 96) return false;
-        /** Recording bar sits above the “Message…” field; mic/heart row is usually same band as composer (cy > cr.top). */
         const cy = r.top + r.height / 2;
-        if (cy > cr.top) return false;
+        if (cy > cr.top + 30) return false;
         return true;
       })
       .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
 
     if (stripCandidates.length) {
-      const r = tryClick(stripCandidates[0], 'dock_rightmost_recording_strip');
-      if (r.ok) return r;
+      const res = finish(stripCandidates[0], 'dock_rightmost_recording_strip');
+      if (res.ok) return res;
     }
 
-    return { ok: false, why: 'no_send_control_in_dock' };
+    /** Composer band: rightmost small SVG (paper plane often has empty aria). */
+    const bandCandidates = docked
+      .filter((el) => {
+        if (!el.querySelector || !el.querySelector('svg')) return false;
+        const label = lower(el.getAttribute('aria-label') || '');
+        const title = lower(el.getAttribute('title') || '');
+        const txt = lower((el.textContent || '').trim().slice(0, 24));
+        if (isDefinitelyNotSend(label, title, txt)) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 14 || r.height < 14 || r.width > 88 || r.height > 88) return false;
+        const cy = r.top + r.height / 2;
+        if (cy < cr.top - 22 || cy > cr.top + 44) return false;
+        if (r.left < cr.left - 20) return false;
+        return true;
+      })
+      .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+
+    if (bandCandidates.length) {
+      const res = finish(bandCandidates[0], 'dock_rightmost_composer_band');
+      if (res.ok) return res;
+    }
+
+    return { ok: false, why: 'no_send_control_in_dock', dockedCount: docked.length };
   };
+}
+
+function clickSendAfterRecordingScript() {
+  return voiceSendResolveScript({ click: true });
+}
+
+function voiceSendTargetPreviewScript() {
+  return voiceSendResolveScript({ click: false });
 }
 
 /**
@@ -1056,6 +1129,12 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         return { ok: false, reason: 'voice_recording_ui_not_detected' };
       }
 
+      /** Plain PNG right after recording UI is detected (see blue bar / timer vs DOM heuristic). */
+      if (isFollowUpScreenshotsEnabled()) {
+        await delay(220);
+        await captureFollowUpScreenshot(page, 'voice-recording-ui-just-confirmed', shotMeta);
+      }
+
       if (voiceSource) {
         internalPlayback = startVoiceNotePlayback(
           voiceSource.path,
@@ -1068,7 +1147,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
       if (isFollowUpScreenshotsEnabled()) {
-        /** Same crosshair as pre-click shot so both PNGs show where the mic was hit (vs blue recording bar). */
+        /** Mic crosshair shortly after recording starts (may differ from just-confirmed if UI flickers). */
         await captureFollowUpScreenshotWithMarkers(
           page,
           [{ x: cx, y: cy, label: 'mic click point (reference)' }],
@@ -1076,7 +1155,15 @@ async function sendVoiceNoteInThread(page, opts = {}) {
           shotMeta
         );
       }
-      await delay(Math.max(0, effectiveHoldMs - afterShotMs));
+      const remainingHold = Math.max(0, effectiveHoldMs - afterShotMs);
+      if (isFollowUpScreenshotsEnabled() && remainingHold > 4500) {
+        const half = Math.floor(remainingHold / 2);
+        await delay(half);
+        await captureFollowUpScreenshot(page, 'voice-recording-mid-hold', shotMeta);
+        await delay(remainingHold - half);
+      } else {
+        await delay(remainingHold);
+      }
     } else {
       if (voiceSource) {
         internalPlayback = startVoiceNotePlayback(
@@ -1116,6 +1203,50 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
     /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
     await delay(1200);
+
+    const previewSend = voiceSendTargetPreviewScript();
+    if (isFollowUpScreenshotsEnabled()) {
+      await delay(280);
+      await captureFollowUpScreenshot(page, 'voice-after-playback-before-send', shotMeta);
+      const preview = await page.evaluate(previewSend).catch(() => null);
+      if (preview && preview.ok && Number.isFinite(preview.x) && Number.isFinite(preview.y)) {
+        if (logger) {
+          logger.log(
+            `Voice: debug Send target preview (${preview.via}) dockedButtons=${preview.dockedCount ?? '?'} aria="${(preview.label || '').slice(0, 80)}"`
+          );
+        }
+        await captureFollowUpScreenshotWithMarkers(
+          page,
+          [
+            {
+              x: preview.x,
+              y: preview.y,
+              label: `Send target (${preview.via}) — Puppeteer will click here`,
+            },
+          ],
+          'voice-send-click-target',
+          shotMeta
+        );
+      } else {
+        const why = preview && preview.why ? preview.why : 'preview_eval_failed';
+        const dc = preview && typeof preview.dockedCount === 'number' ? preview.dockedCount : '?';
+        if (logger) logger.warn(`Voice: could not resolve Send coords for screenshot (${why}, docked=${dc})`);
+        const vp = page.viewport() || { width: 1280, height: 800 };
+        await captureFollowUpScreenshotWithMarkers(
+          page,
+          [
+            {
+              x: Math.min(vp.width - 48, Math.max(80, (vp.width * 3) / 4)),
+              y: vp.height - 90,
+              label: 'Send not resolved — inspect voice-after-playback-before-send',
+            },
+          ],
+          'voice-send-target-unresolved',
+          shotMeta
+        );
+      }
+    }
+
     const clickSend = clickSendAfterRecordingScript();
     let sendResult = null;
     for (let attempt = 0; attempt < 15; attempt++) {
@@ -1125,7 +1256,12 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
     if (!sendResult || !sendResult.ok) {
       const why = sendResult && sendResult.why ? sendResult.why : 'unknown';
-      if (logger) logger.warn(`Voice: could not click Send (${why}) after retries`);
+      const dc = sendResult && typeof sendResult.dockedCount === 'number' ? sendResult.dockedCount : '';
+      if (logger) {
+        logger.warn(
+          `Voice: could not click Send (${why}) after retries${dc !== '' ? ` dockedButtons=${dc}` : ''}`
+        );
+      }
       return { ok: false, reason: 'voice_send_button_not_found' };
     }
 

@@ -45,7 +45,12 @@ Exactly **one** of:
 2. For **voice** follow-ups, when debug screenshots are on you may get:
    - **`*_voice-mic-click-target.png`** — **before** the mic click, with a **red crosshair** at the exact viewport coordinates used (so you can see if we’re hitting the wrong icon).
    - **`*_voice-recording-ui-missed.png`** — if recording UI never appears after the click, same crosshair on the current page (usually wrong target or blocked mic).
-   - **`*_voice-after-mic-click.png`** — after recording UI is confirmed and a short delay; **also includes the same red crosshair** at the mic click coordinates so you can line it up with the blue recording bar.
+   - **`*_voice-recording-ui-just-confirmed.png`** — **plain** screenshot ~220ms after the worker’s recording-UI check passes (blue bar / timer / dock heuristics). Use this to compare **what you see** vs what the heuristic matched.
+   - **`*_voice-after-mic-click.png`** — ~600ms after recording starts; **red crosshair** still on the **mic** coordinates (reference only).
+   - **`*_voice-recording-mid-hold.png`** — halfway through the ffmpeg/hold window (long clips only), **plain** — confirms the recording UI is still visible mid-capture.
+   - **`*_voice-after-playback-before-send.png`** — **plain** screenshot after playback stops and **before** Send is clicked (composer / recording strip as IG shows it then).
+   - **`*_voice-send-click-target.png`** — **red crosshair** on the **resolved Send** center (same logic as the click), with a short label naming the match reason (`dock_aria_send_generic`, `dock_rightmost_composer_band`, etc.).
+   - **`*_voice-send-target-unresolved.png`** — if no Send control could be resolved for coordinates; crosshair is a **placeholder** — inspect `voice-after-playback-before-send` and PM2 logs (`dockedButtons=…`).
    Filenames include `correlationId` when sent in the request.
 3. **Download via HTTP** (Bearer `COLD_DM_API_KEY` when set): `GET /api/debug/follow-up-screenshots` and `GET /api/debug/follow-up-screenshots/file?name=...`
 
