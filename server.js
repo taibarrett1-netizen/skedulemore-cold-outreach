@@ -292,20 +292,35 @@ app.post('/api/follow-up/send', async (req, res) => {
   const cid = (body.clientId || '').trim();
   const sid = (body.instagramSessionId || '').trim();
   const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
+  const correlationId = (
+    req.get('x-correlation-id') ||
+    req.get('x-request-id') ||
+    (body.correlationId && String(body.correlationId).trim()) ||
+    (body.requestId && String(body.requestId).trim()) ||
+    ''
+  ).trim();
   let mode = 'unknown';
   if (body.text != null && String(body.text).trim() !== '') mode = 'text';
   else if (Array.isArray(body.messages) && body.messages.some((m) => String(m).trim())) {
     mode = `messages(${body.messages.filter((m) => String(m).trim()).length})`;
   } else if (body.audioUrl) mode = body.caption != null && String(body.caption).trim() !== '' ? 'voice+caption' : 'voice';
-  logger.log(`[API] follow-up/send request clientId=${cid || '-'} sessionId=${sid || '-'} recipient=@${recip || '-'} mode=${mode}`);
+  const corrPart = correlationId ? ` correlationId=${correlationId}` : '';
+  logger.log(
+    `[API] follow-up/send request clientId=${cid || '-'} sessionId=${sid || '-'} recipient=@${recip || '-'} mode=${mode}${corrPart}`
+  );
   try {
-    const result = await sendFollowUp(body);
+    const payload = correlationId ? { ...body, correlationId } : body;
+    const result = await sendFollowUp(payload);
     if (result.ok) {
-      logger.log(`[API] follow-up/send response ok=true clientId=${cid || '-'} recipient=@${recip || '-'}`);
+      logger.log(
+        `[API] follow-up/send response ok=true clientId=${cid || '-'} recipient=@${recip || '-'}${corrPart}`
+      );
       return res.json({ ok: true });
     }
     const status = result.statusCode && result.statusCode >= 400 && result.statusCode < 600 ? result.statusCode : 400;
-    logger.warn(`[API] follow-up/send response ok=false status=${status} error=${result.error || 'Send failed'}`);
+    logger.warn(
+      `[API] follow-up/send response ok=false status=${status} error=${result.error || 'Send failed'}${corrPart}`
+    );
     return res.status(status).json({ ok: false, error: result.error || 'Send failed' });
   } catch (e) {
     logger.error('[API] follow-up/send exception', e);

@@ -871,25 +871,24 @@ function followUpReasonToError(reason, pageSnippet) {
  * Follow-up audio is configured in dashboard `bot_config.follow_ups[]`; this handler does not read campaigns or
  * `cold_dm_message_group_messages` / migration 010 columns — only the request body + `cold_dm_instagram_sessions`.
  */
-function logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode) {
+function logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId) {
+  const c = correlationId ? ` correlationId=${correlationId}` : '';
   logger.warn(
-    `[follow-up] failed clientId=${clientId || '-'} sessionId=${instagramSessionId || '-'} recipient=@${recipientUsername || '-'} error=${error}`
+    `[follow-up] failed clientId=${clientId || '-'} sessionId=${instagramSessionId || '-'} recipient=@${recipientUsername || '-'} error=${error}${c}`
   );
   return { ok: false, error, statusCode };
 }
 
 async function sendFollowUp(body) {
+  const correlationId = (body.correlationId || body.requestId || '').trim();
+  const cLog = correlationId ? ` correlationId=${correlationId}` : '';
   const clientId = (body.clientId || '').trim();
   const instagramSessionId = (body.instagramSessionId || '').trim();
   const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
+  const fail = (error, statusCode) =>
+    logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId);
   if (!clientId || !instagramSessionId || !recipientUsername) {
-    return logFollowUpFailure(
-      clientId,
-      instagramSessionId,
-      recipientUsername,
-      'clientId, instagramSessionId, and recipientUsername are required',
-      400
-    );
+    return fail('clientId, instagramSessionId, and recipientUsername are required', 400);
   }
 
   const captionRaw = body.caption != null ? String(body.caption).trim() : '';
@@ -905,42 +904,33 @@ async function sendFollowUp(body) {
   const hasAudio = audioUrlRaw !== '';
 
   if (hasCaption && !hasAudio) {
-    return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'caption is only valid with audioUrl', 400);
+    return fail('caption is only valid with audioUrl', 400);
   }
 
   const modeCount = [textSingle, hasMessages, hasAudio].filter(Boolean).length;
   if (modeCount !== 1) {
-    return logFollowUpFailure(
-      clientId,
-      instagramSessionId,
-      recipientUsername,
-      'Specify exactly one of: text, messages (non-empty strings), or audioUrl',
-      400
-    );
+    return fail('Specify exactly one of: text, messages (non-empty strings), or audioUrl', 400);
   }
   if (hasAudio && !/^https:\/\//i.test(audioUrlRaw)) {
-    return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'audioUrl must be an HTTPS URL', 400);
+    return fail('audioUrl must be an HTTPS URL', 400);
   }
 
   const session = await sb.getInstagramSessionByIdForClient(clientId, instagramSessionId);
   if (!session) {
-    return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Instagram session not found for this client', 404);
+    return fail('Instagram session not found for this client', 404);
   }
   const cookies = session.session_data?.cookies;
   if (!cookies?.length) {
-    return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Session has no cookies; reconnect Instagram', 400);
+    return fail('Session has no cookies; reconnect Instagram', 400);
   }
 
   const modeLabel = hasAudio ? (hasCaption ? 'voice+caption' : 'voice') : hasMessages ? `messages(${messageLines.length})` : 'text';
   logger.log(
-    `[follow-up] start clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername} mode=${modeLabel} sessionUser=${session.instagram_username || 'n/a'}`
+    `[follow-up] start clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername} mode=${modeLabel} sessionUser=${session.instagram_username || 'n/a'}${cLog}`
   );
 
   if (hasAudio && !isFfmpegAvailable()) {
-    return logFollowUpFailure(
-      clientId,
-      instagramSessionId,
-      recipientUsername,
+    return fail(
       'ffmpeg/ffprobe not installed on this server (required for voice follow-ups). Run: sudo apt install ffmpeg',
       503
     );
@@ -959,22 +949,22 @@ async function sendFollowUp(body) {
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
     if (page.url().includes('/accounts/login')) {
-      return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Instagram session expired', 401);
+      return fail('Instagram session expired', 401);
     }
 
     const u = normalizeUsername(recipientUsername);
     const nav = await navigateToDmThread(page, u);
     if (!nav.ok) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
-      return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, errMsg, 400);
+      return fail(errMsg, 400);
     }
 
     if (textSingle) {
       const sent = await sendPlainTextInThread(page, String(body.text).trim());
       if (!sent.ok) {
-        return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, followUpReasonToError(sent.reason), 400);
+        return fail(followUpReasonToError(sent.reason), 400);
       }
-      logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}`);
+      logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
       return { ok: true };
     }
 
@@ -982,11 +972,11 @@ async function sendFollowUp(body) {
       for (const line of messageLines) {
         const sent = await sendPlainTextInThread(page, line);
         if (!sent.ok) {
-          return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, followUpReasonToError(sent.reason), 400);
+          return fail(followUpReasonToError(sent.reason), 400);
         }
         await delay(2000);
       }
-      logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}`);
+      logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
       return { ok: true };
     }
 
@@ -994,7 +984,7 @@ async function sendFollowUp(body) {
       if (hasCaption) {
         const cap = await sendPlainTextInThread(page, captionRaw);
         if (!cap.ok) {
-          return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, followUpReasonToError(cap.reason), 400);
+          return fail(followUpReasonToError(cap.reason), 400);
         }
         await delay(1200);
       }
@@ -1003,35 +993,23 @@ async function sendFollowUp(body) {
       try {
         resolved = await resolveVoiceNotePath(audioUrlRaw);
         if (!resolved.localPath) {
-          return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Could not download audio file', 400);
+          return fail('Could not download audio file', 400);
         }
         const prep = await prepareVoiceNoteUi(page, { logger });
         if (!prep.ok) {
-          return logFollowUpFailure(
-            clientId,
-            instagramSessionId,
-            recipientUsername,
-            followUpReasonToError(prep.reason || 'voice_mic_not_found'),
-            400
-          );
+          return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
         }
         playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
         const holdMs = Math.round(playback.durationSec * 1000 + 700);
         const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
         if (!voiceResult.ok) {
-          return logFollowUpFailure(
-            clientId,
-            instagramSessionId,
-            recipientUsername,
-            followUpReasonToError(voiceResult.reason || 'voice_note_failed'),
-            400
-          );
+          return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
         }
-        logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}`);
+        logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
         return { ok: true };
       } catch (e) {
         if (e.message === 'voice_note_download_failed') {
-          return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Could not download audio from audioUrl', 400);
+          return fail('Could not download audio from audioUrl', 400);
         }
         throw e;
       } finally {
@@ -1040,9 +1018,9 @@ async function sendFollowUp(body) {
       }
     }
 
-    return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'No delivery mode', 400);
+    return fail('No delivery mode', 400);
   } catch (e) {
-    logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}`);
+    logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}${cLog}`);
     return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
   } finally {
     if (browser) await browser.close().catch(() => {});
