@@ -40,6 +40,8 @@ Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
 
 **Note:** Sending **Escape** after recording was closing Instagram’s voice UI before “Send” — that is no longer done between record and send.
 
+**Recording gesture:** On **desktop Chrome** the mic is usually a **single click** to start; the worker waits for the audio duration (ffmpeg), then clicks **Send**. **Mobile web** viewports use **press-and-hold** on the mic. The VPS resolves the mic via layout (to the right of the message field, leftmost of the three trailing icons) and uses **`element.click()`** on that node so the right control is hit.
+
 ## Correlation (Supabase ↔ VPS logs)
 
 Optional, for matching `execute_follow_up` / Edge logs to PM2:

@@ -331,8 +331,8 @@ function clickSendAfterRecordingScript() {
 }
 
 /**
- * Desktop: tap mic → record for holdMs → tap Send (paper plane).
- * Mobile web: press-and-hold on mic for holdMs, then Send.
+ * Desktop Chrome: one click on the mic starts recording; wait for audio duration; click Send (paper plane).
+ * Mobile web: press-and-hold on the mic for the duration (older mobile IG pattern).
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
   const { holdMs = 7000, logger = null, correlationId = '' } = opts;
@@ -362,15 +362,22 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   const cx = box.x + box.width / 2;
   const cy = box.y + box.height / 2;
 
+  const afterShotMs = 600;
   if (desktopFlow) {
-    if (logger) logger.log(`Voice (desktop): click mic, record ${Math.round(holdMs)} ms, then send`);
-    await page.mouse.click(cx, cy, { delay: 40 });
+    if (logger) logger.log(`Voice (desktop): click mic, wait ${Math.round(holdMs)} ms, then send`);
+    /** Native DOM click on the resolved mic node (often more reliable than synthetic coords for React). */
+    try {
+      await micEl.click({ delay: 50 });
+    } catch {
+      await page.mouse.click(cx, cy, { delay: 40 });
+    }
+    await delay(afterShotMs);
     if (isFollowUpScreenshotsEnabled()) {
       await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
     }
-    await delay(holdMs);
+    await delay(Math.max(0, holdMs - afterShotMs));
   } else {
-    if (logger) logger.log(`Voice (press-hold): ${Math.round(holdMs)} ms`);
+    if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(holdMs)} ms`);
     await page.mouse.move(cx, cy);
     await page.mouse.down();
     await delay(holdMs);

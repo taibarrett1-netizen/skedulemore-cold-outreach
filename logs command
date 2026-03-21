@@ -20,3 +20,6 @@ cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
 
 scp root@178.62.52.200:/root/ColdDMs/scraper-debug/followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png .
 open followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png
+
+cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
+BASE=http://178.62.52.200:3000 KEY='b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354' node scripts/download-follow-up-screenshots.js
