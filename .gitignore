@@ -17,6 +17,9 @@ database/*.db-journal
 # Logs
 logs/*.log
 
+# Follow-up debug screenshots (may contain DMs)
+follow-up-screenshots/
+
 # Lead list (often contains real data; keep only on server or add to .env)
 leads.csv
 

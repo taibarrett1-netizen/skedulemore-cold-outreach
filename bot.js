@@ -13,6 +13,7 @@ const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
 const { sendVoiceNoteInThread, prepareVoiceNoteUi, grantMicrophoneForInstagram } = require('./utils/instagram-voice-note');
+const { captureFollowUpScreenshot, isFollowUpScreenshotsEnabled } = require('./utils/follow-up-screenshots');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
 
@@ -887,6 +888,11 @@ async function sendFollowUp(body) {
   const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
   const fail = (error, statusCode) =>
     logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId);
+  const shotMeta = { correlationId, logger };
+  const shot = async (page, step) => {
+    if (!isFollowUpScreenshotsEnabled()) return;
+    await captureFollowUpScreenshot(page, step, shotMeta);
+  };
   if (!clientId || !instagramSessionId || !recipientUsername) {
     return fail('clientId, instagramSessionId, and recipientUsername are required', 400);
   }
@@ -948,6 +954,7 @@ async function sendFollowUp(body) {
 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
+    await shot(page, '01-home');
     if (page.url().includes('/accounts/login')) {
       return fail('Instagram session expired', 401);
     }
@@ -958,6 +965,7 @@ async function sendFollowUp(body) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
       return fail(errMsg, 400);
     }
+    await shot(page, '02-thread');
 
     if (textSingle) {
       const sent = await sendPlainTextInThread(page, String(body.text).trim());
@@ -997,14 +1005,24 @@ async function sendFollowUp(body) {
         }
         const prep = await prepareVoiceNoteUi(page, { logger });
         if (!prep.ok) {
+          await shot(page, '03-voice-prep-failed');
           return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
         }
+        await shot(page, '03-voice-composer-ready');
         playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
         const holdMs = Math.round(playback.durationSec * 1000 + 700);
-        const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
+        const voiceResult = await sendVoiceNoteInThread(page, {
+          holdMs,
+          logger,
+          beforeSendClick: async (pg) => {
+            await captureFollowUpScreenshot(pg, '04-voice-after-record-before-send-click', shotMeta);
+          },
+        });
         if (!voiceResult.ok) {
+          await shot(page, '05-voice-send-failed');
           return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
         }
+        await shot(page, '05-voice-after-send-click');
         logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
         return { ok: true };
       } catch (e) {
@@ -1020,6 +1038,15 @@ async function sendFollowUp(body) {
 
     return fail('No delivery mode', 400);
   } catch (e) {
+    try {
+      if (browser && isFollowUpScreenshotsEnabled()) {
+        const pages = await browser.pages();
+        const p = pages.length ? pages[pages.length - 1] : null;
+        if (p) await captureFollowUpScreenshot(p, '99-exception', shotMeta);
+      }
+    } catch {
+      /* ignore */
+    }
     logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}${cLog}`);
     return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
   } finally {

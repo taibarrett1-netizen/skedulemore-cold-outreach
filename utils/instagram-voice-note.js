@@ -276,7 +276,7 @@ function clickSendAfterRecordingScript() {
  * Mobile web: press-and-hold on mic for holdMs, then Send.
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
-  const { holdMs = 7000, logger = null } = opts;
+  const { holdMs = 7000, logger = null, beforeSendClick = null } = opts;
 
   const finder = buildMicFinderScript();
   const viewport = page.viewport();
@@ -316,6 +316,13 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   await micHandle.dispose().catch(() => {});
 
   await delay(800);
+  if (typeof beforeSendClick === 'function') {
+    try {
+      await beforeSendClick(page);
+    } catch (e) {
+      if (logger) logger.warn(`[follow-up] beforeSendClick hook: ${e.message}`);
+    }
+  }
   const clickSend = clickSendAfterRecordingScript();
   let sent = await page.evaluate(clickSend).catch(() => false);
   if (!sent) {

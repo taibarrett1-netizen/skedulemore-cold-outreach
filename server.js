@@ -39,6 +39,7 @@ const projectRoot = path.join(__dirname);
 const envPath = path.join(projectRoot, '.env');
 const leadsPath = path.join(projectRoot, process.env.LEADS_CSV || 'leads.csv');
 const voiceNotesDir = path.join(projectRoot, 'voice-notes');
+const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -182,6 +183,8 @@ const ENV_KEYS = [
   'VOICE_NOTE_MODE',
   'VOICE_NOTE_SINK',
   'VOICE_NOTE_PULSE_SOURCE',
+  'FOLLOW_UP_DEBUG_SCREENSHOTS',
+  'FOLLOW_UP_SCREENSHOTS_FULL_PAGE',
 ];
 
 function readEnv() {
@@ -326,6 +329,63 @@ app.post('/api/follow-up/send', async (req, res) => {
     logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
   }
+});
+
+/** List PNGs from follow-up debug runs (requires Bearer COLD_DM_API_KEY when set). */
+app.get('/api/debug/follow-up-screenshots', (req, res) => {
+  try {
+    if (!fs.existsSync(followUpScreenshotsDir)) {
+      return res.json({
+        ok: true,
+        files: [],
+        directory: 'follow-up-screenshots',
+        hint: 'Set FOLLOW_UP_DEBUG_SCREENSHOTS=true in .env, restart PM2, run a follow-up',
+      });
+    }
+    const names = fs
+      .readdirSync(followUpScreenshotsDir)
+      .filter((f) => /\.png$/i.test(f) && !f.startsWith('.'));
+    const files = names
+      .map((name) => {
+        const fp = path.join(followUpScreenshotsDir, name);
+        try {
+          const st = fs.statSync(fp);
+          return { name, size: st.size, mtime: st.mtime.toISOString() };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
+    res.json({
+      ok: true,
+      files,
+      directory: 'follow-up-screenshots',
+      downloadUrl: '/api/debug/follow-up-screenshots/file?name=FILENAME.png',
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || 'list failed' });
+  }
+});
+
+/** Download one screenshot PNG (query: name=). */
+app.get('/api/debug/follow-up-screenshots/file', (req, res) => {
+  const raw = req.query.name;
+  const name =
+    raw && typeof raw === 'string' && /^[a-zA-Z0-9._-]+\.png$/i.test(path.basename(raw))
+      ? path.basename(raw)
+      : null;
+  if (!name) return res.status(400).json({ ok: false, error: 'Invalid or missing ?name=filename.png' });
+  const fp = path.join(followUpScreenshotsDir, name);
+  const resolved = path.resolve(fp);
+  const resolvedDir = path.resolve(followUpScreenshotsDir);
+  if (!resolved.startsWith(resolvedDir + path.sep)) {
+    return res.status(400).json({ ok: false, error: 'Invalid path' });
+  }
+  if (!fs.existsSync(resolved)) return res.status(404).json({ ok: false, error: 'Not found' });
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+  res.sendFile(resolved);
 });
 
 app.post('/api/voice/upload', uploadVoice.single('file'), (req, res) => {
