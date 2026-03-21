@@ -230,7 +230,7 @@ If **no** chromium process:
 
 | Symptom | What to check |
 |--------|----------------|
-| Instagram / Chromium **cut off on the right** | Bot viewport defaults to **1920×1080**. Set Xvfb to at least that (`1920x1080x24`), `pm2 restart`, open debug browser again. Optional: set `DESKTOP_VIEWPORT_WIDTH` / `DESKTOP_VIEWPORT_HEIGHT` in `.env` to match your Xvfb. In TigerVNC, maximize the window or set scaling to **100%** so the viewer is not cropping. |
+| Instagram / Chromium **cut off on the right** | (1) **Deploy latest `bot.js`**: headed mode must pass Chromium **`--window-size=…`** (not only `page.setViewport` — that does not resize the X11 window). Logs should show `desktopViewport=1920x1080`. (2) Xvfb at least **`1920x1080x24`**. (3) Optional: `DESKTOP_VIEWPORT_WIDTH` / `HEIGHT` in `.env`. (4) TigerVNC: maximize viewer, **100%** scale. |
 | Black screen in VNC | Run Part D (`xterm`) again while VNC is connected. |
 | `curl` fails to port 443 | Use **`http://IP:3000`**, not `https://IP` unless you have a reverse proxy. |
 | `409` from debug endpoint | `pm2 restart all`, wait for online, curl again. |

@@ -9,7 +9,7 @@ const { getRandomMessage } = require('./config/messages');
 const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getControl, setControl } = require('./database/db');
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
-const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
+const { applyMobileEmulation, applyDesktopEmulation, buildDesktopViewport } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { isFfmpegAvailable } = require('./utils/voice-note-audio');
 const {
@@ -32,6 +32,25 @@ function getPuppeteerSlowMo() {
   const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
+/**
+ * Headed Chromium often opens ~800×600; `page.setViewport()` alone does not resize the X11 window,
+ * so Instagram stays visually clipped until the real window matches (especially on VNC + Xvfb).
+ */
+function applyHeadedChromeWindowToLaunchOpts(launchOpts) {
+  if (HEADLESS || !launchOpts || !Array.isArray(launchOpts.args)) return;
+  const vp = buildDesktopViewport();
+  if (!launchOpts.args.some((a) => typeof a === 'string' && a.startsWith('--window-size='))) {
+    launchOpts.args.push(`--window-size=${vp.width},${vp.height}`);
+  }
+  launchOpts.defaultViewport = {
+    width: vp.width,
+    height: vp.height,
+    deviceScaleFactor: vp.deviceScaleFactor,
+    isMobile: vp.isMobile,
+    hasTouch: vp.hasTouch,
+  };
+}
+
 function applyPuppeteerSlowMo(launchOpts) {
   const sm = getPuppeteerSlowMo();
   if (sm > 0) launchOpts.slowMo = sm;
@@ -860,6 +879,7 @@ function buildFollowUpLaunchOptions() {
     env: VOICE_NOTE_PULSE_SOURCE ? { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE } : undefined,
   };
   applyPuppeteerSlowMo(opts);
+  applyHeadedChromeWindowToLaunchOpts(opts);
   return opts;
 }
 
@@ -930,9 +950,10 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
     const holdMs = parseInt(process.env.FOLLOW_UP_DEBUG_BROWSER_MS, 10);
     const hasTimedHold = Number.isFinite(holdMs) && holdMs > 0;
 
+    const dvp = buildDesktopViewport();
     logger.log(
       `[debug] follow-up/browser: Chromium open for manual test (user=${session.instagram_username || 'n/a'}). ` +
-        `DISPLAY=${process.env.DISPLAY || '(unset)'}. ` +
+        `DISPLAY=${process.env.DISPLAY || '(unset)'} desktopViewport=${dvp.width}x${dvp.height} (HEADLESS_MODE=false adds --window-size). ` +
         (hasTimedHold
           ? `Auto-close after FOLLOW_UP_DEBUG_BROWSER_MS=${holdMs}ms.`
           : 'Holding until PM2 restart (or set FOLLOW_UP_DEBUG_BROWSER_MS).')
@@ -1326,6 +1347,7 @@ async function runBotMultiTenant() {
   };
   if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
   applyPuppeteerSlowMo(launchOpts);
+  applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
   let browser;
   try {
@@ -1537,6 +1559,7 @@ async function runBot() {
   };
   if (VOICE_NOTE_PULSE_SOURCE) launchOpts.env = { ...process.env, PULSE_SOURCE: VOICE_NOTE_PULSE_SOURCE };
   applyPuppeteerSlowMo(launchOpts);
+  applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
   const useSessionCookies = false;
   if (!useSessionCookies) {
