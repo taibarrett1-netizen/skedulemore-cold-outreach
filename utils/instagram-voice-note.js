@@ -158,47 +158,44 @@ async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
 }
 
 /**
- * True when desktop voice recording UI is likely active (blue strip, 0:xx timer in composer band, pause/delete).
- * Avoids false positives from header clock (e.g. 11:07) by scoping to lower viewport and 0:xx pattern.
+ * Recording UI detection scoped to the **DM composer dock** (Message field row + strip above it).
+ * Avoids false positives from **blue outgoing message bubbles** in the thread (old logic used any blue in lower half).
  */
 function detectInstagramVoiceRecordingUiScript() {
   return function detectInstagramVoiceRecordingUi() {
     const lower = (s) => (s || '').toLowerCase();
-    const bottomStart = window.innerHeight * 0.48;
-
-    for (const el of document.querySelectorAll('div, span, section')) {
-      let r;
-      try {
-        r = el.getBoundingClientRect();
-      } catch {
-        continue;
-      }
-      if (r.top < bottomStart || r.width < 100) continue;
-      const bg = window.getComputedStyle(el).backgroundColor;
-      const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-      if (mm) {
-        const R = +mm[1];
-        const G = +mm[2];
-        const B = +mm[3];
-        if (B > 200 && R < 100 && G > 90 && r.height >= 16 && r.height <= 220) {
-          return { ok: true, why: 'blue_strip' };
-        }
-      }
+    const inputs = Array.from(
+      document.querySelectorAll('textarea[placeholder], [contenteditable="true"], [role="textbox"]')
+    );
+    const compose = inputs.find((el) => {
+      const ph = lower(el.getAttribute('placeholder') || '');
+      const al = lower(el.getAttribute('aria-label') || '');
+      return ph.includes('message') || al.includes('message');
+    });
+    if (!compose) {
+      return { ok: false, why: 'no_composer' };
     }
+    const cr = compose.getBoundingClientRect();
 
-    for (const el of document.querySelectorAll('div, span, p')) {
-      let r;
-      try {
-        r = el.getBoundingClientRect();
-      } catch {
-        continue;
-      }
-      if (r.top < bottomStart || r.height <= 0 || r.height > 72) continue;
-      const text = (el.textContent || '').trim();
-      if (/^0:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_0mm' };
-      if (/^1:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_1mm' };
-    }
+    /** Vertical: from just above the composer pill to bottom of viewport (not mid-thread bubbles). */
+    const dockTop = Math.max(cr.top - 120, window.innerHeight * 0.62);
+    const dockBottom = window.innerHeight + 4;
+    /** Horizontal: align with composer column (exclude left nav / inbox list). */
+    const dockLeft = Math.max(0, cr.left - 60);
+    const dockRight = window.innerWidth - 4;
 
+    const centerInDock = (r) => {
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      return (
+        cy >= dockTop &&
+        cy <= dockBottom &&
+        cx >= dockLeft &&
+        cx <= dockRight
+      );
+    };
+
+    /** Pause / delete recording — only in composer dock. */
     for (const el of document.querySelectorAll('[aria-label], [title], button, [role="button"]')) {
       let r;
       try {
@@ -206,7 +203,7 @@ function detectInstagramVoiceRecordingUiScript() {
       } catch {
         continue;
       }
-      if (r.top < bottomStart) continue;
+      if (!centerInDock(r)) continue;
       const al = lower(el.getAttribute('aria-label') || '');
       const ti = lower(el.getAttribute('title') || '');
       const t = `${al} ${ti}`;
@@ -214,26 +211,160 @@ function detectInstagramVoiceRecordingUiScript() {
       if (t.includes('delete') && (t.includes('clip') || t.includes('record'))) return { ok: true, why: 'aria_delete' };
     }
 
+    /** Recording timer 0:xx / 1:xx — small text, in dock only (not header clock). */
+    for (const el of document.querySelectorAll('div, span, p')) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!centerInDock(r) || r.height <= 0 || r.height > 56) continue;
+      const text = (el.textContent || '').trim();
+      if (text.length > 6) continue;
+      if (/^0:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_0mm' };
+      if (/^1:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_1mm' };
+    }
+
+    /**
+     * Blue recording strip: must sit in dock, be **wider than tall** (not a bubble), bounded height.
+     */
+    for (const el of document.querySelectorAll('div, span')) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (!centerInDock(r)) continue;
+      if (r.width < 160 || r.height < 12 || r.height > 64) continue;
+      if (r.width < r.height * 2.2) continue;
+      const bg = window.getComputedStyle(el).backgroundColor;
+      const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (!mm) continue;
+      const R = +mm[1];
+      const G = +mm[2];
+      const B = +mm[3];
+      if (B > 200 && R < 100 && G > 85) {
+        return { ok: true, why: 'blue_strip_dock' };
+      }
+    }
+
     return { ok: false, why: 'none' };
   };
 }
 
-async function waitForVoiceRecordingUi(page, opts = {}) {
-  const { timeoutMs = VOICE_RECORDING_UI_TIMEOUT_MS, pollMs = 350, logger = null } = opts;
-  const script = detectInstagramVoiceRecordingUiScript();
+async function evaluateRecordingUiOnce(page) {
+  return page.evaluate(detectInstagramVoiceRecordingUiScript()).catch(() => ({ ok: false, why: 'eval_error' }));
+}
+
+/**
+ * After a mic gesture, wait up to `maxMs` for recording UI (tight polling).
+ * @returns {Promise<{ ok: boolean, why?: string, method?: string }>}
+ */
+async function waitForRecordingUiAfterAttempt(page, maxMs, pollMs, logger, methodLabel) {
   const start = Date.now();
   let lastWhy = 'none';
-  while (Date.now() - start < timeoutMs) {
-    const res = await page.evaluate(script).catch(() => ({ ok: false, why: 'eval_error' }));
+  while (Date.now() - start < maxMs) {
+    const res = await evaluateRecordingUiOnce(page);
     if (res && res.ok) {
-      if (logger) logger.log(`Voice: recording UI detected (${res.why || 'ok'})`);
-      return true;
+      if (logger) logger.log(`Voice: recording UI (${res.why}) after ${methodLabel}`);
+      return { ok: true, why: res.why, method: methodLabel };
     }
     lastWhy = (res && res.why) || 'none';
     await delay(pollMs);
   }
-  if (logger) logger.warn(`Voice: recording UI not detected within ${timeoutMs}ms (last=${lastWhy})`);
-  return false;
+  if (logger) logger.log(`Voice: no recording UI after ${methodLabel} (lastWhy=${lastWhy})`);
+  return { ok: false, why: lastWhy, method: methodLabel };
+}
+
+/** Ms to poll for recording UI after each mic gesture (env: VOICE_MIC_ATTEMPT_WAIT_MS, else tied to VOICE_RECORDING_UI_TIMEOUT_MS). */
+const PER_ATTEMPT_RECORDING_WAIT_MS = Math.min(
+  Math.max(
+    parseInt(process.env.VOICE_MIC_ATTEMPT_WAIT_MS, 10) ||
+      Math.min(4000, Math.max(1200, Math.floor(VOICE_RECORDING_UI_TIMEOUT_MS / 3))),
+    800
+  ),
+  8000
+);
+
+/**
+ * Try several click paths; only proceed to the next if recording UI did not appear.
+ */
+async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
+  const attempts = [
+    {
+      name: 'element.click',
+      run: async () => {
+        try {
+          await micEl.click({ delay: 60 });
+        } catch {
+          await page.mouse.click(cx, cy, { delay: 40 });
+        }
+      },
+    },
+    {
+      name: 'mouse_move+down+up',
+      run: async () => {
+        await page.mouse.move(cx, cy);
+        await delay(80);
+        await page.mouse.down();
+        await delay(100);
+        await page.mouse.up();
+      },
+    },
+    {
+      name: 'mouse.click_coords',
+      run: async () => {
+        await page.mouse.move(cx, cy);
+        await delay(50);
+        await page.mouse.click(cx, cy, { delay: 55, clickCount: 1 });
+      },
+    },
+    {
+      name: 'elementFromPoint+pointer+mouse',
+      run: async () => {
+        const x = Math.round(cx);
+        const y = Math.round(cy);
+        await page.evaluate(
+          (px, py) => {
+            const target = document.elementFromPoint(px, py);
+            if (!target) return;
+            const common = { bubbles: true, cancelable: true, view: window, clientX: px, clientY: py };
+            if (typeof PointerEvent !== 'undefined') {
+              target.dispatchEvent(
+                new PointerEvent('pointerdown', { ...common, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+              );
+            }
+            target.dispatchEvent(new MouseEvent('mousedown', common));
+            if (typeof PointerEvent !== 'undefined') {
+              target.dispatchEvent(
+                new PointerEvent('pointerup', { ...common, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+              );
+            }
+            target.dispatchEvent(new MouseEvent('mouseup', common));
+            target.dispatchEvent(new MouseEvent('click', common));
+          },
+          x,
+          y
+        );
+      },
+    },
+  ];
+
+  for (const a of attempts) {
+    await a.run();
+    const got = await waitForRecordingUiAfterAttempt(
+      page,
+      PER_ATTEMPT_RECORDING_WAIT_MS,
+      180,
+      logger,
+      a.name
+    );
+    if (got.ok) return got;
+    await delay(350);
+  }
+  return { ok: false, why: 'all_attempts_failed' };
 }
 
 /**
@@ -615,7 +746,11 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     let effectiveHoldMs = holdMsOpt || 7000;
 
     if (desktopFlow) {
-      if (logger) logger.log('Voice (desktop): click mic, then wait for recording UI before audio + hold');
+      if (logger) {
+        logger.log(
+          'Voice (desktop): mic target screenshot → focus composer → try click methods (with composer-scoped recording check between each)'
+        );
+      }
       if (isFollowUpScreenshotsEnabled()) {
         await captureFollowUpScreenshotWithMarkers(
           page,
@@ -624,18 +759,28 @@ async function sendVoiceNoteInThread(page, opts = {}) {
           shotMeta
         );
       }
-      try {
-        await micEl.click({ delay: 50 });
-      } catch {
-        await page.mouse.click(cx, cy, { delay: 40 });
-      }
 
-      const uiOk = await waitForVoiceRecordingUi(page, { logger });
-      if (!uiOk) {
+      await page
+        .evaluate(() => {
+          const lower = (s) => (s || '').toLowerCase();
+          const inputs = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
+          for (const el of inputs) {
+            const ph = lower(el.getAttribute('placeholder') || '');
+            const al = lower(el.getAttribute('aria-label') || '');
+            if (ph.includes('message') || al.includes('message')) {
+              el.focus();
+              return;
+            }
+          }
+        })
+        .catch(() => {});
+
+      const act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger);
+      if (!act.ok) {
         if (isFollowUpScreenshotsEnabled()) {
           await captureFollowUpScreenshotWithMarkers(
             page,
-            [{ x: cx, y: cy, label: 'clicked here — recording UI never appeared' }],
+            [{ x: cx, y: cy, label: 'all mic gestures failed — no recording UI in composer dock' }],
             'voice-recording-ui-missed',
             shotMeta
           );
@@ -657,7 +802,13 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
       if (isFollowUpScreenshotsEnabled()) {
-        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+        /** Same crosshair as pre-click shot so both PNGs show where the mic was hit (vs blue recording bar). */
+        await captureFollowUpScreenshotWithMarkers(
+          page,
+          [{ x: cx, y: cy, label: 'mic click point (reference)' }],
+          'voice-after-mic-click',
+          shotMeta
+        );
       }
       await delay(Math.max(0, effectiveHoldMs - afterShotMs));
     } else {

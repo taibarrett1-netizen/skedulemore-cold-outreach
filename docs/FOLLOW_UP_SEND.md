@@ -45,7 +45,7 @@ Exactly **one** of:
 2. For **voice** follow-ups, when debug screenshots are on you may get:
    - **`*_voice-mic-click-target.png`** — **before** the mic click, with a **red crosshair** at the exact viewport coordinates used (so you can see if we’re hitting the wrong icon).
    - **`*_voice-recording-ui-missed.png`** — if recording UI never appears after the click, same crosshair on the current page (usually wrong target or blocked mic).
-   - **`*_voice-after-mic-click.png`** — after recording UI is confirmed and a short delay (recording strip should be visible).
+   - **`*_voice-after-mic-click.png`** — after recording UI is confirmed and a short delay; **also includes the same red crosshair** at the mic click coordinates so you can line it up with the blue recording bar.
    Filenames include `correlationId` when sent in the request.
 3. **Download via HTTP** (Bearer `COLD_DM_API_KEY` when set): `GET /api/debug/follow-up-screenshots` and `GET /api/debug/follow-up-screenshots/file?name=...`
 
@@ -57,9 +57,18 @@ See **`DEPLOYMENT.md`** → *Watching the browser on a VPS*. Set `HEADLESS_MODE=
 
 ### Recording UI gate (desktop)
 
-After clicking the mic, the worker **waits** for Instagram’s recording UI (blue strip, **`0:00`–`0:59`**-style timer in the composer band, or pause/delete recording controls). It **does not** start feeding audio into Pulse/ffmpeg until that passes (so you don’t burn the file while the composer still shows “Message…”). If the UI never appears, you get **`voice_recording_ui_not_detected`** and the debug PNG (if enabled) should still show the idle composer.
+Detection is **scoped to the composer dock** (the “Message…” row and strip just above it), so **blue outgoing bubbles** in the thread are **not** treated as recording UI.
 
-Optional env: **`VOICE_RECORDING_UI_TIMEOUT_MS`** (default **12000**) — max wait for that UI after the mic click.
+The worker tries **several mic gestures in order**, and after **each** one polls until real recording UI appears or a per-attempt timeout hits:
+
+1. `element.click()` on the mic node (with coordinate fallback)  
+2. `mouse` move → `down` → `up` at mic center  
+3. `mouse.click` at coordinates  
+4. `elementFromPoint` + synthetic pointer/mouse events  
+
+**ffmpeg → Pulse** starts only after that check passes (timer **`0:xx`/`1:xx`**, pause/delete **aria**, or a **wide** blue strip in the dock — not a bubble). If all attempts fail → **`voice_recording_ui_not_detected`**.
+
+Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOICE_RECORDING_UI_TIMEOUT_MS`** still influences the default when unset.
 
 ### Stricter success criteria
 
@@ -67,7 +76,7 @@ By default **`VOICE_NOTE_STRICT_VERIFY`** is **on**: after clicking Send, the wo
 
 **Note:** Sending **Escape** after recording was closing Instagram’s voice UI before “Send” — that is no longer done between record and send.
 
-**Recording gesture:** On **desktop Chrome** the mic is usually a **single click** to start; the worker waits for the audio duration (ffmpeg), then clicks **Send**. **Mobile web** viewports use **press-and-hold** on the mic. The VPS resolves the mic via layout (to the right of the message field, leftmost of the three trailing icons) and uses **`element.click()`** on that node so the right control is hit.
+**Recording gesture:** On **desktop Chrome** the worker tries multiple activation methods until recording UI is confirmed, then holds for the audio duration (ffmpeg), then clicks **Send**. **Mobile web** uses **press-and-hold** on the mic. The mic is resolved via layout (to the right of the message field, leftmost of the three trailing icons).
 
 ## Correlation (Supabase ↔ VPS logs)
 

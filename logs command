@@ -1,6 +1,8 @@
 # Download all follow-up debug PNGs from VPS (KEY = COLD_DM_API_KEY, one line)
+# Red crosshair = where Puppeteer clicked: *voice-mic-click-target* (before mic) and *voice-after-mic-click* (during record)
 cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
 BASE=http://178.62.52.200:3000 KEY='paste_key_here' node scripts/download-follow-up-screenshots.js
+# Then: open follow-up-screenshots-download/ and sort by date, or: ls follow-up-screenshots-download/*click*
 
 # Watch IG in the VPS browser (Xvfb + VNC): see DEPLOYMENT.md "Watching the browser on a VPS"
 # ssh -L 5900:127.0.0.1:5900 root@YOUR_IP
