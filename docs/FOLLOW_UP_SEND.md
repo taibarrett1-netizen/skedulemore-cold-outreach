@@ -138,6 +138,34 @@ If you see **duplicate opener-style text** in the thread:
 - **Home (`01-home`):** If a **“Turn on Notifications”** modal is visible, it blocks the rest of the session until dismissed. The worker now clicks **Not Now** on that (and similar) modals **before** the `01-home` screenshot.
 - **Composer (`04`):** A **sticker / GIF panel** over the thread steals clicks from the real mic/send. The worker now sends **Escape** several times before voice actions and **excludes emoji/sticker/GIF controls** when resolving the mic. The send step prefers **voice send** controls and avoids sticker regions.
 
+### Clear debug PNGs on the VPS
+
+From project root (where `follow-up-screenshots/` lives):
+
+```bash
+npm run clean-follow-up-screenshots
+# or: rm -f follow-up-screenshots/*.png
+```
+
+### Per–mic-method screenshots
+
+With **`FOLLOW_UP_DEBUG_SCREENSHOTS=true`**, each desktop mic attempt saves **`voice-mic-after_<method>.png`** with an on-image label:  
+`METHOD: <name> | recordingUI=YES|no (why)`. Pick the method that first shows **`YES`**, then set **`VOICE_DESKTOP_MIC_METHOD=<exact name>`** so only that path runs.
+
+Valid names (same order as default attempts):  
+`element.click`, `mouse_hold_to_start_recording`, `stepped_move+press_hold`, `mouse_move+down+up`, `mouse.click_coords`, `elementFromPoint+pointer+mouse`.
+
+### Send click nudge
+
+After playback stops, the worker resolves the Send control, moves the mouse **slightly right** (default **14px**, **`VOICE_SEND_CLICK_NUDGE_X`**), then clicks with Puppeteer (falls back to in-page `el.click()` if needed).
+
+### Recording UI not detected (but screenshots show the blue bar)
+
+Headless Chromium sometimes **does not match** our DOM/`getComputedStyle` heuristics even when **`voice-recording-ui-missed.png`** shows an active recording strip (timing or paint differences).
+
+- **`VOICE_ASSUME_RECORDING_AFTER_MIC=true`** — after the normal mic gesture sequence, still run **ffmpeg → Pulse**, hold for the audio duration, then **Send**, even if recording UI was never “confirmed.” Check screenshots / the thread; if recording never started, you may capture silence.
+- **`VOICE_RECORDING_UI_CONFIRM_STREAK=1`** — require only **one** successful poll instead of two before treating recording UI as confirmed (default `2`).
+
 ## VPS requirements (voice)
 
 - **`ffmpeg` and `ffprobe`** must be installed (`sudo apt install ffmpeg`). Without them the dashboard process can crash with `spawn ffmpeg ENOENT` when sending voice.

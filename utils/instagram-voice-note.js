@@ -18,6 +18,21 @@ const { startVoiceNotePlayback } = require('./voice-note-audio');
 /** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
 const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
 
+/**
+ * If true, after the full mic gesture sequence we still run ffmpeg + hold + Send when recording-UI
+ * heuristics never confirm (headless often matches screenshots but not `getComputedStyle` / DOM checks).
+ * Risk: if recording never started, you may send silence or mis-click — use with FOLLOW_UP_DEBUG_SCREENSHOTS.
+ */
+const VOICE_ASSUME_RECORDING_AFTER_MIC =
+  process.env.VOICE_ASSUME_RECORDING_AFTER_MIC === '1' ||
+  process.env.VOICE_ASSUME_RECORDING_AFTER_MIC === 'true';
+
+/** Consecutive matching polls required before accepting recording UI (default 2). Set `1` if UI is slow/single-frame. */
+const VOICE_RECORDING_UI_CONFIRM_STREAK = Math.min(
+  5,
+  Math.max(1, parseInt(process.env.VOICE_RECORDING_UI_CONFIRM_STREAK, 10) || 2)
+);
+
 /** Max wait after mic click for Instagram recording strip (blue bar / 0:xx timer). */
 const VOICE_RECORDING_UI_TIMEOUT_MS = Math.min(
   Math.max(parseInt(process.env.VOICE_RECORDING_UI_TIMEOUT_MS, 10) || 12000, 3000),
@@ -406,8 +421,12 @@ async function waitForRecordingUiAfterAttempt(page, maxMs, pollMs, logger, metho
         lastOkSig = sig;
         streak = 1;
       }
-      if (streak >= 2) {
-        if (logger) logger.log(`Voice: recording UI (${res.why}) after ${methodLabel} (confirmed x2)`);
+      if (streak >= VOICE_RECORDING_UI_CONFIRM_STREAK) {
+        if (logger) {
+          logger.log(
+            `Voice: recording UI (${res.why}) after ${methodLabel} (confirmed x${VOICE_RECORDING_UI_CONFIRM_STREAK})`
+          );
+        }
         return { ok: true, why: res.why, method: methodLabel };
       }
     } else {
@@ -447,10 +466,29 @@ const VOICE_MIC_START_HOLD_MS = Math.min(
 );
 
 /**
- * Try several click paths; only proceed to the next if recording UI did not appear.
+ * Run only this desktop mic method if set (exact `name` below). Empty = try all in order.
+ * @see VOICE_DESKTOP_MIC_METHOD_NAMES
  */
-async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
-  const attempts = [
+const VOICE_DESKTOP_MIC_METHOD = (process.env.VOICE_DESKTOP_MIC_METHOD || '').trim();
+
+/** Nudge Send click slightly right (paper plane vs heart). Override: VOICE_SEND_CLICK_NUDGE_X */
+const VOICE_SEND_CLICK_NUDGE_X = Math.min(
+  80,
+  Math.max(0, parseInt(process.env.VOICE_SEND_CLICK_NUDGE_X, 10) || 14)
+);
+
+/** Stable list for docs / dashboard copy-paste */
+const VOICE_DESKTOP_MIC_METHOD_NAMES = [
+  'element.click',
+  'mouse_hold_to_start_recording',
+  'stepped_move+press_hold',
+  'mouse_move+down+up',
+  'mouse.click_coords',
+  'elementFromPoint+pointer+mouse',
+];
+
+function buildDesktopMicAttempts(page, micEl, cx, cy) {
+  return [
     {
       name: 'element.click',
       run: async () => {
@@ -462,10 +500,6 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
       },
     },
     {
-      /**
-       * Point at mic center and hold (mobile-style start). Desktop Web is usually tap-to-toggle, but
-       * headless/IG sometimes only arms recording after a longer press.
-       */
       name: 'mouse_hold_to_start_recording',
       run: async () => {
         await page.mouse.move(Math.round(cx), Math.round(cy));
@@ -477,7 +511,6 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
       },
     },
     {
-      /** Stepped pointer path + short press-hold (desktop Web often responds better than instant click). */
       name: 'stepped_move+press_hold',
       run: async () => {
         const steps = 8;
@@ -550,6 +583,31 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
       },
     },
   ];
+}
+
+function selectDesktopMicAttempts(page, micEl, cx, cy, logger) {
+  const all = buildDesktopMicAttempts(page, micEl, cx, cy);
+  if (!VOICE_DESKTOP_MIC_METHOD) return all;
+  const one = all.filter((a) => a.name === VOICE_DESKTOP_MIC_METHOD);
+  if (one.length) return one;
+  if (logger && typeof logger.warn === 'function') {
+    logger.warn(
+      `[voice] VOICE_DESKTOP_MIC_METHOD="${VOICE_DESKTOP_MIC_METHOD}" not found. Valid: ${VOICE_DESKTOP_MIC_METHOD_NAMES.join(
+        ', '
+      )}. Running all methods.`
+    );
+  }
+  return all;
+}
+
+/**
+ * Try click paths; only proceed to the next if recording UI did not appear.
+ * With FOLLOW_UP_DEBUG_SCREENSHOTS, saves one PNG per method (label = method + detected y/n).
+ */
+async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta = null) {
+  const attempts = selectDesktopMicAttempts(page, micEl, cx, cy, logger);
+  const safeStep = (name) =>
+    `voice-mic-after_${String(name).replace(/[^a-zA-Z0-9]+/g, '_').replace(/_+/g, '_').slice(0, 40)}`;
 
   for (const a of attempts) {
     await a.run();
@@ -560,6 +618,10 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
       logger,
       a.name
     );
+    if (isFollowUpScreenshotsEnabled() && shotMeta) {
+      const label = `METHOD: ${a.name} | recordingUI=${got.ok ? 'YES' : 'no'}${got.why ? ` (${got.why})` : ''}`;
+      await captureFollowUpScreenshotWithMarkers(page, [{ x: cx, y: cy, label }], safeStep(a.name), shotMeta);
+    }
     if (got.ok) return got;
     await delay(350);
   }
@@ -1211,7 +1273,16 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         })
         .catch(() => {});
 
-      const act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger);
+      let act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta);
+      if (!act.ok && VOICE_ASSUME_RECORDING_AFTER_MIC) {
+        if (logger) {
+          logger.warn(
+            '[voice] Recording UI heuristics did not confirm after mic attempts; continuing anyway (VOICE_ASSUME_RECORDING_AFTER_MIC=true). Playback + hold will run — verify with screenshots / thread.'
+          );
+        }
+        act = { ok: true, why: 'assumed_after_mic_attempts', method: 'VOICE_ASSUME_RECORDING_AFTER_MIC' };
+        await delay(800);
+      }
       if (!act.ok) {
         if (isFollowUpScreenshotsEnabled()) {
           await captureFollowUpScreenshotWithMarkers(
@@ -1345,8 +1416,33 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
 
     const clickSend = clickSendAfterRecordingScript();
+    const previewOnly = voiceSendTargetPreviewScript();
     let sendResult = null;
     for (let attempt = 0; attempt < 15; attempt++) {
+      const preview = await page.evaluate(previewOnly).catch(() => null);
+      if (preview && preview.ok && Number.isFinite(preview.x) && Number.isFinite(preview.y)) {
+        const nx = Math.round(preview.x + VOICE_SEND_CLICK_NUDGE_X);
+        const ny = Math.round(preview.y);
+        try {
+          await page.mouse.move(nx, ny);
+          await delay(90);
+          await page.mouse.click(nx, ny, { delay: 55 });
+          sendResult = {
+            ok: true,
+            via: `${preview.via || 'preview'}_puppeteer_nudge${VOICE_SEND_CLICK_NUDGE_X}`,
+            label: preview.label,
+            dockedCount: preview.dockedCount,
+          };
+          if (logger) {
+            logger.log(
+              `Voice: Send via Puppeteer mouse at (${nx},${ny}) nudgeX=${VOICE_SEND_CLICK_NUDGE_X} (${preview.via || 'preview'})`
+            );
+          }
+          break;
+        } catch (e) {
+          if (logger) logger.warn(`Voice: Puppeteer Send click failed (${e.message}); falling back to DOM click`);
+        }
+      }
       sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
       if (sendResult && sendResult.ok) break;
       await delay(450);
@@ -1390,4 +1486,5 @@ module.exports = {
   prepareVoiceNoteUi,
   grantMicrophoneForInstagram,
   VOICE_NOTE_STRICT_VERIFY,
+  VOICE_DESKTOP_MIC_METHOD_NAMES,
 };

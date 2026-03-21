@@ -8,7 +8,8 @@
     "status": "node cli.js --status",
     "reset-daily": "node cli.js --reset-daily",
     "dashboard": "node server.js",
-    "download-follow-up-screenshots": "node scripts/download-follow-up-screenshots.js"
+    "download-follow-up-screenshots": "node scripts/download-follow-up-screenshots.js",
+    "clean-follow-up-screenshots": "node -e \"const fs=require('fs'),p=require('path');const d=p.join('follow-up-screenshots');if(fs.existsSync(d))for(const f of fs.readdirSync(d))if(f.endsWith('.png'))fs.unlinkSync(p.join(d,f));console.log('cleared follow-up-screenshots/*.png');\""
   },
   "keywords": [
     "instagram",
