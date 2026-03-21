@@ -75,11 +75,26 @@ Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOIC
 
 ### Stricter success criteria
 
-By default **`VOICE_NOTE_STRICT_VERIFY`** is **on**: after clicking Send, the worker polls the thread until it sees a DOM change (e.g. new `audio` / list rows). If Instagram returns “success” in logs but no bubble appears, you should see a **`voice_not_confirmed_in_thread`** error instead of a false **`sent ok`**. Set **`VOICE_NOTE_STRICT_VERIFY=false`** only if this check causes false failures on your layout.
+By default **`VOICE_NOTE_STRICT_VERIFY`** is **on**: after clicking Send, the worker polls the thread until it sees a DOM change (e.g. new `audio` / list rows, scroll height in the message column, or new play/voice-related controls in the thread). If Instagram returns “success” in logs but no bubble appears, you should see a **`voice_not_confirmed_in_thread`** error instead of a false **`sent ok`**. Set **`VOICE_NOTE_STRICT_VERIFY=false`** only if this check causes false failures on your layout.
+
+**If logs show `scroll=0` / `scrollerText=0` for the whole run:** the old heuristic often **could not find the message scroller**; the voice note may still have been sent. Check the thread in the app or in a VNC session. Recent worker builds add a **fallback scroller** (largest `overflow-y: auto|scroll` region in `main`) and **`mediaHints`** (play/voice/clip aria in the thread) so verification matches IG Web better.
+
+### Reverse‑engineering IG Web (console, network)
+
+Instagram’s minified JS rarely prints useful **`console.log`** for DMs. For your own debugging:
+
+1. **Local Chrome (logged into the same account):** open the DM thread → **DevTools** → **Network** → filter **`graphql`** or **`ajax`** → record while you send a voice note manually. Inspect **request name / response** (often `.../graphql/query/` with doc IDs). That’s the real “API contract,” not the page console.
+2. **Puppeteer:** after `const page = await browser.newPage()`, you can temporarily add  
+   `page.on('console', (msg) => console.log('[browser]', msg.type(), msg.text()));`  
+   and **`page.on('pageerror', …)`** to see page errors. That helps for **your** `evaluate()` scripts, not IG internals.
+3. **CDP:** `const client = await page.target().createCDPSession(); await client.send('Log.enable'); client.on('Log.entryAdded', …)` for browser log entries (still sparse for IG).
+4. **What to paste to an assistant:** a **HAR** export (sanitized), or **screenshots** of the Network row for the request fired when you tap Send on a voice note, plus **your PM2 log lines** (`Voice verify: …`, `mediaHints`).
 
 **Note:** Sending **Escape** after recording was closing Instagram’s voice UI before “Send” — that is no longer done between record and send.
 
-**Recording gesture:** On **desktop Chrome** the worker tries multiple activation methods until recording UI is confirmed, then holds for the audio duration (ffmpeg), then clicks **Send**. **Mobile web** uses **press-and-hold** on the mic. The mic is resolved via layout (to the right of the message field, leftmost of the three trailing icons).
+**Recording gesture:** On **desktop Chrome** the worker tries multiple activation methods until recording UI is confirmed, then holds for the audio duration (ffmpeg), then clicks **Send**. **ffmpeg is stopped before the Send click** so the virtual mic is not still streaming into a “recording” session. **Send** is resolved only inside the **composer dock** (and excludes Like/Heart/Gallery/Mic labels); the old “rightmost icon in the bottom strip” fallback could hit the **heart** and look like a success in logs while no voice note was sent.
+
+**Mobile web** uses **press-and-hold** on the mic. The mic is resolved via layout (to the right of the message field, leftmost of the three trailing icons).
 
 ## Correlation (Supabase ↔ VPS logs)
 

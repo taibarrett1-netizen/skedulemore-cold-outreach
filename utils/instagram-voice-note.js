@@ -42,9 +42,14 @@ function threadDomMetricsScript() {
       document.body;
 
     const lower = (s) => (s || '').toLowerCase();
+    const mainSection =
+      document.querySelector('section[role="main"]') ||
+      document.querySelector('[role="main"]') ||
+      document.querySelector('main');
+
     const findMessageScroller = () => {
       const inputs = document.querySelectorAll(
-        'textarea[placeholder], textarea, [contenteditable="true"], [role="textbox"], div[contenteditable="true"]'
+        'textarea[placeholder], textarea, p[contenteditable="true"], [contenteditable="true"], [role="textbox"], div[contenteditable="true"]'
       );
       for (const ta of inputs) {
         const ph = lower(ta.getAttribute('placeholder') || ta.getAttribute('aria-label') || '');
@@ -57,7 +62,7 @@ function threadDomMetricsScript() {
           }
         }
         let el = ta;
-        for (let i = 0; i < 18 && el; i++) {
+        for (let i = 0; i < 22 && el; i++) {
           el = el.parentElement;
           if (!el) break;
           try {
@@ -69,7 +74,36 @@ function threadDomMetricsScript() {
           }
         }
       }
-      return null;
+      /**
+       * IG often nests the thread in a scrollable div that doesn’t sit directly above the composer.
+       * If composer-walk fails, pick the largest overflow-y scroll area inside main (typical message column).
+       */
+      if (!mainSection) return null;
+      let best = null;
+      let bestSh = 0;
+      try {
+        mainSection.querySelectorAll('div').forEach((div) => {
+          try {
+            const st = window.getComputedStyle(div);
+            const oy = st.overflowY;
+            if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return;
+            const sh = div.scrollHeight;
+            const ch = div.clientHeight || 0;
+            if (ch < 100 || sh < ch + 40) return;
+            const r = div.getBoundingClientRect();
+            if (r.height < 80 || r.top > window.innerHeight * 0.92) return;
+            if (sh > bestSh) {
+              bestSh = sh;
+              best = div;
+            }
+          } catch {
+            /* ignore */
+          }
+        });
+      } catch {
+        /* ignore */
+      }
+      return best;
     };
 
     const scroller = findMessageScroller();
@@ -98,6 +132,34 @@ function threadDomMetricsScript() {
     const listItems = root.querySelectorAll('[role="listitem"]');
     const rows = root.querySelectorAll('[role="row"]');
 
+    /** Voice rows often expose play/pause/voice aria before <audio> appears in DOM. */
+    let mediaThreadHints = 0;
+    const hintRoot = mainSection || root;
+    try {
+      hintRoot.querySelectorAll('div[role="button"], button, [role="button"]').forEach((el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.bottom > window.innerHeight - 100) return;
+          const al = lower(el.getAttribute('aria-label') || '');
+          const ti = lower(el.getAttribute('title') || '');
+          const t = `${al} ${ti}`;
+          if (
+            t.includes('play') ||
+            t.includes('pause') ||
+            t.includes('voice') ||
+            t.includes('clip') ||
+            t.includes('audio message')
+          ) {
+            mediaThreadHints += 1;
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+    } catch {
+      /* ignore */
+    }
+
     return {
       audio: audios.length,
       listItems: listItems.length,
@@ -106,6 +168,7 @@ function threadDomMetricsScript() {
       scrollerChildCount,
       scrollerTextLen,
       mainTextLen,
+      mediaThreadHints,
     };
   };
 }
@@ -115,18 +178,24 @@ function voiceThreadLooksDelivered(before, after) {
   const childDelta = after.scrollerChildCount - before.scrollerChildCount;
   const scrollerTextDelta = after.scrollerTextLen - before.scrollerTextLen;
   const mainTextDelta = after.mainTextLen - before.mainTextLen;
+  const hintDelta = (after.mediaThreadHints || 0) - (before.mediaThreadHints || 0);
 
   if (after.audio > before.audio) return true;
   if (after.listItems > before.listItems) return true;
   if (after.rows > before.rows) return true;
   /** New bubble often grows scroll area or adds a child row. */
   if (scrollDelta >= 25) return true;
+  if (scrollDelta >= 8 && after.scrollerScrollHeight > 0) return true;
   if (childDelta >= 1) return true;
   /** New message text (e.g. duration label) inside the thread scroller. */
   if (before.scrollerTextLen > 0 && scrollerTextDelta >= 8) return true;
   if (before.scrollerScrollHeight > 0 && scrollerTextDelta >= 8) return true;
+  /** Voice note row often adds a play/voice control in the thread. */
+  if (hintDelta >= 1) return true;
   /** Fallback: main pane text grew (noisier; ignore tiny deltas). */
   if (mainTextDelta >= 12) return true;
+  /** Voice-only bubble may add almost no innerText; allow tiny growth if scroller started working. */
+  if (mainTextDelta >= 4 && after.scrollerScrollHeight > before.scrollerScrollHeight) return true;
   return false;
 }
 
@@ -141,7 +210,7 @@ async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
     if (after && voiceThreadLooksDelivered(before, after)) {
       if (logger) {
         logger.log(
-          `Voice verify: thread changed (audio ${before.audio}→${after.audio}, list ${before.listItems}→${after.listItems}, rows ${before.rows}→${after.rows}, scroll ${before.scrollerScrollHeight}→${after.scrollerScrollHeight}, scrollerKids ${before.scrollerChildCount}→${after.scrollerChildCount}, scrollerText ${before.scrollerTextLen}→${after.scrollerTextLen}, mainText ${before.mainTextLen}→${after.mainTextLen})`
+          `Voice verify: thread changed (audio ${before.audio}→${after.audio}, list ${before.listItems}→${after.listItems}, rows ${before.rows}→${after.rows}, scroll ${before.scrollerScrollHeight}→${after.scrollerScrollHeight}, scrollerKids ${before.scrollerChildCount}→${after.scrollerChildCount}, scrollerText ${before.scrollerTextLen}→${after.scrollerTextLen}, mainText ${before.mainTextLen}→${after.mainTextLen}, mediaHints ${before.mediaThreadHints ?? 0}→${after.mediaThreadHints ?? 0})`
         );
       }
       return true;
@@ -151,7 +220,7 @@ async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
   if (logger) {
     const snap = await page.evaluate(threadDomMetricsScript()).catch(() => before);
     logger.warn(
-      `Voice verify: no thread change within ${timeoutMs}ms (final: audio=${snap.audio} listItems=${snap.listItems} rows=${snap.rows} scroll=${snap.scrollerScrollHeight} kids=${snap.scrollerChildCount} scrollerText=${snap.scrollerTextLen} mainText=${snap.mainTextLen}; before scroll=${before.scrollerScrollHeight})`
+      `Voice verify: no thread change within ${timeoutMs}ms (final: audio=${snap.audio} listItems=${snap.listItems} rows=${snap.rows} scroll=${snap.scrollerScrollHeight} kids=${snap.scrollerChildCount} scrollerText=${snap.scrollerTextLen} mainText=${snap.mainTextLen} mediaHints=${snap.mediaThreadHints ?? 0}; before scroll=${before.scrollerScrollHeight} beforeHints=${before.mediaThreadHints ?? 0})`
     );
   }
   return false;
@@ -709,70 +778,146 @@ function clickSendAfterRecordingScript() {
       }
       return false;
     };
+
+    function findComposerForDock() {
+      const byPlaceholder = (el) => {
+        const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+        const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+        const t = (p + ' ' + a).toLowerCase();
+        return (
+          t.includes('message') ||
+          t.includes('messenger') ||
+          t.includes('add a message') ||
+          t.includes('write a message')
+        );
+      };
+      const all = document.querySelectorAll(
+        'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+      );
+      for (const el of all) {
+        try {
+          if (!el || el.disabled) continue;
+          if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+          if (byPlaceholder(el)) return el;
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const el of all) {
+        try {
+          if (!el || el.disabled) continue;
+          if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+          return el;
+        } catch {
+          /* ignore */
+        }
+      }
+      return null;
+    }
+
+    /** Do not treat Like/Heart/Gallery/Mic as Send (old fallback: rightmost bottom icon = heart). */
+    const isDefinitelyNotSend = (label, title, txt) => {
+      const t = `${label} ${title} ${txt}`;
+      return (
+        /\blike\b|\blove\b|\bheart\b|\breact\b|\bliking\b/.test(t) ||
+        /\bemoji\b|\bsticker\b|\bgif\b|\bgallery\b|\bphoto\b|\bimage\b|\bcamera\b|\battach\b|\bclip\b\s*art/.test(t) ||
+        /\bmicrophone\b|\bmic\b|\bvoice message\b|\brecord\b|\brecording\b|\bpause\b|\bdelete\b|\btrash\b/.test(t)
+      );
+    };
+
+    const compose = findComposerForDock();
+    if (!compose) {
+      return { ok: false, why: 'no_composer' };
+    }
+    const cr = compose.getBoundingClientRect();
+    const dockTop = Math.max(cr.top - 160, window.innerHeight * 0.52);
+    const dockBottom = window.innerHeight + 4;
+    const dockLeft = Math.max(0, cr.left - 80);
+    const dockRight = window.innerWidth - 4;
+
+    const centerInDock = (el) => {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        return false;
+      }
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      return cx >= dockLeft && cx <= dockRight && cy >= dockTop && cy <= dockBottom;
+    };
+
     const clickables = Array.from(
       document.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"]')
     );
-    const voiceSend = clickables.find((el) => {
-      if (!visible(el) || inStickerNoise(el)) return false;
-      const label = lower(el.getAttribute('aria-label'));
-      const title = lower(el.getAttribute('title'));
-      return (
+
+    const docked = clickables.filter((el) => visible(el) && !inStickerNoise(el) && centerInDock(el));
+
+    const tryClick = (el, via) => {
+      try {
+        el.click();
+        const label = (el.getAttribute && el.getAttribute('aria-label')) || '';
+        return { ok: true, via, label: label.slice(0, 120) };
+      } catch {
+        return { ok: false, why: 'click_throw' };
+      }
+    };
+
+    for (const el of docked) {
+      const label = lower(el.getAttribute('aria-label') || '');
+      const title = lower(el.getAttribute('title') || '');
+      const txt = lower((el.textContent || '').trim().slice(0, 40));
+      if (isDefinitelyNotSend(label, title, txt)) continue;
+      if (
         (label.includes('voice') && label.includes('send')) ||
         (title.includes('voice') && title.includes('send')) ||
+        label.includes('send voice') ||
         label === 'send' ||
-        label.includes('send voice')
-      );
-    });
-    if (voiceSend) {
-      voiceSend.click();
-      return true;
+        title === 'send'
+      ) {
+        const r = tryClick(el, 'dock_aria_voice_or_send');
+        if (r.ok) return r;
+      }
     }
-    const send = clickables.find((el) => {
-      if (!visible(el) || inStickerNoise(el)) return false;
-      const label = lower(el.getAttribute('aria-label'));
-      const title = lower(el.getAttribute('title'));
+
+    for (const el of docked) {
+      const label = lower(el.getAttribute('aria-label') || '');
+      const title = lower(el.getAttribute('title') || '');
       const txt = lower((el.textContent || '').trim());
-      if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) return false;
-      if (label.includes('send') || title.includes('send') || txt === 'send') return true;
-      return false;
-    });
-    if (send) {
-      send.click();
-      return true;
+      if (isDefinitelyNotSend(label, title, txt)) continue;
+      if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) continue;
+      if (label.includes('send') || title.includes('send') || txt === 'send') {
+        const r = tryClick(el, 'dock_aria_send_generic');
+        if (r.ok) return r;
+      }
     }
-    const bottom = window.innerHeight - 180;
-    const planes = clickables
+
+    /**
+     * Recording strip: paper-plane Send is usually the rightmost icon **in the dock** with an SVG,
+     * not the thread “heart” (which sits in the same row when idle — must stay excluded).
+     */
+    const stripCandidates = docked
       .filter((el) => {
-        if (!visible(el) || inStickerNoise(el)) return false;
-        if (!el.querySelector('svg')) return false;
-        const label = lower(el.getAttribute('aria-label'));
-        if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) return false;
+        if (!el.querySelector || !el.querySelector('svg')) return false;
+        const label = lower(el.getAttribute('aria-label') || '');
+        const title = lower(el.getAttribute('title') || '');
+        const txt = lower((el.textContent || '').trim().slice(0, 24));
+        if (isDefinitelyNotSend(label, title, txt)) return false;
         const r = el.getBoundingClientRect();
-        return r.top >= bottom;
+        if (r.width < 14 || r.height < 14 || r.width > 96 || r.height > 96) return false;
+        /** Recording bar sits above the “Message…” field; mic/heart row is usually same band as composer (cy > cr.top). */
+        const cy = r.top + r.height / 2;
+        if (cy > cr.top) return false;
+        return true;
       })
       .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-    if (planes.length && planes[0]) {
-      planes[0].click();
-      return true;
+
+    if (stripCandidates.length) {
+      const r = tryClick(stripCandidates[0], 'dock_rightmost_recording_strip');
+      if (r.ok) return r;
     }
-    /** Recording bar: Send is usually the rightmost circular control above the composer. */
-    const bottomY = window.innerHeight - 240;
-    const row = clickables
-      .filter((el) => {
-        if (!visible(el) || inStickerNoise(el)) return false;
-        if (!el.querySelector('svg')) return false;
-        const r = el.getBoundingClientRect();
-        if (r.top < bottomY) return false;
-        const label = lower(el.getAttribute('aria-label'));
-        if (label.includes('microphone') || label.includes('voice message') || label.includes('gallery')) return false;
-        return r.width > 16 && r.height > 16;
-      })
-      .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
-    if (row.length) {
-      row[0].click();
-      return true;
-    }
-    return false;
+
+    return { ok: false, why: 'no_send_control_in_dock' };
   };
 }
 
@@ -807,10 +952,11 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       scrollerChildCount: 0,
       scrollerTextLen: 0,
       mainTextLen: 0,
+      mediaThreadHints: 0,
     }));
     if (logger) {
       logger.log(
-        `Voice: thread snapshot before mic (audio=${metricsBefore.audio}, listItems=${metricsBefore.listItems}, rows=${metricsBefore.rows}, scroll=${metricsBefore.scrollerScrollHeight || 0})`
+        `Voice: thread snapshot before mic (audio=${metricsBefore.audio}, listItems=${metricsBefore.listItems}, rows=${metricsBefore.rows}, scroll=${metricsBefore.scrollerScrollHeight || 0}, mediaHints=${metricsBefore.mediaThreadHints ?? 0})`
       );
     }
 
@@ -955,21 +1101,39 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       await page.mouse.up();
     }
 
+    /**
+     * Stop ffmpeg → Pulse **before** clicking Send. Leaving the stream running made the “recording”
+     * session ambiguous and matched mis-clicks (e.g. heart) that never queued a voice message.
+     */
+    if (internalPlayback) {
+      if (logger) logger.log('Voice: stopping ffmpeg playback before Send click');
+      internalPlayback.stop();
+      internalPlayback = null;
+    }
+
     await micEl.dispose().catch(() => {});
     await micHandle.dispose().catch(() => {});
 
     /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
     await delay(1200);
     const clickSend = clickSendAfterRecordingScript();
-    let sent = false;
+    let sendResult = null;
     for (let attempt = 0; attempt < 15; attempt++) {
-      sent = await page.evaluate(clickSend).catch(() => false);
-      if (sent) break;
+      sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
+      if (sendResult && sendResult.ok) break;
       await delay(450);
     }
-    if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
+    if (!sendResult || !sendResult.ok) {
+      const why = sendResult && sendResult.why ? sendResult.why : 'unknown';
+      if (logger) logger.warn(`Voice: could not click Send (${why}) after retries`);
+      return { ok: false, reason: 'voice_send_button_not_found' };
+    }
 
-    if (logger) logger.log('Voice: send control clicked; waiting for thread to update…');
+    if (logger) {
+      logger.log(
+        `Voice: send control clicked (${sendResult.via}) aria="${(sendResult.label || '').replace(/"/g, "'")}"; waiting for thread to update…`
+      );
+    }
     await delay(800);
 
     if (strictVerify) {
