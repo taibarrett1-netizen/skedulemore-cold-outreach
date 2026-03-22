@@ -38,6 +38,15 @@ function getPuppeteerSlowMo() {
   const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
+
+/**
+ * After voice Send in follow-ups, keep the browser open this long so Instagram can finish upload
+ * before we close the session (default 10s). Set VOICE_POST_SEND_BROWSER_WAIT_MS=0 to skip.
+ */
+const VOICE_POST_SEND_BROWSER_WAIT_MS = Math.min(
+  120000,
+  Math.max(0, parseInt(process.env.VOICE_POST_SEND_BROWSER_WAIT_MS, 10) || 10000)
+);
 /**
  * Headed Chromium often opens ~800×600; `page.setViewport()` alone does not resize the X11 window,
  * so Instagram stays visually clipped until the real window matches (especially on VNC + Xvfb).
@@ -1209,6 +1218,12 @@ async function sendFollowUp(body) {
       });
       if (!voiceResult.ok) {
         return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
+      }
+      if (VOICE_POST_SEND_BROWSER_WAIT_MS > 0) {
+        logger.log(
+          `[follow-up] voice: waiting ${VOICE_POST_SEND_BROWSER_WAIT_MS}ms before closing browser (upload settle)`
+        );
+        await delay(VOICE_POST_SEND_BROWSER_WAIT_MS);
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
       fs.unlink(CHROME_FAKE_MIC_WAV, () => {});
