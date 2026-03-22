@@ -630,10 +630,6 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta
       logger,
       a.name
     );
-    if (isFollowUpScreenshotsEnabled() && shotMeta) {
-      const label = `METHOD: ${a.name} | recordingUI=${got.ok ? 'YES' : 'no'}${got.why ? ` (${got.why})` : ''}`;
-      await captureFollowUpScreenshotWithMarkers(page, [{ x: cx, y: cy, label }], safeStep(a.name), shotMeta);
-    }
     if (got.ok) return got;
     await delay(350);
   }
@@ -1062,6 +1058,65 @@ function voiceSendResolveScript(opts) {
       return out;
     };
 
+    /**
+     * IG voice Send is the paper-plane circle at the **bottom-right** of the viewport.
+     * Run this first so we never pick a chat bubble or strip heuristic in the thread column.
+     */
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const inBottomRightChrome = (r) =>
+      r.bottom > h - 88 && r.right > w - 88 && r.width >= 20 && r.width <= 72 && r.height >= 20 && r.height <= 72;
+
+    const cornerProbes = [
+      [w - 28, h - 28],
+      [w - 36, h - 32],
+      [w - 44, h - 36],
+      [w - 52, h - 40],
+    ];
+    for (const [px, py] of cornerProbes) {
+      let node = document.elementFromPoint(px, py);
+      for (let depth = 0; depth < 14 && node; depth++) {
+        try {
+          const r = node.getBoundingClientRect();
+          if (inBottomRightChrome(r) && node.querySelector && node.querySelector('svg')) {
+            const lab = lower(node.getAttribute('aria-label') || '') + lower(node.getAttribute('title') || '');
+            if (!isDefinitelyNotSend(lab, '', '')) {
+              const res = finish(node, 'viewport_bottom_right_corner');
+              if (res.ok) return res;
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        node = node.parentElement;
+      }
+    }
+
+    /** All interactive nodes in the literal bottom-right (excludes thread bubbles). */
+    const cornerCandidates = clickables
+      .filter((el) => {
+        if (!visible(el) || inStickerNoise(el)) return false;
+        try {
+          const r = el.getBoundingClientRect();
+          if (!inBottomRightChrome(r)) return false;
+          if (!el.querySelector || !el.querySelector('svg')) return false;
+          const lab = lower(el.getAttribute('aria-label') || '') + lower(el.getAttribute('title') || '');
+          if (isDefinitelyNotSend(lab, '', '')) return false;
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => {
+        const ra = a.getBoundingClientRect();
+        const rb = b.getBoundingClientRect();
+        return rb.right + rb.bottom - (ra.right + ra.bottom);
+      });
+    if (cornerCandidates.length) {
+      const res = finish(cornerCandidates[0], 'corner_rightmost_control');
+      if (res.ok) return res;
+    }
+
     for (const el of docked) {
       const tid = lower(el.getAttribute('data-testid') || '');
       if (tid.includes('send') && tid.includes('voice')) {
@@ -1266,15 +1321,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
       if (logger) {
         logger.log(
-          'Voice (desktop): mic target screenshot → focus composer → try click methods (with composer-scoped recording check between each)'
-        );
-      }
-      if (isFollowUpScreenshotsEnabled()) {
-        await captureFollowUpScreenshotWithMarkers(
-          page,
-          [{ x: cx, y: cy, label: 'mic click target (red crosshair)' }],
-          'voice-mic-click-target',
-          shotMeta
+          'Voice (desktop): focus composer → click mic → hold → send'
         );
       }
 
@@ -1340,63 +1387,36 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         await delay(800);
       }
       if (!act.ok) {
-        if (isFollowUpScreenshotsEnabled()) {
-          await captureFollowUpScreenshotWithMarkers(
-            page,
-            [{ x: cx, y: cy, label: 'all mic gestures failed — no recording UI in composer dock' }],
-            'voice-recording-ui-missed',
-            shotMeta
-          );
-        }
         await micEl.dispose().catch(() => {});
         await micHandle.dispose().catch(() => {});
         return { ok: false, reason: 'voice_recording_ui_not_detected' };
       }
 
-      /** Plain PNG right after recording UI is detected (see blue bar / timer vs DOM heuristic). */
+      /** Screenshot 1: After mic click — recording UI visible. */
       if (isFollowUpScreenshotsEnabled()) {
         await delay(220);
-        await captureFollowUpScreenshot(page, 'voice-recording-ui-just-confirmed', shotMeta);
+        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
       }
 
       if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
-      if (isFollowUpScreenshotsEnabled()) {
-        /** Mic crosshair shortly after recording starts (may differ from just-confirmed if UI flickers). */
-        await captureFollowUpScreenshotWithMarkers(
-          page,
-          [{ x: cx, y: cy, label: 'mic click point (reference)' }],
-          'voice-after-mic-click',
-          shotMeta
-        );
-      }
       const remainingHold = Math.max(0, effectiveHoldMs - afterShotMs);
-      if (isFollowUpScreenshotsEnabled() && remainingHold > 4500) {
-        const half = Math.floor(remainingHold / 2);
-        await delay(half);
-        await captureFollowUpScreenshot(page, 'voice-recording-mid-hold', shotMeta);
-        await delay(remainingHold - half);
-      } else {
-        await delay(remainingHold);
-      }
+      await delay(remainingHold);
     } else {
       // Mobile: Chrome fake mic — use durationSec for hold
       if (voiceSource && voiceSource.durationSec != null) {
         effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 700);
       }
       if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
-      if (isFollowUpScreenshotsEnabled()) {
-        await captureFollowUpScreenshotWithMarkers(
-          page,
-          [{ x: cx, y: cy, label: 'mic press-and-hold target' }],
-          'voice-mic-click-target',
-          shotMeta
-        );
-      }
       await page.mouse.move(cx, cy);
       await page.mouse.down();
       await delay(effectiveHoldMs);
       await page.mouse.up();
+      /** Screenshot 1 (mobile): After hold — recording UI. */
+      if (isFollowUpScreenshotsEnabled()) {
+        await delay(300);
+        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+      }
     }
 
     await micEl.dispose().catch(() => {});
@@ -1406,46 +1426,24 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     await delay(1200);
 
     const previewSend = voiceSendTargetPreviewScript();
+    /** Screenshot 2: Where we're clicking to send. */
     if (isFollowUpScreenshotsEnabled()) {
       await delay(280);
-      await captureFollowUpScreenshot(page, 'voice-after-playback-before-send', shotMeta);
       const preview = await page.evaluate(previewSend).catch(() => null);
-      if (preview && preview.ok && Number.isFinite(preview.x) && Number.isFinite(preview.y)) {
-        if (logger) {
-          logger.log(
-            `Voice: debug Send target preview (${preview.via}) dockedButtons=${preview.dockedCount ?? '?'} aria="${(preview.label || '').slice(0, 80)}"`
-          );
-        }
-        await captureFollowUpScreenshotWithMarkers(
-          page,
-          [
-            {
-              x: preview.x,
-              y: preview.y,
-              label: `Send target (${preview.via}) — Puppeteer will click here`,
-            },
-          ],
-          'voice-send-click-target',
-          shotMeta
-        );
-      } else {
-        const why = preview && preview.why ? preview.why : 'preview_eval_failed';
-        const dc = preview && typeof preview.dockedCount === 'number' ? preview.dockedCount : '?';
-        if (logger) logger.warn(`Voice: could not resolve Send coords for screenshot (${why}, docked=${dc})`);
-        const vp = page.viewport() || { width: 1280, height: 800 };
-        await captureFollowUpScreenshotWithMarkers(
-          page,
-          [
-            {
-              x: Math.min(vp.width - 48, Math.max(80, (vp.width * 3) / 4)),
-              y: vp.height - 90,
-              label: 'Send not resolved — inspect voice-after-playback-before-send',
-            },
-          ],
-          'voice-send-target-unresolved',
-          shotMeta
-        );
+      const vp = page.viewport() || { width: 1280, height: 800 };
+      const sx = preview && preview.ok && Number.isFinite(preview.x) ? preview.x : vp.width - 36;
+      const sy = preview && preview.ok && Number.isFinite(preview.y) ? preview.y : vp.height - 36;
+      if (logger && preview?.via) {
+        logger.log(`Voice: Send target (${preview.via}) at (${Math.round(sx)},${Math.round(sy)})`);
+      } else if (logger && preview?.why) {
+        logger.warn(`Voice: Send coords unresolved (${preview.why}) — using corner fallback`);
       }
+      await captureFollowUpScreenshotWithMarkers(
+        page,
+        [{ x: sx, y: sy, label: 'Send target — Puppeteer will click here' }],
+        'voice-send-target',
+        shotMeta
+      );
     }
 
     const clickSend = clickSendAfterRecordingScript();
@@ -1479,6 +1477,22 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
       if (sendResult && sendResult.ok) break;
       await delay(450);
+    }
+    if (!sendResult || !sendResult.ok) {
+      const vp = page.viewport();
+      if (vp && vp.width > 200 && vp.height > 200) {
+        const bx = Math.round(vp.width - 36);
+        const by = Math.round(vp.height - 36);
+        try {
+          await page.mouse.move(bx, by);
+          await delay(80);
+          await page.mouse.click(bx, by, { delay: 55 });
+          sendResult = { ok: true, via: 'viewport_blind_corner', label: '' };
+          if (logger) logger.log(`Voice: Send blind click at viewport corner (${bx},${by})`);
+        } catch {
+          /* ignore */
+        }
+      }
     }
     if (!sendResult || !sendResult.ok) {
       const why = sendResult && sendResult.why ? sendResult.why : 'unknown';
