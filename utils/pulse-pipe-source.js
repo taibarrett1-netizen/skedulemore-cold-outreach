@@ -19,6 +19,18 @@ const VOICE_USE_PIPE_SOURCE = process.env.VOICE_USE_PIPE_SOURCE !== 'false' && p
 
 let pipeSourceSetupDone = false;
 
+/** Build env so PulseAudio clients (pactl, Chromium) find the server. PM2 often lacks XDG_RUNTIME_DIR. */
+function pactlEnv() {
+  const env = { ...process.env };
+  if (env.PULSE_SERVER) return env;
+  const rt = env.XDG_RUNTIME_DIR || (typeof process.getuid === 'function' && process.getuid() === 0 ? '/run/user/0' : null);
+  if (rt) {
+    env.XDG_RUNTIME_DIR = rt;
+    env.PULSE_RUNTIME_PATH = rt;
+  }
+  return env;
+}
+
 /**
  * Find and unload PulseAudio modules by name and argument match.
  * @param {string} moduleName - e.g. 'module-null-sink' or 'module-pipe-source'
@@ -27,7 +39,7 @@ let pipeSourceSetupDone = false;
  */
 function unloadPulseModuleIfPresent(moduleName, argMatch) {
   try {
-    const list = spawnSync('pactl', ['list', 'modules'], { encoding: 'utf8' });
+    const list = spawnSync('pactl', ['list', 'modules'], { encoding: 'utf8', env: pactlEnv() });
     if (list.status !== 0 || !list.stdout) return false;
     const blocks = list.stdout.split('\n\n');
     for (const block of blocks) {
@@ -121,7 +133,7 @@ function ensureVoicePipeSource(logger = null) {
         'rate=48000',
         'channels=2',
       ],
-      { encoding: 'utf8' }
+      { encoding: 'utf8', env: pactlEnv() }
     );
 
     if (load.status !== 0) {
@@ -136,6 +148,7 @@ function ensureVoicePipeSource(logger = null) {
     // 5. Set as default source so Chromium's getUserMedia uses it without PULSE_SOURCE
     const setDefault = spawnSync('pactl', ['set-default-source', VOICE_NOTE_SOURCE_NAME], {
       encoding: 'utf8',
+      env: pactlEnv(),
     });
     if (setDefault.status !== 0 && logger) {
       logger.warn(`[voice] pactl set-default-source failed: ${setDefault.stderr || ''}`);
@@ -164,9 +177,15 @@ function isPipeSourceReady() {
   return pipeSourceSetupDone;
 }
 
+/** Env for Chromium so getUserMedia finds PulseAudio (same as pactl). */
+function getPulseClientEnv() {
+  return pactlEnv();
+}
+
 module.exports = {
   ensureVoicePipeSource,
   getVoiceNotePipePath,
+  getPulseClientEnv,
   isPipeSourceReady,
   VOICE_NOTE_SOURCE_NAME,
   VOICE_NOTE_PIPE_PATH,

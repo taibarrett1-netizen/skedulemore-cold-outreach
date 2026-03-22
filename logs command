@@ -49,3 +49,7 @@ curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
   -H "Authorization: Bearer b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354" \
   -H "Content-Type: application/json" \
   -d '{"clientId":"f0aff6c5-64f8-498b-83f5-b31e7291d34d","instagramSessionId":"e5c11f0f-8fa2-48f4-a06e-57381ef7c2e0"}'
+
+  rm -f follow-up-screenshots/*.png
+
+  npm run download-follow-up-screenshots

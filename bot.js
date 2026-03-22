@@ -17,7 +17,7 @@ const {
 } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { isFfmpegAvailable } = require('./utils/voice-note-audio');
-const { ensureVoicePipeSource } = require('./utils/pulse-pipe-source');
+const { ensureVoicePipeSource, getPulseClientEnv } = require('./utils/pulse-pipe-source');
 const {
   sendVoiceNoteInThread,
   prepareVoiceNoteUi,
@@ -915,6 +915,7 @@ function buildFollowUpLaunchOptions() {
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
+    env: getPulseClientEnv(),
   };
   appendOptionalFakeMediaDeviceArg(opts.args);
   applyPuppeteerSlowMo(opts);
@@ -1390,6 +1391,7 @@ async function runBotMultiTenant() {
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
+    env: getPulseClientEnv(),
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
   ensureVoicePipeSource(logger);
@@ -1603,6 +1605,7 @@ async function runBot() {
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
+    env: getPulseClientEnv(),
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
   ensureVoicePipeSource(logger);
@@ -1742,6 +1745,7 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
+    env: getPulseClientEnv(),
   };
   ensureVoicePipeSource(logger);
   appendOptionalFakeMediaDeviceArg(connectLaunch.args);
