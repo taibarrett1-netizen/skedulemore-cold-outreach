@@ -216,49 +216,17 @@ function voiceThreadLooksDelivered(before, after) {
   const childDelta = after.scrollerChildCount - before.scrollerChildCount;
   const scrollerTextDelta = after.scrollerTextLen - before.scrollerTextLen;
   const mainTextDelta = after.mainTextLen - before.mainTextLen;
-  const hintDelta = (after.mediaThreadHints || 0) - (before.mediaThreadHints || 0);
-
   /**
-   * Recording strip teardown can shrink measured scroller text without a new message — but **not** when
-   * play/voice hints in the thread increased (successful send often reflows + hintDelta>=1).
+   * Closing the voice recording strip / composer reflow often increases scrollHeight and mediaHints
+   * while **shrinking** measured scroller innerText — that is NOT a new message (logs still looked “sent ok”).
    */
   if (
     scrollerTextDelta < -80 &&
     childDelta <= 0 &&
     after.audio <= before.audio &&
-    scrollDelta > 15 &&
-    hintDelta <= 0
+    scrollDelta > 15
   ) {
     return false;
-  }
-
-  /**
-   * False positive: `mediaHints` ticks +1 and scroll grows while scroller + main text **shrink in sync**
-   * (IG re-layout). Not a reliable “new bubble” — logs showed “sent ok” with no message.
-   */
-  if (
-    hintDelta === 1 &&
-    scrollDelta >= 18 &&
-    scrollDelta < 600 &&
-    scrollerTextDelta < -18 &&
-    mainTextDelta < -18 &&
-    Math.abs(scrollerTextDelta - mainTextDelta) < 35
-  ) {
-    return false;
-  }
-
-  /**
-   * hint+scroll alone matched reflows — require measurable new content (or hint jump ≥2).
-   */
-  if (
-    hintDelta >= 1 &&
-    scrollDelta >= 25 &&
-    (childDelta >= 1 ||
-      scrollerTextDelta >= 5 ||
-      mainTextDelta >= 12 ||
-      hintDelta >= 2)
-  ) {
-    return true;
   }
 
   if (after.audio > before.audio) return true;
