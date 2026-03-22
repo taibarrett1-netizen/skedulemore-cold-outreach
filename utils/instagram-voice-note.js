@@ -216,18 +216,24 @@ function voiceThreadLooksDelivered(before, after) {
   const childDelta = after.scrollerChildCount - before.scrollerChildCount;
   const scrollerTextDelta = after.scrollerTextLen - before.scrollerTextLen;
   const mainTextDelta = after.mainTextLen - before.mainTextLen;
+  const hintDelta = (after.mediaThreadHints || 0) - (before.mediaThreadHints || 0);
+
   /**
-   * Closing the voice recording strip / composer reflow often increases scrollHeight and mediaHints
-   * while **shrinking** measured scroller innerText — that is NOT a new message (logs still looked “sent ok”).
+   * Recording strip teardown can shrink measured scroller text without a new message — but **not** when
+   * play/voice hints in the thread increased (successful send often reflows + hintDelta>=1).
    */
   if (
     scrollerTextDelta < -80 &&
     childDelta <= 0 &&
     after.audio <= before.audio &&
-    scrollDelta > 15
+    scrollDelta > 15 &&
+    hintDelta <= 0
   ) {
     return false;
   }
+
+  /** New voice row often bumps scroll + thread media hints even when innerText length drops (virtualization). */
+  if (hintDelta >= 1 && scrollDelta >= 25) return true;
 
   if (after.audio > before.audio) return true;
   if (after.listItems > before.listItems) return true;

@@ -1039,7 +1039,8 @@ function followUpReasonToError(reason, pageSnippet) {
     voice_note_failed: 'Voice note failed',
     voice_recording_ui_not_detected:
       'Voice recording UI did not appear after clicking the mic (no blue bar / 0:00 timer). Wrong control clicked or mic blocked; use VNC / HEADLESS_MODE=false to inspect',
-    voice_not_confirmed_in_thread: 'Voice send was not confirmed in the thread (DOM did not update). Try debug screenshots, VNC, or PUPPETEER_SLOW_MO_MS',
+    voice_not_confirmed_in_thread:
+      'Voice send was not confirmed in the thread (DOM did not update). Try VNC / HEADLESS_MODE=false, PUPPETEER_SLOW_MO_MS, or set VOICE_NOTE_STRICT_VERIFY=false if sends are succeeding but verification fails.',
     empty_message: 'Empty message',
   };
   let msg = map[reason] || reason || 'Send failed';

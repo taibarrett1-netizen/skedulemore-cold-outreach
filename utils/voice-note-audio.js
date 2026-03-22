@@ -28,14 +28,15 @@ function isFfmpegAvailable() {
 
 /**
  * Leading / trailing silence (seconds) so the fake-mic loop hits silence, not speech.
- * Defaults: short lead-in (~0.12s) so the message starts quicker; modest tail (~0.22s) before loop.
+ * Defaults: ~0.12s lead-in, ~0.08s tail (short tail = less dead air at end of the sent note).
  * Set `VOICE_FAKE_MIC_PAD_START_SEC` / `VOICE_FAKE_MIC_PAD_END_SEC` to override (use `0` to disable that side).
  */
 function getChromeFakeMicPadSec() {
   const start = parseFloat(process.env.VOICE_FAKE_MIC_PAD_START_SEC);
   const end = parseFloat(process.env.VOICE_FAKE_MIC_PAD_END_SEC);
   const defStart = 0.12;
-  const defEnd = 0.22;
+  /** Short tail — long pad + hold = audible silence before loop; tune VOICE_FAKE_MIC_PAD_END_SEC. */
+  const defEnd = 0.08;
   const padStart = Number.isFinite(start) && start >= 0 ? Math.min(start, 5) : defStart;
   const padEnd = Number.isFinite(end) && end >= 0 ? Math.min(end, 5) : defEnd;
   return { padStart, padEnd };
@@ -62,6 +63,16 @@ function getAudioDurationSec(audioPath) {
 }
 
 /**
+ * Resample to 48 kHz stereo s16 for Chrome’s fake mic. Uses wider SWR window for cleaner down/up-sampling.
+ * Advanced: set `VOICE_FAKE_MIC_ARESAMPLE_FILTER` to a full `aresample=…,aformat=…` chain (no brackets).
+ */
+function fakeMicInputResampleStereo() {
+  const custom = (process.env.VOICE_FAKE_MIC_ARESAMPLE_FILTER || '').trim();
+  if (custom) return custom;
+  return 'aresample=48000:filter_size=256:cutoff=0.973,aformat=sample_fmts=s16:channel_layouts=stereo';
+}
+
+/**
  * Convert audio to Chrome fake mic format and write to /tmp/current-voice-note.wav.
  * Chrome expects: 48kHz, stereo, s16.
  *
@@ -82,12 +93,8 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
     '-y',
     '-i',
     inputPath,
-    '-ar',
-    '48000',
-    '-ac',
-    '2',
-    '-sample_fmt',
-    's16',
+    '-filter:a',
+    fakeMicInputResampleStereo(),
     '-f',
     'wav',
     CHROME_FAKE_MIC_WAV,
@@ -98,8 +105,7 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
     result = spawnSync(bin, argsSimple, { encoding: 'utf8', timeout: 30000 });
   } else if (padStart <= 0 && padEnd > 0) {
     const fcEndOnly =
-      `[0:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo[main];` +
-      `[main]apad=pad_dur=${padEnd}[out]`;
+      `[0:a]${fakeMicInputResampleStereo()}[main];` + `[main]apad=pad_dur=${padEnd}[out]`;
     result = spawnSync(
       bin,
       [
@@ -129,7 +135,7 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
         : `[mid]aformat=sample_fmts=s16:channel_layouts=stereo[out]`;
     const fc =
       `[0:a]aformat=sample_fmts=s16:channel_layouts=stereo[pre];` +
-      `[1:a]aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo[main];` +
+      `[1:a]${fakeMicInputResampleStereo()}[main];` +
       `[pre][main]concat=n=2:v=0:a=1[mid];` +
       midToOut;
     const paddedArgs = [
@@ -208,6 +214,7 @@ function ensureChromeFakeMicPlaceholder(logger = null) {
 module.exports = {
   getAudioDurationSec,
   getChromeFakeMicPadSec,
+  fakeMicInputResampleStereo,
   isFfmpegAvailable,
   convertToChromeFakeMicWav,
   ensureChromeFakeMicPlaceholder,
