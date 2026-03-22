@@ -212,23 +212,27 @@ function voiceThreadLooksDelivered(before, after) {
   const childDelta = after.scrollerChildCount - before.scrollerChildCount;
   const scrollerTextDelta = after.scrollerTextLen - before.scrollerTextLen;
   const mainTextDelta = after.mainTextLen - before.mainTextLen;
-  const hintDelta = (after.mediaThreadHints || 0) - (before.mediaThreadHints || 0);
+  /**
+   * Closing the voice recording strip / composer reflow often increases scrollHeight and mediaHints
+   * while **shrinking** measured scroller innerText — that is NOT a new message (logs still looked “sent ok”).
+   */
+  if (
+    scrollerTextDelta < -80 &&
+    childDelta <= 0 &&
+    after.audio <= before.audio &&
+    scrollDelta > 15
+  ) {
+    return false;
+  }
 
   if (after.audio > before.audio) return true;
   if (after.listItems > before.listItems) return true;
   if (after.rows > before.rows) return true;
-  /** New bubble often grows scroll area or adds a child row. */
-  if (scrollDelta >= 25) return true;
-  if (scrollDelta >= 8 && after.scrollerScrollHeight > 0) return true;
   if (childDelta >= 1) return true;
-  /** New message text (e.g. duration label) inside the thread scroller. */
-  if (before.scrollerTextLen > 0 && scrollerTextDelta >= 8) return true;
-  if (before.scrollerScrollHeight > 0 && scrollerTextDelta >= 8) return true;
-  /** mediaHints alone caused false positives — pair with scroll/children/text. */
-  if (hintDelta >= 1 && (scrollDelta >= 10 || childDelta >= 1 || scrollerTextDelta >= 10)) return true;
-  /** Main pane text: require larger delta (timestamps/seen text move otherwise). */
+  /** New message text (e.g. duration label, “Seen”, transcription link) in the thread scroller. */
+  if (scrollerTextDelta >= 8) return true;
   if (mainTextDelta >= 45) return true;
-  /** Voice-only bubble may add almost no innerText; allow tiny growth if scroller started working. */
+  /** Voice-only bubble may add almost no innerText; allow tiny growth with scroll if text moved. */
   if (mainTextDelta >= 8 && after.scrollerScrollHeight > before.scrollerScrollHeight + 15) return true;
   return false;
 }
