@@ -2,9 +2,12 @@ const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const {
   getVoiceNotePipePath,
+  getVoiceAudioMode,
+  getPulseClientEnv,
   isPipeSourceReady,
   pausePipeSilenceFiller,
   resumePipeSilenceFiller,
+  VOICE_NOTE_SOURCE_NAME,
 } = require('./pulse-pipe-source');
 
 function ffmpegBin() {
@@ -48,93 +51,81 @@ function getAudioDurationSec(audioPath) {
 }
 
 /**
- * Start ffmpeg feeding the voice-note audio file into the pipe-source.
- *
- * CHANGED: No longer uses Pulse sink (-f pulse). Now writes raw s16le 48kHz stereo
- * to the named pipe that module-pipe-source reads. This matches the pipe-source
- * format (s16le rate=48000 channels=2). The second arg (pipePathOrSink) is kept
- * for API compatibility but ignored — we always use getVoiceNotePipePath().
+ * Start ffmpeg feeding the voice-note audio. Uses pipe-source (raw PCM → fifo) or
+ * null-sink (ffmpeg -f pulse → sink) depending on getVoiceAudioMode().
  */
 function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 90000) {
   if (!audioPath) throw new Error('voice_note_path_missing');
   if (!fs.existsSync(audioPath)) throw new Error('voice_note_file_not_found');
   if (!isPipeSourceReady()) {
     throw new Error(
-      'voice_pipe_source_not_ready: PulseAudio pipe-source setup failed (pactl not found or load-module failed). Voice notes require a VPS with PulseAudio. Install: sudo apt install pulseaudio.'
+      'voice_pipe_source_not_ready: PulseAudio setup failed. Voice notes require a VPS with PulseAudio. Install: sudo apt install pulseaudio.'
     );
   }
   const durationSec = getAudioDurationSec(audioPath);
-  const pipePath = getVoiceNotePipePath();
-
-  // Release silence writer so ffmpeg can open the fifo exclusively
-  pausePipeSilenceFiller();
-  spawnSync('sleep', ['0.05'], { encoding: 'utf8' });
-
-  const resumeIfNeeded = () => resumePipeSilenceFiller(logger);
-
-  // ffmpeg outputs raw s16le 48kHz stereo to stdout; we stream that into the pipe
-  const args = [
-    '-re',
-    '-stream_loop',
-    '0',
-    '-i',
-    audioPath,
-    '-vn',
-    '-ac',
-    '2',
-    '-ar',
-    '48000',
-    '-f',
-    's16le',
-    '-',
-  ];
+  const mode = getVoiceAudioMode();
+  const sinkName = _pipePathOrSink?.sink || VOICE_NOTE_SOURCE_NAME;
 
   const bin = ffmpegBin();
-  // Use fd not WriteStream: Node spawn rejects streams with fd:null; opening the pipe for write
-  // blocks until module-pipe-source (reader) connects — ensure ensureVoicePipeSource ran first.
-  let pipeFd;
-  try {
-    pipeFd = fs.openSync(pipePath, 'w');
-  } catch (e) {
-    resumeIfNeeded();
-    throw new Error(
-      `voice_note_pipe_open_failed: ${pipePath} — run on VPS with PulseAudio. pactl load-module module-pipe-source must succeed first.`
-    );
+  let child;
+
+  if (mode === 'nullsink') {
+    // ffmpeg writes directly to Pulse sink; Chromium captures from sink.monitor
+    const args = [
+      '-re', '-stream_loop', '0', '-i', audioPath,
+      '-vn', '-ac', '1', '-ar', '48000',
+      '-f', 'pulse', sinkName,
+    ];
+    child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], env: getPulseClientEnv() });
+  } else {
+    // pipe-source: ffmpeg → raw PCM → fifo
+    pausePipeSilenceFiller();
+    spawnSync('sleep', ['0.05'], { encoding: 'utf8' });
+    const resumeIfNeeded = () => resumePipeSilenceFiller(logger);
+    const pipePath = getVoiceNotePipePath();
+
+    let pipeFd;
+    try {
+      pipeFd = fs.openSync(pipePath, 'w');
+    } catch (e) {
+      resumeIfNeeded();
+      throw new Error(`voice_note_pipe_open_failed: ${pipePath}`);
+    }
+
+    const args = [
+      '-re', '-stream_loop', '0', '-i', audioPath,
+      '-vn', '-ac', '2', '-ar', '48000', '-f', 's16le', '-',
+    ];
+    child = spawn(bin, args, { stdio: ['ignore', pipeFd, 'pipe'] });
+
+    child.on('exit', () => {
+      try { fs.closeSync(pipeFd); } catch { /* ignore */ }
+      resumeIfNeeded();
+    });
+    child.on('error', () => { if (!child.killed) resumeIfNeeded(); });
   }
-  const child = spawn(bin, args, { stdio: ['ignore', pipeFd, 'pipe'] });
+
   let stderrBuf = '';
   if (child.stderr) {
     child.stderr.on('data', (d) => {
       if (stderrBuf.length < 2000) stderrBuf += d.toString();
     });
   }
-  const timeout = setTimeout(() => {
-    child.kill('SIGTERM');
-  }, timeoutMs);
+  const timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
   let exited = false;
+  child.on('exit', () => {
+    exited = true;
+    clearTimeout(timeout);
+  });
   child.on('error', (err) => {
-    if (!exited) resumeIfNeeded();
-    if (err && err.code === 'ENOENT') {
-      if (logger) {
-        logger.warn(
-          `ffmpeg not found (${bin}). Install on the VPS: sudo apt install ffmpeg. Or set FFMPEG_PATH to the full binary path.`
-        );
-      }
+    if (err && err.code === 'ENOENT' && logger) {
+      logger.warn(`ffmpeg not found (${bin}). Install: sudo apt install ffmpeg.`);
     } else if (logger) {
       logger.warn('ffmpeg spawn error: ' + (err && err.message ? err.message : String(err)));
     }
   });
-  child.on('exit', () => {
-    exited = true;
-    clearTimeout(timeout);
-    try {
-      fs.closeSync(pipeFd);
-    } catch {
-      /* ignore */
-    }
-    resumeIfNeeded();
-  });
-  if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) → pipe: ${audioPath}`);
+
+  if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) ${mode === 'nullsink' ? '→ pulse sink' : '→ pipe'}: ${audioPath}`);
   return {
     durationSec,
     stop: () => {
