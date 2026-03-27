@@ -10,6 +10,24 @@ const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 
 let _client = null;
 
+function noWorkDebugEnabled() {
+  return process.env.NO_WORK_DEBUG !== '0';
+}
+
+function logNoWorkDebug(message, details = null) {
+  if (!noWorkDebugEnabled()) return;
+  const prefix = '[no-work-debug] ';
+  if (details == null) {
+    console.log(prefix + message);
+    return;
+  }
+  try {
+    console.log(prefix + message + ' ' + JSON.stringify(details));
+  } catch {
+    console.log(prefix + message);
+  }
+}
+
 function getSupabase() {
   if (_client) return _client;
   const url = process.env.SUPABASE_URL;
@@ -509,10 +527,17 @@ async function getClientIdsWithPauseZero() {
  */
 async function getNextPendingWorkAnyClient() {
   const clientIds = await getClientIdsWithPauseZero();
-  if (clientIds.length === 0) return null;
+  if (clientIds.length === 0) {
+    logNoWorkDebug('No clients with pause=0.');
+    return null;
+  }
   for (const clientId of clientIds) {
     const work = await getNextPendingCampaignLead(clientId);
-    if (work) return { clientId, work };
+    if (work) {
+      logNoWorkDebug('Selected work for client.', { clientId, campaignId: work.campaignId, campaignLeadId: work.campaignLeadId, username: work.username });
+      return { clientId, work };
+    }
+    logNoWorkDebug('Client has no sendable work this iteration.', { clientId });
   }
   return null;
 }
@@ -1230,9 +1255,28 @@ async function getNextPendingCampaignLead(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
   const campaigns = await getActiveCampaigns(clientId);
+  const campaignDebug = [];
   for (const camp of campaigns) {
+    const dbg = {
+      campaignId: camp.id,
+      campaignName: camp.name || null,
+      inSchedule: true,
+      hasMessageText: true,
+      leadGroupCount: 0,
+      leadRowsCount: 0,
+      pendingCount: 0,
+      skippedMissingLeadRow: 0,
+      skippedAlreadySent: 0,
+      blockedBy: null,
+      reason: null,
+    };
     const campaignTz = camp.timezone ?? null;
-    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) {
+      dbg.inSchedule = false;
+      dbg.reason = 'outside_schedule';
+      campaignDebug.push(dbg);
+      continue;
+    }
     let messageText = null;
     let messageGroupMessageId = null;
     let voiceNotePath = null;
@@ -1253,21 +1297,36 @@ async function getNextPendingCampaignLead(clientId) {
     if (!voiceNotePath && camp.send_voice_note && camp.voice_note_storage_path) {
       voiceNotePath = camp.voice_note_storage_path;
     }
-    if (!messageText) continue;
+    if (!messageText) {
+      dbg.hasMessageText = false;
+      dbg.reason = 'no_message_text';
+      campaignDebug.push(dbg);
+      continue;
+    }
 
     const { data: leadGroupRows } = await sb
       .from('cold_dm_campaign_lead_groups')
       .select('lead_group_id')
       .eq('campaign_id', camp.id);
     const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
-    if (leadGroupIds.length === 0) continue;
+    dbg.leadGroupCount = leadGroupIds.length;
+    if (leadGroupIds.length === 0) {
+      dbg.reason = 'no_lead_groups';
+      campaignDebug.push(dbg);
+      continue;
+    }
 
     const { data: leadRows } = await sb
       .from('cold_dm_leads')
       .select('id, username')
       .eq('client_id', clientId)
       .in('lead_group_id', leadGroupIds);
-    if (!leadRows || leadRows.length === 0) continue;
+    dbg.leadRowsCount = leadRows?.length || 0;
+    if (!leadRows || leadRows.length === 0) {
+      dbg.reason = 'no_leads_in_mapped_groups';
+      campaignDebug.push(dbg);
+      continue;
+    }
 
     for (const lead of leadRows) {
       const { data: existing } = await sb
@@ -1296,6 +1355,7 @@ async function getNextPendingCampaignLead(clientId) {
         .limit(1)
         .maybeSingle();
       if (error || !pendingRow?.lead_id) break;
+      dbg.pendingCount += 1;
       const { data: leadData } = await sb
         .from('cold_dm_leads')
         .select('username, first_name, last_name, display_name')
@@ -1303,11 +1363,13 @@ async function getNextPendingCampaignLead(clientId) {
         .eq('client_id', clientId)
         .maybeSingle();
       if (!leadData?.username) {
+        dbg.skippedMissingLeadRow += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'failed').catch(() => {});
         continue;
       }
       const sent = await alreadySent(clientId, leadData.username);
       if (sent) {
+        dbg.skippedAlreadySent += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'sent').catch(() => {});
         continue;
       }
@@ -1315,12 +1377,32 @@ async function getNextPendingCampaignLead(clientId) {
       leadRow = leadData;
       break;
     }
-    if (!clRow || !leadRow) continue;
+    if (!clRow || !leadRow) {
+      dbg.reason = 'no_pending_row_survived_filters';
+      campaignDebug.push(dbg);
+      continue;
+    }
 
     const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
-    if (camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit) continue;
-    if (camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit) continue;
+    if (camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit) {
+      dbg.blockedBy = 'daily_limit';
+      dbg.reason = 'daily_limit_reached';
+      campaignDebug.push(dbg);
+      continue;
+    }
+    if (camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit) {
+      dbg.blockedBy = 'hourly_limit';
+      dbg.reason = 'hourly_limit_reached';
+      campaignDebug.push(dbg);
+      continue;
+    }
 
+    logNoWorkDebug('Campaign selected for send.', {
+      clientId,
+      campaignId: camp.id,
+      campaignLeadId: clRow.id,
+      username: normalizeUsername(leadRow.username),
+    });
     return {
       campaignLeadId: clRow.id,
       campaignId: camp.id,
@@ -1340,6 +1422,7 @@ async function getNextPendingCampaignLead(clientId) {
       voiceNoteMode,
     };
   }
+  logNoWorkDebug('No sendable campaign lead found.', { clientId, campaignsChecked: campaignDebug });
   return null;
 }
 
