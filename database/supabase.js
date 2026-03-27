@@ -11,7 +11,7 @@ const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 let _client = null;
 
 function noWorkDebugEnabled() {
-  return process.env.NO_WORK_DEBUG !== '0';
+  return process.env.NO_WORK_DEBUG === '1' || process.env.NO_WORK_DEBUG === 'true';
 }
 
 function logNoWorkDebug(message, details = null) {
