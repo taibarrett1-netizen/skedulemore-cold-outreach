@@ -1390,18 +1390,35 @@ async function reactivateCampaignsWithPendingLeads(clientId) {
   let reactivated = 0;
   for (const camp of campaigns) {
     if (camp.status === 'active') continue;
-    const { count } = await sb
+    const { count: pendingCount } = await sb
       .from('cold_dm_campaign_leads')
       .select('*', { count: 'exact', head: true })
       .eq('campaign_id', camp.id)
       .eq('status', 'pending');
-    if ((count ?? 0) > 0) {
-      const { error } = await sb
-        .from('cold_dm_campaigns')
-        .update({ status: 'active', updated_at: new Date().toISOString() })
-        .eq('id', camp.id);
-      if (!error) reactivated += 1;
+    let shouldActivate = (pendingCount ?? 0) > 0;
+    if (!shouldActivate) {
+      // Fallback: some flows show leads as pending in UI before campaign_leads rows are materialized.
+      // If campaign has mapped lead groups with leads, activate so worker can materialize pending rows.
+      const { data: leadGroupRows } = await sb
+        .from('cold_dm_campaign_lead_groups')
+        .select('lead_group_id')
+        .eq('campaign_id', camp.id);
+      const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+      if (leadGroupIds.length > 0) {
+        const { count: mappedLeadCount } = await sb
+          .from('cold_dm_leads')
+          .select('*', { count: 'exact', head: true })
+          .eq('client_id', clientId)
+          .in('lead_group_id', leadGroupIds);
+        shouldActivate = (mappedLeadCount ?? 0) > 0;
+      }
     }
+    if (!shouldActivate) continue;
+    const { error } = await sb
+      .from('cold_dm_campaigns')
+      .update({ status: 'active', updated_at: new Date().toISOString() })
+      .eq('id', camp.id);
+    if (!error) reactivated += 1;
   }
   return reactivated;
 }

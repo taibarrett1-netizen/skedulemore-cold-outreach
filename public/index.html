@@ -221,8 +221,13 @@
         document.getElementById('leads-remaining').textContent = d.leadsRemaining;
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
-        if (d.processRunning) { dot.className = 'status-dot running'; text.textContent = 'Running'; }
-        else { dot.className = 'status-dot paused'; text.textContent = 'Stopped'; }
+        if (d.processRunning) {
+          dot.className = 'status-dot running';
+          text.textContent = d.statusMessage || 'Running';
+        } else {
+          dot.className = 'status-dot paused';
+          text.textContent = d.statusMessage || 'Stopped';
+        }
         updateControlButton(d.processRunning);
       }).catch((e) => { console.error('[Dashboard] Status fetch failed', e); document.getElementById('status-text').textContent = 'Error loading status'; });
     }

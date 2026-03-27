@@ -9,6 +9,7 @@ const {
   isSupabaseConfigured,
   getClientId,
   setClientId,
+  getControl: getControlSupabase,
   setControl: setControlSupabase,
   getClientStatusMessage: getClientStatusMessageSupabase,
   getDailyStats: getDailyStatsSupabase,
@@ -121,12 +122,15 @@ app.get('/api/status', (req, res) => {
   (async () => {
     try {
       if (useSupabase) {
-        const [processRunning, stats, statusMessage, leadsCounts] = await Promise.all([
+        const [processRunningPm2, stats, statusMessage, leadsCounts, pauseFlag] = await Promise.all([
           processRunningPromise,
           getDailyStatsSupabase(clientId),
           getClientStatusMessageSupabase(clientId),
           getLeadsTotalAndRemaining(clientId),
+          getControlSupabase(clientId),
         ]);
+        const paused = pauseFlag === '1' || pauseFlag === 1;
+        const processRunning = processRunningPm2 && !paused;
         send(200, {
           processRunning,
           statusMessage: statusMessage ?? (processRunning ? null : 'Stopped'),
