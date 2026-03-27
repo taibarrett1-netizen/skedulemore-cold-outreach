@@ -27,6 +27,7 @@ const {
   pickScraperSessionForJob,
   savePlatformScraperSession,
   addCampaignLeadsFromGroups,
+  reactivateCampaignsWithPendingLeads,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -128,7 +129,7 @@ app.get('/api/status', (req, res) => {
         ]);
         send(200, {
           processRunning,
-          statusMessage: processRunning ? (statusMessage ?? null) : 'Stopped',
+          statusMessage: statusMessage ?? (processRunning ? null : 'Stopped'),
           todaySent: stats.total_sent,
           todayFailed: stats.total_failed,
           leadsTotal: leadsCounts.total,
@@ -574,10 +575,18 @@ app.post('/api/instagram/connect/2fa', async (req, res) => {
 
 // --- API: bot control (PM2 start/stop) ---
 // Return 200 immediately; pm2 start/stop runs in background. Sender loop does the actual wait (schedule, limits).
-app.post('/api/control/start', (req, res) => {
+app.post('/api/control/start', async (req, res) => {
   const clientId = req.body?.clientId;
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
+    try {
+      const reactivated = await reactivateCampaignsWithPendingLeads(clientId);
+      if (reactivated > 0) {
+        console.log(`[API] Reactivated ${reactivated} campaign(s) with pending leads for clientId=${clientId}`);
+      }
+    } catch (e) {
+      console.error('[API] reactivateCampaignsWithPendingLeads', e);
+    }
     setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });

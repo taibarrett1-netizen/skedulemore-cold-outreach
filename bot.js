@@ -1545,6 +1545,8 @@ async function runBotMultiTenant() {
           } else {
             await sb.setClientStatusMessage(cid, 'No work. Start again from the dashboard when you have a campaign to run.').catch(() => {});
           }
+          // Keep control flag aligned with worker state so dashboards don't show "running" after an auto-exit.
+          await sb.setControl(cid, 1).catch(() => {});
         }
         logger.log('No work. Exiting. Start again from the dashboard when you have a campaign to run.');
         await browser.close().catch(() => {});

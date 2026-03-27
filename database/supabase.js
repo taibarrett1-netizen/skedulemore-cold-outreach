@@ -583,7 +583,8 @@ async function getClientNoWorkResumeAt(clientId) {
           .in('campaign_id', campaignIds)
           .eq('status', 'pending')
       : { count: 0 };
-  if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending', resumeAt: null };
+  const pendingTotal = pendingCount ?? 0;
+  if (pendingTotal === 0) return { message: null, reason: 'no_pending', resumeAt: null };
 
   let earliestScheduleResume = null;
   let firstWindow = null;
@@ -651,7 +652,17 @@ async function getClientNoWorkResumeAt(clientId) {
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
   }
-  return { message: null, reason: 'no_pending', resumeAt: null };
+  const unsendableHint = await getNoWorkHint(clientId).catch(() => '');
+  if (unsendableHint) {
+    return { message: unsendableHint, reason: 'no_sendable_work', resumeAt: null };
+  }
+  return {
+    message:
+      `Pending leads exist (${pendingTotal}) but none are currently sendable. ` +
+      'Check campaign status=active, lead groups assigned, message group/template configured, and per-campaign limits/schedule.',
+    reason: 'no_sendable_work',
+    resumeAt: null,
+  };
 }
 
 async function getRecentSent(clientId, limit = 50) {
@@ -1363,6 +1374,38 @@ async function addCampaignLeadsFromGroups(clientId, campaignId) {
   return added;
 }
 
+/**
+ * On Start, reactivate campaigns that still have pending leads but are not active.
+ * Returns number of campaigns switched to status='active'.
+ */
+async function reactivateCampaignsWithPendingLeads(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  const { data: campaigns } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, status')
+    .eq('client_id', clientId);
+  if (!campaigns || campaigns.length === 0) return 0;
+
+  let reactivated = 0;
+  for (const camp of campaigns) {
+    if (camp.status === 'active') continue;
+    const { count } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if ((count ?? 0) > 0) {
+      const { error } = await sb
+        .from('cold_dm_campaigns')
+        .update({ status: 'active', updated_at: new Date().toISOString() })
+        .eq('id', camp.id);
+      if (!error) reactivated += 1;
+    }
+  }
+  return reactivated;
+}
+
 async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = null) {
   const sb = getSupabase();
   if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
@@ -1449,4 +1492,5 @@ module.exports = {
   getNoWorkHint,
   getFirstNameBlocklist,
   addCampaignLeadsFromGroups,
+  reactivateCampaignsWithPendingLeads,
 };
