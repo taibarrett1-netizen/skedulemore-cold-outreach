@@ -572,6 +572,36 @@ async function getClientNoWorkResumeAt(clientId) {
   if (!sb || !clientId) return { message: null, reason: 'no_pending', resumeAt: null };
 
   const settings = await getSettings(clientId);
+  const { data: allCampaigns } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name, status')
+    .eq('client_id', clientId);
+  if (!allCampaigns || allCampaigns.length === 0) {
+    return { message: 'No campaigns.', reason: 'no_campaigns', resumeAt: null };
+  }
+  const pendingByCampaign = await Promise.all(
+    allCampaigns.map(async (c) => {
+      const { count } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', c.id)
+        .eq('status', 'pending');
+      return { id: c.id, name: c.name, status: c.status, pending: count ?? 0 };
+    })
+  );
+  const pendingAnyCampaign = pendingByCampaign.filter((c) => c.pending > 0);
+  if (pendingAnyCampaign.length > 0) {
+    const inactiveWithPending = pendingAnyCampaign.filter((c) => c.status !== 'active');
+    const activeWithPending = pendingAnyCampaign.filter((c) => c.status === 'active');
+    if (inactiveWithPending.length > 0 && activeWithPending.length === 0) {
+      const names = inactiveWithPending.map((c) => `"${c.name}" (${c.status})`).join(', ');
+      return {
+        message: `Campaign(s) have pending leads but status is not active: ${names}. Set campaign to Active in the dashboard.`,
+        reason: 'inactive_campaign_with_pending',
+        resumeAt: null,
+      };
+    }
+  }
   const campaigns = await getActiveCampaigns(clientId);
   const campaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
 
@@ -1123,8 +1153,6 @@ async function getNoWorkHint(clientId) {
     .select('id, name, status')
     .eq('client_id', clientId);
   if (!campaigns?.length) return 'No campaigns.';
-  const active = campaigns.filter((c) => c.status === 'active');
-  if (active.length > 0) return '';
   const withPending = await Promise.all(
     campaigns.map(async (c) => {
       const { count } = await sb
@@ -1135,6 +1163,8 @@ async function getNoWorkHint(clientId) {
       return { name: c.name, status: c.status, pending: count ?? 0 };
     })
   );
+  const activeWithPending = withPending.filter((c) => c.status === 'active' && c.pending > 0);
+  if (activeWithPending.length > 0) return '';
   const stoppedWithPending = withPending.filter((c) => c.pending > 0 && c.status !== 'active');
   if (stoppedWithPending.length > 0) {
     const names = stoppedWithPending.map((c) => `"${c.name}" (${c.status})`).join(', ');
@@ -1378,13 +1408,15 @@ async function addCampaignLeadsFromGroups(clientId, campaignId) {
  * On Start, reactivate campaigns that still have pending leads but are not active.
  * Returns number of campaigns switched to status='active'.
  */
-async function reactivateCampaignsWithPendingLeads(clientId) {
+async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return 0;
-  const { data: campaigns } = await sb
+  let q = sb
     .from('cold_dm_campaigns')
     .select('id, status')
     .eq('client_id', clientId);
+  if (campaignId) q = q.eq('id', campaignId);
+  const { data: campaigns } = await q;
   if (!campaigns || campaigns.length === 0) return 0;
 
   let reactivated = 0;
@@ -1405,12 +1437,23 @@ async function reactivateCampaignsWithPendingLeads(clientId) {
         .eq('campaign_id', camp.id);
       const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
       if (leadGroupIds.length > 0) {
-        const { count: mappedLeadCount } = await sb
+        const { data: mappedLeads } = await sb
           .from('cold_dm_leads')
-          .select('*', { count: 'exact', head: true })
+          .select('username')
           .eq('client_id', clientId)
           .in('lead_group_id', leadGroupIds);
-        shouldActivate = (mappedLeadCount ?? 0) > 0;
+        const usernames = (mappedLeads || [])
+          .map((r) => normalizeUsername(r.username || '').toLowerCase())
+          .filter(Boolean);
+        if (usernames.length > 0) {
+          const { data: sentRows } = await sb
+            .from('cold_dm_sent_messages')
+            .select('username')
+            .eq('client_id', clientId)
+            .in('username', usernames);
+          const sentSet = new Set((sentRows || []).map((r) => normalizeUsername(r.username || '').toLowerCase()));
+          shouldActivate = usernames.some((u) => !sentSet.has(u));
+        }
       }
     }
     if (!shouldActivate) continue;
