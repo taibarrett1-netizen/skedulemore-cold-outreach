@@ -4,14 +4,21 @@
  * No PULSE_SOURCE, null-sink, pipe-source, or pactl needed.
  */
 
-const CHROME_FAKE_MIC_WAV = '/tmp/current-voice-note.wav';
+const DEFAULT_CHROME_FAKE_MIC_WAV = '/tmp/current-voice-note.wav';
+
+function buildChromeFakeMicPath(suffix = '') {
+  const clean = String(suffix || '')
+    .replace(/[^a-z0-9_-]+/gi, '_')
+    .slice(0, 80);
+  return clean ? `/tmp/current-voice-note-${clean}.wav` : DEFAULT_CHROME_FAKE_MIC_WAV;
+}
 
 /** Add the three Chrome flags for fake mic. Call before every puppeteer.launch. */
-function appendChromeFakeMicArgs(args) {
+function appendChromeFakeMicArgs(args, fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
   if (!Array.isArray(args)) return;
   const flags = [
     '--use-fake-device-for-media-stream',
-    `--use-file-for-fake-audio-capture=${CHROME_FAKE_MIC_WAV}`,
+    `--use-file-for-fake-audio-capture=${fakeMicPath}`,
     '--use-fake-ui-for-media-stream',
   ];
   for (const f of flags) {
@@ -22,6 +29,7 @@ function appendChromeFakeMicArgs(args) {
 }
 
 module.exports = {
-  CHROME_FAKE_MIC_WAV,
+  DEFAULT_CHROME_FAKE_MIC_WAV,
+  buildChromeFakeMicPath,
   appendChromeFakeMicArgs,
 };

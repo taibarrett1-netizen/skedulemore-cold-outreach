@@ -401,33 +401,45 @@ async function logSentMessage(clientId, username, message, status = 'success', c
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
 
-  const { data: existing } = await sb
-    .from('cold_dm_daily_stats')
-    .select('total_sent, total_failed')
-    .eq('client_id', clientId)
-    .eq('date', date)
-    .maybeSingle();
-
-  if (existing) {
-    const { error: updateErr } = await sb
+  // Optimistic CAS retry to avoid lost updates under concurrent writes.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { data: existing, error: getErr } = await sb
       .from('cold_dm_daily_stats')
-      .update(
-        status === 'success'
-          ? { total_sent: existing.total_sent + 1 }
-          : { total_failed: existing.total_failed + 1 }
-      )
+      .select('total_sent, total_failed')
       .eq('client_id', clientId)
-      .eq('date', date);
+      .eq('date', date)
+      .maybeSingle();
+    if (getErr) throw getErr;
+
+    if (!existing) {
+      const { error: insertStatErr } = await sb.from('cold_dm_daily_stats').upsert(
+        {
+          client_id: clientId,
+          date,
+          total_sent: status === 'success' ? 1 : 0,
+          total_failed: status === 'failed' ? 1 : 0,
+        },
+        { onConflict: 'client_id,date', ignoreDuplicates: true }
+      );
+      if (insertStatErr) throw insertStatErr;
+      continue;
+    }
+
+    const nextTotalSent = status === 'success' ? existing.total_sent + 1 : existing.total_sent;
+    const nextTotalFailed = status === 'failed' ? existing.total_failed + 1 : existing.total_failed;
+    const { data: updated, error: updateErr } = await sb
+      .from('cold_dm_daily_stats')
+      .update({ total_sent: nextTotalSent, total_failed: nextTotalFailed })
+      .eq('client_id', clientId)
+      .eq('date', date)
+      .eq('total_sent', existing.total_sent)
+      .eq('total_failed', existing.total_failed)
+      .select('client_id')
+      .limit(1);
     if (updateErr) throw updateErr;
-  } else {
-    const { error: insertStatErr } = await sb.from('cold_dm_daily_stats').insert({
-      client_id: clientId,
-      date,
-      total_sent: status === 'success' ? 1 : 0,
-      total_failed: status === 'failed' ? 1 : 0,
-    });
-    if (insertStatErr) throw insertStatErr;
+    if (updated && updated.length > 0) return;
   }
+  throw new Error('Failed to atomically update daily stats after retries');
 }
 
 async function getDailyStats(clientId) {
@@ -901,25 +913,39 @@ async function recordScraperActions(platformSessionId, count) {
   const sb = getSupabase();
   if (!sb) return;
   const today = new Date().toISOString().slice(0, 10);
-  const { data: existing } = await sb
-    .from('cold_dm_scraper_daily_usage')
-    .select('id, actions_count')
-    .eq('platform_scraper_session_id', platformSessionId)
-    .eq('usage_date', today)
-    .maybeSingle();
-  const newCount = (existing?.actions_count || 0) + count;
-  if (existing) {
-    await sb
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { data: existing, error: getErr } = await sb
       .from('cold_dm_scraper_daily_usage')
-      .update({ actions_count: newCount, updated_at: new Date().toISOString() })
-      .eq('id', existing.id);
-  } else {
-    await sb.from('cold_dm_scraper_daily_usage').insert({
-      platform_scraper_session_id: platformSessionId,
-      usage_date: today,
-      actions_count: newCount,
-    });
+      .select('id, actions_count')
+      .eq('platform_scraper_session_id', platformSessionId)
+      .eq('usage_date', today)
+      .maybeSingle();
+    if (getErr) throw getErr;
+
+    if (!existing) {
+      const { error: insertErr } = await sb.from('cold_dm_scraper_daily_usage').upsert(
+        {
+          platform_scraper_session_id: platformSessionId,
+          usage_date: today,
+          actions_count: count,
+        },
+        { onConflict: 'platform_scraper_session_id,usage_date', ignoreDuplicates: true }
+      );
+      if (insertErr) throw insertErr;
+      continue;
+    }
+
+    const { data: updated, error: updateErr } = await sb
+      .from('cold_dm_scraper_daily_usage')
+      .update({ actions_count: existing.actions_count + count, updated_at: new Date().toISOString() })
+      .eq('id', existing.id)
+      .eq('actions_count', existing.actions_count)
+      .select('id')
+      .limit(1);
+    if (updateErr) throw updateErr;
+    if (updated && updated.length > 0) return;
   }
+  throw new Error('Failed to atomically update scraper daily usage after retries');
 }
 
 async function savePlatformScraperSession(sessionData, instagramUsername, dailyActionsLimit = 500) {

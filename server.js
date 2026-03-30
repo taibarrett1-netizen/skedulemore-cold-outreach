@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
+const { rateLimit } = require('express-rate-limit');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const {
   isSupabaseConfigured,
@@ -56,22 +57,100 @@ app.use(express.static(path.join(__dirname, 'public')));
 if (!fs.existsSync(voiceNotesDir)) fs.mkdirSync(voiceNotesDir, { recursive: true });
 app.use('/voice-notes', express.static(voiceNotesDir));
 
-// Optional API key for external clients (e.g. Lovable). Set COLD_DM_API_KEY in .env to enable.
-const API_KEY = process.env.COLD_DM_API_KEY;
-if (API_KEY) {
-  app.use('/api', (req, res, next) => {
-    const key = req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.headers['x-api-key'];
-    if (key !== API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    next();
-  });
+const API_KEY = (process.env.COLD_DM_API_KEY || '').trim();
+const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
+  .split(',')
+  .map((x) => x.trim())
+  .filter(Boolean)
+  .reduce((acc, pair) => {
+    const idx = pair.indexOf(':');
+    if (idx <= 0 || idx === pair.length - 1) return acc;
+    const key = pair.slice(0, idx).trim();
+    const clientId = pair.slice(idx + 1).trim();
+    if (key && clientId) acc[key] = clientId;
+    return acc;
+  }, {});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Math.max(10, parseInt(process.env.API_RATE_LIMIT_PER_MIN || '120', 10) || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api', apiLimiter);
+
+function getPresentedApiKey(req) {
+  const auth = req.headers.authorization;
+  const bearer = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+  const xApiKey = (req.headers['x-api-key'] || '').toString().trim();
+  return bearer || xApiKey || '';
 }
+
+function resolveRequestedClientId(req) {
+  const bodyClientId = req.body?.clientId;
+  const queryClientId = req.query?.clientId;
+  return (bodyClientId || queryClientId || '').toString().trim();
+}
+
+function requireScopedClientId(req, res) {
+  const clientId = resolveRequestedClientId(req);
+  if (!clientId) {
+    res.status(400).json({ ok: false, error: 'clientId is required' });
+    return null;
+  }
+  if (req.authClientId && req.authClientId !== clientId) {
+    res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+    return null;
+  }
+  return clientId;
+}
+
+app.use('/api', (req, res, next) => {
+  if (req.path === '/health') return next();
+  const key = getPresentedApiKey(req);
+  if (!key) {
+    return res.status(401).json({ error: 'Unauthorized: missing API key' });
+  }
+  if (!API_KEY && Object.keys(API_KEY_CLIENT_MAP).length === 0) {
+    return res.status(503).json({ error: 'API key auth is required but not configured on the server' });
+  }
+  if (Object.prototype.hasOwnProperty.call(API_KEY_CLIENT_MAP, key)) {
+    req.authClientId = API_KEY_CLIENT_MAP[key];
+    return next();
+  }
+  if (API_KEY && key === API_KEY) {
+    return next();
+  }
+  return res.status(401).json({ error: 'Unauthorized' });
+});
 
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
 const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 * 1024 } });
 
 const BOT_PM2_NAME = 'ig-dm-bot';
+const MAX_CONCURRENT_FOLLOW_UPS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_FOLLOW_UPS || '3', 10) || 3);
+const MAX_CONCURRENT_SCRAPERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SCRAPERS || '2', 10) || 2);
+let activeFollowUpRequests = 0;
+let activeScraperJobs = 0;
+
+function tryAcquire(kind) {
+  if (kind === 'followUp') {
+    if (activeFollowUpRequests >= MAX_CONCURRENT_FOLLOW_UPS) return false;
+    activeFollowUpRequests += 1;
+    return true;
+  }
+  if (kind === 'scraper') {
+    if (activeScraperJobs >= MAX_CONCURRENT_SCRAPERS) return false;
+    activeScraperJobs += 1;
+    return true;
+  }
+  return false;
+}
+
+function release(kind) {
+  if (kind === 'followUp' && activeFollowUpRequests > 0) activeFollowUpRequests -= 1;
+  if (kind === 'scraper' && activeScraperJobs > 0) activeScraperJobs -= 1;
+}
 
 function getBotProcessRunning(cb) {
   exec('pm2 jlist', { maxBuffer: 1024 * 1024 }, (err, stdout) => {
@@ -96,7 +175,10 @@ app.get('/api/health', (req, res) => {
 // --- API: status & stats ---
 // Returns immediately using only fast queries and stored status (set by the sender loop). No schedule recomputation.
 app.get('/api/status', (req, res) => {
-  const clientId = req.query.clientId;
+  const clientId = resolveRequestedClientId(req);
+  if (req.authClientId && clientId && req.authClientId !== clientId) {
+    return res.status(403).json({ error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   const useSupabase = isSupabaseConfigured() && clientId;
   let responded = false;
   const send = (status, body) => {
@@ -173,11 +255,27 @@ app.get('/api/status', (req, res) => {
 });
 
 app.get('/api/stats', (req, res) => {
+  const clientId = requireScopedClientId(req, res);
+  if (!clientId) return;
+  if (isSupabaseConfigured()) {
+    getDailyStatsSupabase(clientId)
+      .then((stats) => res.json(stats))
+      .catch((e) => res.status(500).json({ error: e.message }));
+    return;
+  }
   res.json(getDailyStats());
 });
 
 app.get('/api/sent', (req, res) => {
+  const clientId = requireScopedClientId(req, res);
+  if (!clientId) return;
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+  if (isSupabaseConfigured()) {
+    getRecentSentSupabase(clientId, limit)
+      .then((rows) => res.json(rows))
+      .catch((e) => res.status(500).json({ error: e.message }));
+    return;
+  }
   res.json(getRecentSent(limit));
 });
 
@@ -318,12 +416,20 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
  * Voice: `audioUrl` = HTTPS URL the worker GETs; optional `caption` = text in-thread before voice. Correlation: X-Correlation-ID / X-Request-ID / body correlationId | requestId.
  */
 app.post('/api/follow-up/send', async (req, res) => {
+  if (!tryAcquire('followUp')) {
+    return res.status(429).json({ ok: false, error: 'Too many concurrent follow-up sends. Try again shortly.' });
+  }
   if (!isSupabaseConfigured()) {
     logger.warn('[API] follow-up/send 503 Supabase not configured');
+    release('followUp');
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   const body = req.body || {};
   const cid = (body.clientId || '').trim();
+  if (req.authClientId && cid !== req.authClientId) {
+    release('followUp');
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   const sid = (body.instagramSessionId || '').trim();
   const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
   const correlationId = (
@@ -374,6 +480,8 @@ app.post('/api/follow-up/send', async (req, res) => {
   } catch (e) {
     logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
+  } finally {
+    release('followUp');
   }
 });
 
@@ -388,6 +496,9 @@ app.post('/api/debug/follow-up/browser', (req, res) => {
   }
   const body = req.body || {};
   const cid = (body.clientId || '').trim();
+  if (req.authClientId && cid && cid !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   const sid = (body.instagramSessionId || '').trim();
   if (!cid || !sid) {
     return res.status(400).json({ ok: false, error: 'clientId and instagramSessionId are required' });
@@ -515,6 +626,9 @@ function cleanupExpiredScraper2FA() {
 // If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
 app.post('/api/instagram/connect', async (req, res) => {
   const { username, password, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
@@ -554,12 +668,18 @@ app.post('/api/instagram/connect', async (req, res) => {
 
 app.post('/api/instagram/connect/2fa', async (req, res) => {
   const { pending2FAId, twoFactorCode, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!pending2FAId || !twoFactorCode || !clientId) {
     return res.status(400).json({ ok: false, error: 'pending2FAId, twoFactorCode, and clientId are required' });
   }
   const pending = pending2FAMap.get(pending2FAId);
   if (!pending) {
     return res.status(400).json({ ok: false, error: 'Session expired. Start Connect again and enter the new code when the popup appears.' });
+  }
+  if (String(pending.clientId) !== String(clientId)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: pending 2FA session does not belong to this clientId' });
   }
   if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
     pending2FAMap.delete(pending2FAId);
@@ -583,6 +703,9 @@ app.post('/api/instagram/connect/2fa', async (req, res) => {
 // Return 200 immediately; pm2 start/stop runs in background. Sender loop does the actual wait (schedule, limits).
 app.post('/api/control/start', async (req, res) => {
   const clientId = req.body?.clientId;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   const campaignId = req.body?.campaignId || null;
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
@@ -625,6 +748,9 @@ app.post('/api/control/start', async (req, res) => {
 
 app.post('/api/reset-failed', async (req, res) => {
   const clientId = req.body?.clientId;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   try {
     if (isSupabaseConfigured() && clientId) {
       const cleared = await clearFailedAttemptsSupabase(clientId);
@@ -643,6 +769,9 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   const { campaignId, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!campaignId || !clientId) {
     return res.status(400).json({ ok: false, error: 'campaignId and clientId are required' });
   }
@@ -658,6 +787,9 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
 // --- Scraper API (same login + 2FA flow as Instagram connect) ---
 app.post('/api/scraper/connect', async (req, res) => {
   const { username, password, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
@@ -696,12 +828,18 @@ app.post('/api/scraper/connect', async (req, res) => {
 
 app.post('/api/scraper/connect/2fa', async (req, res) => {
   const { pending2FAId, twoFactorCode, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!pending2FAId || !twoFactorCode || !clientId) {
     return res.status(400).json({ ok: false, error: 'pending2FAId, twoFactorCode, and clientId are required' });
   }
   const pending = pendingScraper2FAMap.get(pending2FAId);
   if (!pending) {
     return res.status(400).json({ ok: false, error: 'Session expired. Start Scraper Connect again and enter the new code when the popup appears.' });
+  }
+  if (String(pending.clientId) !== String(clientId)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: pending 2FA session does not belong to this clientId' });
   }
   if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
     pendingScraper2FAMap.delete(pending2FAId);
@@ -722,6 +860,9 @@ app.post('/api/scraper/connect/2fa', async (req, res) => {
 
 app.get('/api/scraper/status', async (req, res) => {
   const clientId = req.query.clientId || req.body?.clientId;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!clientId) {
     return res.status(400).json({ error: 'clientId is required' });
   }
@@ -753,6 +894,9 @@ app.get('/api/scraper/status', async (req, res) => {
 
 app.post('/api/scraper/status', async (req, res) => {
   const clientId = req.body?.clientId || req.query.clientId;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!clientId) {
     return res.status(400).json({ error: 'clientId is required' });
   }
@@ -784,6 +928,9 @@ app.post('/api/scraper/status', async (req, res) => {
 
 app.post('/api/scraper/start', async (req, res) => {
   const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   const scrapeType = scrape_type === 'comments' ? 'comments' : 'followers';
 
   if (!clientId) {
@@ -801,6 +948,9 @@ app.post('/api/scraper/start', async (req, res) => {
     }
   }
   try {
+    if (!tryAcquire('scraper')) {
+      return res.status(429).json({ ok: false, error: 'Too many concurrent scraper jobs. Try again shortly.' });
+    }
     const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
 
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
@@ -824,18 +974,19 @@ app.post('/api/scraper/start', async (req, res) => {
         leadGroupId: lead_group_id || null,
       }).catch((err) => {
         console.error('[API] runFollowerScrape error', err);
-      });
+      }).finally(() => release('scraper'));
     } else {
       runCommentScrape(String(clientId), String(jobId), post_urls || [], {
         maxLeads: effectiveMaxLeads,
         leadGroupId: lead_group_id || null,
       }).catch((err) => {
         console.error('[API] runCommentScrape error', err);
-      });
+      }).finally(() => release('scraper'));
     }
 
     res.json({ ok: true, jobId, mode: 'puppeteer_legacy' });
   } catch (e) {
+    release('scraper');
     console.error('[API] Scraper start error', e);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -843,6 +994,9 @@ app.post('/api/scraper/start', async (req, res) => {
 
 app.post('/api/scraper/stop', async (req, res) => {
   const { clientId, jobId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
@@ -883,6 +1037,9 @@ app.post('/api/scraper/connect-platform', async (req, res) => {
 
 app.post('/api/control/stop', (req, res) => {
   const clientId = req.body?.clientId;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));

@@ -17,7 +17,11 @@ const {
 } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { isFfmpegAvailable, convertToChromeFakeMicWav, ensureChromeFakeMicPlaceholder } = require('./utils/voice-note-audio');
-const { appendChromeFakeMicArgs, CHROME_FAKE_MIC_WAV } = require('./utils/chrome-fake-mic');
+const {
+  appendChromeFakeMicArgs,
+  DEFAULT_CHROME_FAKE_MIC_WAV,
+  buildChromeFakeMicPath,
+} = require('./utils/chrome-fake-mic');
 const {
   sendVoiceNoteInThread,
   prepareVoiceNoteUi,
@@ -112,7 +116,7 @@ async function resolveVoiceNotePath(rawPath) {
   const p = (rawPath || '').trim();
   if (!p) return { localPath: '', cleanup: async () => {} };
   if (!/^https?:\/\//i.test(p)) return { localPath: p, cleanup: async () => {} };
-  const res = await fetch(p);
+  const res = await fetch(p, { signal: AbortSignal.timeout(15000) });
   if (!res.ok) throw new Error('voice_note_download_failed');
   const ab = await res.arrayBuffer();
   const ext = path.extname(new URL(p).pathname || '').toLowerCase() || '.wav';
@@ -157,6 +161,7 @@ async function coldDmOnSend(payload) {
   try {
     const res = await fetch(url, {
       method: 'POST',
+      signal: AbortSignal.timeout(10000),
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
@@ -883,9 +888,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   return { ok: false, reason: noComposeReason || 'no_compose' };
 }
 
-function buildFollowUpLaunchOptions() {
+function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
   // NEW: Chrome fake mic with file injection (no PulseAudio needed).
-  ensureChromeFakeMicPlaceholder(logger);
+  ensureChromeFakeMicPlaceholder(logger, fakeMicPath);
   const opts = {
     headless: HEADLESS,
     args: [
@@ -895,7 +900,7 @@ function buildFollowUpLaunchOptions() {
       '--autoplay-policy=no-user-gesture-required',
     ],
   };
-  appendChromeFakeMicArgs(opts.args);
+  appendChromeFakeMicArgs(opts.args, fakeMicPath);
   applyPuppeteerSlowMo(opts);
   applyHeadedChromeWindowToLaunchOpts(opts);
   return opts;
@@ -1135,13 +1140,17 @@ async function sendFollowUp(body) {
   // NEW: For voice, download + convert to Chrome fake mic format BEFORE launch.
   // We restart browser so the new audio file is loaded via --use-file-for-fake-audio-capture.
   let voiceDurationSec = null;
+  let followUpFakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV;
   if (hasAudio) {
+    followUpFakeMicPath = buildChromeFakeMicPath(
+      `${clientId}-${instagramSessionId}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`
+    );
     const resolved = await resolveVoiceNotePath(audioUrlRaw);
     if (!resolved.localPath) {
       return fail('Could not download audio file', 400);
     }
     try {
-      const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
+      const conv = convertToChromeFakeMicWav(resolved.localPath, logger, followUpFakeMicPath);
       voiceDurationSec = conv.durationSec;
     } catch (e) {
       await resolved.cleanup().catch(() => {});
@@ -1150,7 +1159,7 @@ async function sendFollowUp(body) {
     await resolved.cleanup();
   }
 
-  const launchOpts = buildFollowUpLaunchOptions();
+  const launchOpts = buildFollowUpLaunchOptions(followUpFakeMicPath);
   let browser;
   let idCapture = null;
   try {
@@ -1241,7 +1250,7 @@ async function sendFollowUp(body) {
         await delay(VOICE_POST_SEND_BROWSER_WAIT_MS);
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
-      fs.unlink(CHROME_FAKE_MIC_WAV, () => {});
+      fs.unlink(followUpFakeMicPath, () => {});
       if (hasCaption) {
         const pair = [...captionIds, voiceResult.instagramMessageId || null];
         if (pair.some((x) => x != null)) {
@@ -1270,6 +1279,9 @@ async function sendFollowUp(body) {
       }
     }
     if (browser) await browser.close().catch(() => {});
+    if (hasAudio && followUpFakeMicPath && followUpFakeMicPath !== DEFAULT_CHROME_FAKE_MIC_WAV) {
+      fs.unlink(followUpFakeMicPath, () => {});
+    }
   }
 }
 

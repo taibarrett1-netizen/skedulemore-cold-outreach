@@ -4,7 +4,7 @@
 
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
-const { CHROME_FAKE_MIC_WAV } = require('./chrome-fake-mic');
+const { DEFAULT_CHROME_FAKE_MIC_WAV } = require('./chrome-fake-mic');
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -71,7 +71,7 @@ function getAudioDurationSec(audioPath) {
  *
  * @returns {{ durationSec: number, padStartSec: number, padEndSec: number }}
  */
-function convertToChromeFakeMicWav(inputPath, logger = null) {
+function convertToChromeFakeMicWav(inputPath, logger = null, outputPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
   if (!inputPath || !fs.existsSync(inputPath)) {
     throw new Error('voice_note_file_not_found');
   }
@@ -90,7 +90,7 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
     's16',
     '-f',
     'wav',
-    CHROME_FAKE_MIC_WAV,
+    outputPath,
   ];
 
   let result;
@@ -118,7 +118,7 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
         's16',
         '-f',
         'wav',
-        CHROME_FAKE_MIC_WAV,
+        outputPath,
       ],
       { encoding: 'utf8', timeout: 30000 }
     );
@@ -154,7 +154,7 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
       's16',
       '-f',
       'wav',
-      CHROME_FAKE_MIC_WAV,
+      outputPath,
     ];
     result = spawnSync(bin, paddedArgs, { encoding: 'utf8', timeout: 30000 });
   }
@@ -164,15 +164,15 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
     throw new Error(`voice_note_convert_failed: ${err}`);
   }
 
-  const durationOut = fs.existsSync(CHROME_FAKE_MIC_WAV)
-    ? getAudioDurationSec(CHROME_FAKE_MIC_WAV)
+  const durationOut = fs.existsSync(outputPath)
+    ? getAudioDurationSec(outputPath)
     : 7;
 
   if (logger && typeof logger.log === 'function') {
     const padNote =
       padStart > 0 || padEnd > 0 ? ` pad=${padStart}s+${padEnd}s` : '';
     logger.log(
-      `[voice] Converted to Chrome fake mic format: ${inputPath} → ${CHROME_FAKE_MIC_WAV} (${durationOut.toFixed(1)}s${padNote})`
+      `[voice] Converted to Chrome fake mic format: ${inputPath} → ${outputPath} (${durationOut.toFixed(1)}s${padNote})`
     );
   }
   return { durationSec: durationOut, padStartSec: padStart, padEndSec: padEnd };
@@ -182,8 +182,8 @@ function convertToChromeFakeMicWav(inputPath, logger = null) {
  * Ensure /tmp/current-voice-note.wav exists (silent placeholder) so Chrome can launch.
  * Call before first browser launch when no voice file has been converted yet.
  */
-function ensureChromeFakeMicPlaceholder(logger = null) {
-  if (fs.existsSync(CHROME_FAKE_MIC_WAV)) return;
+function ensureChromeFakeMicPlaceholder(logger = null, outputPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
+  if (fs.existsSync(outputPath)) return;
   const bin = ffmpegBin();
   const result = spawnSync(
     bin,
@@ -196,12 +196,12 @@ function ensureChromeFakeMicPlaceholder(logger = null) {
       '-ac', '2',
       '-sample_fmt', 's16',
       '-f', 'wav',
-      CHROME_FAKE_MIC_WAV,
+      outputPath,
     ],
     { encoding: 'utf8', timeout: 5000 }
   );
   if (result.status !== 0 && logger && typeof logger.warn === 'function') {
-    logger.warn(`[voice] Could not create placeholder ${CHROME_FAKE_MIC_WAV}: ${result.stderr || ''}`);
+    logger.warn(`[voice] Could not create placeholder ${outputPath}: ${result.stderr || ''}`);
   }
 }
 

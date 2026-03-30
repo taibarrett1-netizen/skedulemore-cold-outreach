@@ -117,6 +117,8 @@
     <div class="card">
       <h2>Connect Instagram (Cold Outreach)</h2>
       <p class="msg" id="connect-msg" style="display:none;"></p>
+      <label>API key</label>
+      <input type="password" id="connect-api-key" placeholder="Server COLD_DM_API_KEY or mapped client key">
       <label>Client ID</label>
       <input type="text" id="connect-client-id" placeholder="Your client/user id (required for Supabase)">
       <label>Instagram username</label>
@@ -168,6 +170,35 @@
 
   <script>
     let connectPending = null;
+    const API_KEY_STORAGE_KEY = 'coldDmApiKey';
+    const CLIENT_ID_STORAGE_KEY = 'coldDmClientId';
+
+    function getClientId() {
+      return (document.getElementById('connect-client-id').value || localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '').trim();
+    }
+
+    function getApiKey() {
+      return (document.getElementById('connect-api-key').value || localStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
+    }
+
+    function persistApiCreds() {
+      const apiKey = getApiKey();
+      const clientId = getClientId();
+      if (apiKey) localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
+      if (clientId) localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
+    }
+
+    function withClientId(data = {}) {
+      const clientId = getClientId();
+      return clientId ? { ...data, clientId } : data;
+    }
+
+    function apiFetch(url, options = {}) {
+      const headers = { ...(options.headers || {}) };
+      const apiKey = getApiKey();
+      if (apiKey) headers['x-api-key'] = apiKey;
+      return fetch(url, { ...options, headers });
+    }
 
     function showPanel(id) {
       document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
@@ -188,11 +219,11 @@
     }
 
     function doConnect(username, password, clientId) {
-      return fetch('/api/instagram/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, clientId }) }).then(r => r.json());
+      return apiFetch('/api/instagram/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, clientId }) }).then(r => r.json());
     }
 
     function submit2FACode(pending2FAId, twoFactorCode, clientId) {
-      return fetch('/api/instagram/connect/2fa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending2FAId, twoFactorCode, clientId }) }).then(r => r.json());
+      return apiFetch('/api/instagram/connect/2fa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending2FAId, twoFactorCode, clientId }) }).then(r => r.json());
     }
 
     function open2FAModal() {
@@ -213,7 +244,9 @@
 
     function refreshStatus() {
       console.log('[Dashboard] Fetching status...');
-      fetch('/api/status').then(r => r.json()).then(d => {
+      const params = new URLSearchParams();
+      if (getClientId()) params.set('clientId', getClientId());
+      apiFetch('/api/status' + (params.toString() ? '?' + params.toString() : '')).then(r => r.json()).then(d => {
         console.log('[Dashboard] Status:', d);
         document.getElementById('today-sent').textContent = d.todaySent;
         document.getElementById('today-failed').textContent = d.todayFailed;
@@ -253,7 +286,7 @@
     }
 
     function loadSettings() {
-      fetch('/api/settings').then(r => r.json()).then(d => {
+      apiFetch('/api/settings').then(r => r.json()).then(d => {
         document.getElementById('env-username').value = d.INSTAGRAM_USERNAME || '';
         document.getElementById('env-password').value = d.INSTAGRAM_PASSWORD || ''; // will show ******** if set
         document.getElementById('env-daily-limit').value = d.DAILY_SEND_LIMIT || 100;
@@ -265,7 +298,7 @@
         document.getElementById('env-voice-note-source-name').value = d.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVoice';
         document.getElementById('env-voice-note-pipe-path').value = d.VOICE_NOTE_PIPE_PATH || '/tmp/cold-dms-voice.pipe';
       });
-      fetch('/api/messages').then(r => r.json()).then(d => {
+      apiFetch('/api/messages').then(r => r.json()).then(d => {
         document.getElementById('messages-list').value = (d.messages || []).join('\n');
       });
     }
@@ -284,7 +317,7 @@
         VOICE_NOTE_PIPE_PATH: document.getElementById('env-voice-note-pipe-path').value.trim(),
       };
       if (payload.INSTAGRAM_PASSWORD === '********') delete payload.INSTAGRAM_PASSWORD;
-      fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      apiFetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
         .then(r => r.json()).then(() => { showMsg('settings-msg', 'Settings saved.', true); })
         .catch(() => { showMsg('settings-msg', 'Failed to save.', false); });
     });
@@ -293,7 +326,7 @@
       const text = document.getElementById('messages-list').value;
       const messages = text.split('\n').map(l => l.trim()).filter(Boolean);
       if (!messages.length) { showMsg('messages-msg', 'Add at least one message.', false); return; }
-      fetch('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages }) })
+      apiFetch('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages }) })
         .then(r => r.json()).then(() => { showMsg('messages-msg', 'Messages saved.', true); })
         .catch(() => { showMsg('messages-msg', 'Failed to save.', false); });
     });
@@ -303,7 +336,7 @@
       if (!input.files || !input.files[0]) { showMsg('settings-msg', 'Choose an audio file first.', false); return; }
       const fd = new FormData();
       fd.append('file', input.files[0]);
-      fetch('/api/voice/upload', { method: 'POST', body: fd })
+      apiFetch('/api/voice/upload', { method: 'POST', body: fd })
         .then(r => r.json())
         .then((d) => {
           if (!d.ok) throw new Error(d.error || 'Upload failed');
@@ -323,7 +356,7 @@
     }
 
     function loadLeads() {
-      fetch('/api/leads').then(r => r.json()).then(d => {
+      apiFetch('/api/leads').then(r => r.json()).then(d => {
         document.getElementById('leads-raw').value = d.raw && d.raw.trim() ? d.raw : '';
         document.getElementById('leads-count').textContent = d.usernames ? d.usernames.length + ' leads' : 'No leads file yet.';
       });
@@ -331,7 +364,7 @@
 
     document.getElementById('btn-save-leads').addEventListener('click', () => {
       const raw = document.getElementById('leads-raw').value;
-      fetch('/api/leads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ raw }) })
+      apiFetch('/api/leads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ raw }) })
         .then(r => r.json()).then(d => { showMsg('leads-msg', 'Saved ' + d.count + ' leads.', true); loadLeads(); })
         .catch(() => { showMsg('leads-msg', 'Failed to save.', false); });
     });
@@ -341,13 +374,15 @@
       if (!input.files || !input.files[0]) { showMsg('leads-msg', 'Choose a file first.', false); return; }
       const fd = new FormData();
       fd.append('file', input.files[0]);
-      fetch('/api/leads/upload', { method: 'POST', body: fd })
+      apiFetch('/api/leads/upload', { method: 'POST', body: fd })
         .then(r => r.json()).then(d => { showMsg('leads-msg', 'Uploaded ' + d.count + ' leads.', true); loadLeads(); document.getElementById('leads-raw').value = ''; input.value = ''; })
         .catch(() => { showMsg('leads-msg', 'Upload failed.', false); });
     });
 
     function loadSent() {
-      fetch('/api/sent').then(r => r.json()).then(rows => {
+      const params = new URLSearchParams();
+      if (getClientId()) params.set('clientId', getClientId());
+      apiFetch('/api/sent' + (params.toString() ? '?' + params.toString() : '')).then(r => r.json()).then(rows => {
         const tbody = document.getElementById('sent-tbody');
         tbody.innerHTML = rows.length ? rows.map(r => '<tr><td>@' + r.username + '</td><td>' + escapeHtml(r.message) + '</td><td>' + r.sent_at + '</td><td>' + r.status + '</td></tr>').join('') : '<tr><td colspan="4">No sent messages yet.</td></tr>';
       });
@@ -361,7 +396,7 @@
       const action = isStart ? 'start' : 'stop';
       console.log('[Dashboard] Control click:', action, '->', endpoint);
       btn.disabled = true;
-      fetch(endpoint, { method: 'POST' })
+      apiFetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withClientId({})) })
         .then((r) => { console.log('[Dashboard] Control response', r.status, endpoint); return r.json(); })
         .then((data) => {
           console.log('[Dashboard] Control result', data);
@@ -379,7 +414,7 @@
     document.getElementById('btn-reset-failed').addEventListener('click', () => {
       const btn = document.getElementById('btn-reset-failed');
       btn.disabled = true;
-      fetch('/api/reset-failed', { method: 'POST' })
+      apiFetch('/api/reset-failed', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(withClientId({})) })
         .then((r) => r.json())
         .then((data) => {
           if (data.ok) {
@@ -395,6 +430,7 @@
       const username = document.getElementById('connect-username').value.trim();
       const password = document.getElementById('connect-password').value;
       const clientId = document.getElementById('connect-client-id').value.trim();
+      persistApiCreds();
       if (!username || !password) { showConnectMsg('Enter username and password.', false); return; }
       if (!clientId) { showConnectMsg('Client ID is required (Supabase).', false); return; }
       const btn = document.getElementById('btn-connect');
@@ -435,6 +471,10 @@
 
     document.getElementById('btn-twofa-cancel').addEventListener('click', () => close2FAModal());
 
+    document.getElementById('connect-client-id').value = localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
+    document.getElementById('connect-api-key').value = localStorage.getItem(API_KEY_STORAGE_KEY) || '';
+    document.getElementById('connect-client-id').addEventListener('change', persistApiCreds);
+    document.getElementById('connect-api-key').addEventListener('change', persistApiCreds);
     loadSettings();
     refreshStatus();
     setInterval(refreshStatus, 10000);

@@ -6,6 +6,8 @@ if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
 
 const logPath = path.join(logsDir, 'bot.log');
 const errorPath = path.join(logsDir, 'error.log');
+const logStream = fs.createWriteStream(logPath, { flags: 'a' });
+const errorStream = fs.createWriteStream(errorPath, { flags: 'a' });
 
 function timestamp() {
   return new Date().toISOString();
@@ -14,9 +16,7 @@ function timestamp() {
 function write(level, msg) {
   const line = `[${timestamp()}] [${level}] ${msg}\n`;
   process.stdout.write(line);
-  try {
-    fs.appendFileSync(logPath, line);
-  } catch (e) {}
+  logStream.write(line);
 }
 
 function log(msg) {
@@ -31,9 +31,7 @@ function error(msg, err) {
   const errMsg = err ? (err.message || String(err)) : '';
   write('ERROR', errMsg ? `${msg}: ${errMsg}` : msg);
   const errLine = err && err.stack ? `${msg}\n${err.stack}\n` : `${msg}\n`;
-  try {
-    fs.appendFileSync(errorPath, `[${timestamp()}] ${errLine}`);
-  } catch (e) {}
+  errorStream.write(`[${timestamp()}] ${errLine}`);
 }
 
 module.exports = { log, warn, error };
