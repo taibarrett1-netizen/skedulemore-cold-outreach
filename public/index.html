@@ -117,8 +117,6 @@
     <div class="card">
       <h2>Connect Instagram (Cold Outreach)</h2>
       <p class="msg" id="connect-msg" style="display:none;"></p>
-      <label>API key</label>
-      <input type="password" id="connect-api-key" placeholder="Server COLD_DM_API_KEY or mapped client key">
       <label>Client ID</label>
       <input type="text" id="connect-client-id" placeholder="Your client/user id (required for Supabase)">
       <label>Instagram username</label>
@@ -170,21 +168,14 @@
 
   <script>
     let connectPending = null;
-    const API_KEY_STORAGE_KEY = 'coldDmApiKey';
     const CLIENT_ID_STORAGE_KEY = 'coldDmClientId';
 
     function getClientId() {
       return (document.getElementById('connect-client-id').value || localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '').trim();
     }
 
-    function getApiKey() {
-      return (document.getElementById('connect-api-key').value || localStorage.getItem(API_KEY_STORAGE_KEY) || '').trim();
-    }
-
-    function persistApiCreds() {
-      const apiKey = getApiKey();
+    function persistClientId() {
       const clientId = getClientId();
-      if (apiKey) localStorage.setItem(API_KEY_STORAGE_KEY, apiKey);
       if (clientId) localStorage.setItem(CLIENT_ID_STORAGE_KEY, clientId);
     }
 
@@ -195,9 +186,8 @@
 
     function apiFetch(url, options = {}) {
       const headers = { ...(options.headers || {}) };
-      const apiKey = getApiKey();
-      if (apiKey) headers['x-api-key'] = apiKey;
-      return fetch(url, { ...options, headers });
+      // API key: HttpOnly cookie set by server on GET / (see server.js); not in JS or repo.
+      return fetch(url, { ...options, headers, credentials: 'include' });
     }
 
     function showPanel(id) {
@@ -430,7 +420,7 @@
       const username = document.getElementById('connect-username').value.trim();
       const password = document.getElementById('connect-password').value;
       const clientId = document.getElementById('connect-client-id').value.trim();
-      persistApiCreds();
+      persistClientId();
       if (!username || !password) { showConnectMsg('Enter username and password.', false); return; }
       if (!clientId) { showConnectMsg('Client ID is required (Supabase).', false); return; }
       const btn = document.getElementById('btn-connect');
@@ -472,9 +462,7 @@
     document.getElementById('btn-twofa-cancel').addEventListener('click', () => close2FAModal());
 
     document.getElementById('connect-client-id').value = localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
-    document.getElementById('connect-api-key').value = localStorage.getItem(API_KEY_STORAGE_KEY) || '';
-    document.getElementById('connect-client-id').addEventListener('change', persistApiCreds);
-    document.getElementById('connect-api-key').addEventListener('change', persistApiCreds);
+    document.getElementById('connect-client-id').addEventListener('change', persistClientId);
     loadSettings();
     refreshStatus();
     setInterval(refreshStatus, 10000);

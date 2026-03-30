@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
 const { exec, spawn } = require('child_process');
@@ -53,9 +54,7 @@ const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
-if (!fs.existsSync(voiceNotesDir)) fs.mkdirSync(voiceNotesDir, { recursive: true });
-app.use('/voice-notes', express.static(voiceNotesDir));
+app.use(cookieParser());
 
 const API_KEY = (process.env.COLD_DM_API_KEY || '').trim();
 const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
@@ -71,6 +70,32 @@ const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
     return acc;
   }, {});
 
+const COOKIE_NAME = 'cold_dm_api';
+const cookieSecure =
+  process.env.COLD_DM_COOKIE_SECURE === '1' || process.env.COLD_DM_COOKIE_SECURE === 'true';
+
+// Dashboard HTML: set HttpOnly cookie from server env so the browser never types or sees the API key in JS/repo.
+app.get('/', (req, res) => {
+  if (API_KEY) {
+    res.cookie(COOKIE_NAME, API_KEY, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: cookieSecure,
+      path: '/',
+      maxAge: 60 * 24 * 60 * 60 * 1000, // 60 days
+    });
+  }
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/index.html', (req, res) => {
+  res.redirect(302, '/');
+});
+
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
+if (!fs.existsSync(voiceNotesDir)) fs.mkdirSync(voiceNotesDir, { recursive: true });
+app.use('/voice-notes', express.static(voiceNotesDir));
+
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: Math.max(10, parseInt(process.env.API_RATE_LIMIT_PER_MIN || '120', 10) || 120),
@@ -83,7 +108,8 @@ function getPresentedApiKey(req) {
   const auth = req.headers.authorization;
   const bearer = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
   const xApiKey = (req.headers['x-api-key'] || '').toString().trim();
-  return bearer || xApiKey || '';
+  const cookieKey = req.cookies && req.cookies[COOKIE_NAME] ? String(req.cookies[COOKIE_NAME]).trim() : '';
+  return bearer || xApiKey || cookieKey;
 }
 
 function resolveRequestedClientId(req) {
@@ -1052,11 +1078,6 @@ app.post('/api/control/stop', (req, res) => {
   console.log('[API] Stop bot requested (legacy)');
   res.json({ ok: true, processRunning: false });
   exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
-});
-
-// --- serve dashboard ---
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () => {
