@@ -8,6 +8,8 @@
     "status": "node cli.js --status",
     "reset-daily": "node cli.js --reset-daily",
     "dashboard": "node server.js",
+    "worker:send": "node workers/send-worker.js",
+    "worker:scrape": "node workers/scrape-worker.js",
     "download-follow-up-screenshots": "node scripts/download-follow-up-screenshots.js",
     "test:campaign-limits": "node scripts/test-campaign-limit-handling.js"
   },

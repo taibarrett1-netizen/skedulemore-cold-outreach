@@ -847,9 +847,25 @@ async function getPlatformScraperSessions() {
   if (!sb) return [];
   const { data, error } = await sb
     .from('cold_dm_platform_scraper_sessions')
-    .select('id, session_data, instagram_username, daily_actions_limit')
+    .select(
+      'id, session_data, instagram_username, daily_actions_limit, account_state, cooldown_until, leased_until, leased_by_worker, risk_score'
+    )
     .order('id', { ascending: true });
-  if (error) return [];
+  if (error) {
+    const { data: fallback, error: fallbackErr } = await sb
+      .from('cold_dm_platform_scraper_sessions')
+      .select('id, session_data, instagram_username, daily_actions_limit')
+      .order('id', { ascending: true });
+    if (fallbackErr) return [];
+    return (fallback || []).map((row) => ({
+      ...row,
+      account_state: 'active',
+      cooldown_until: null,
+      leased_until: null,
+      leased_by_worker: null,
+      risk_score: 0,
+    }));
+  }
   return data || [];
 }
 
@@ -864,6 +880,90 @@ async function getPlatformScraperSessionById(id) {
     .maybeSingle();
   if (error) return null;
   return data;
+}
+
+function computeLeaseUntil(leaseSec = 180) {
+  const sec = Math.max(30, parseInt(leaseSec, 10) || 180);
+  return new Date(Date.now() + sec * 1000).toISOString();
+}
+
+/**
+ * Reserve one platform scraper account for a worker.
+ * Best-effort atomic reservation via compare-and-swap update.
+ */
+async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeLeaseUntil(leaseSec);
+  const sessions = await getPlatformScraperSessions();
+  if (!sessions.length) return null;
+  const usage = await getPlatformScraperUsageToday(sessions.map((s) => s.id));
+
+  const eligible = sessions
+    .filter((s) => {
+      const state = (s.account_state || 'active').toLowerCase();
+      if (state !== 'active') return false;
+      if (s.cooldown_until && new Date(s.cooldown_until).getTime() > Date.now()) return false;
+      if (s.leased_until && new Date(s.leased_until).getTime() > Date.now()) return false;
+      return (usage[s.id] || 0) < (s.daily_actions_limit || 500);
+    })
+    .sort((a, b) => {
+      const aRisk = a.risk_score || 0;
+      const bRisk = b.risk_score || 0;
+      if (aRisk !== bRisk) return aRisk - bRisk;
+      return (usage[a.id] || 0) - (usage[b.id] || 0);
+    });
+
+  for (const candidate of eligible) {
+    const { data, error } = await sb
+      .from('cold_dm_platform_scraper_sessions')
+      .update({
+        leased_until: leaseUntil,
+        leased_by_worker: workerId,
+        lease_heartbeat_at: nowIso,
+        updated_at: nowIso,
+      })
+      .eq('id', candidate.id)
+      .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
+      .select('id, session_data, instagram_username')
+      .limit(1);
+    if (!error && data && data.length > 0) {
+      return {
+        id: data[0].id,
+        session_data: data[0].session_data,
+        instagram_username: data[0].instagram_username,
+      };
+    }
+  }
+  return null;
+}
+
+async function heartbeatPlatformScraperSessionLease(sessionId, workerId, leaseSec = 180) {
+  const sb = getSupabase();
+  if (!sb || !sessionId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeLeaseUntil(leaseSec);
+  const { data, error } = await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .update({ leased_until: leaseUntil, lease_heartbeat_at: nowIso, updated_at: nowIso })
+    .eq('id', sessionId)
+    .eq('leased_by_worker', workerId)
+    .select('id')
+    .limit(1);
+  return !error && !!(data && data.length > 0);
+}
+
+async function releasePlatformScraperSessionLease(sessionId, workerId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) return;
+  const nowIso = new Date().toISOString();
+  let q = sb
+    .from('cold_dm_platform_scraper_sessions')
+    .update({ leased_until: null, leased_by_worker: null, lease_heartbeat_at: nowIso, updated_at: nowIso })
+    .eq('id', sessionId);
+  if (workerId) q = q.eq('leased_by_worker', workerId);
+  await q;
 }
 
 async function getPlatformScraperUsageToday(sessionIds) {
@@ -994,7 +1094,7 @@ async function createScrapeJob(
   const payload = {
     client_id: clientId,
     target_username: targetUsername,
-    status: 'running',
+    status: 'pending',
     scraped_count: 0,
     started_at: new Date().toISOString(),
   };
@@ -1024,6 +1124,8 @@ async function updateScrapeJob(jobId, updates) {
   const payload = { ...updates };
   if (payload.status === 'completed' || payload.status === 'failed' || payload.status === 'cancelled') {
     payload.finished_at = new Date().toISOString();
+    payload.leased_until = null;
+    payload.leased_by_worker = null;
   }
   const { error } = await sb.from('cold_dm_scrape_jobs').update(payload).eq('id', jobId);
   if (error) throw error;
@@ -1055,7 +1157,16 @@ async function cancelScrapeJob(clientId, jobId) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   if (jobId) {
-    const { error } = await sb.from('cold_dm_scrape_jobs').update({ status: 'cancelled', finished_at: new Date().toISOString() }).eq('id', jobId).eq('client_id', clientId);
+    const { error } = await sb
+      .from('cold_dm_scrape_jobs')
+      .update({
+        status: 'cancelled',
+        finished_at: new Date().toISOString(),
+        leased_until: null,
+        leased_by_worker: null,
+      })
+      .eq('id', jobId)
+      .eq('client_id', clientId);
     if (error) throw error;
     return true;
   }
@@ -1063,19 +1174,110 @@ async function cancelScrapeJob(clientId, jobId) {
     .from('cold_dm_scrape_jobs')
     .select('id')
     .eq('client_id', clientId)
-    .eq('status', 'running')
+    .in('status', ['running', 'pending', 'leased', 'retry'])
     .order('started_at', { ascending: false })
     .limit(1)
     .maybeSingle();
   if (running?.id) {
     const { error } = await sb
       .from('cold_dm_scrape_jobs')
-      .update({ status: 'cancelled', finished_at: new Date().toISOString() })
+      .update({ status: 'cancelled', finished_at: new Date().toISOString(), leased_until: null, leased_by_worker: null })
       .eq('id', running.id);
     if (error) throw error;
     return true;
   }
   return false;
+}
+
+/**
+ * Atomically claim next pending scrape job (Postgres SKIP LOCKED via RPC when deployed).
+ */
+async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const { data, error } = await sb.rpc('claim_cold_dm_scrape_job', {
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSeconds,
+  });
+  if (!error) {
+    const rows = Array.isArray(data) ? data : data != null ? [data] : [];
+    if (rows.length > 0) return rows[0];
+    return null;
+  }
+  return claimColdDmScrapeJobFallback(workerId, leaseSeconds);
+}
+
+/** Best-effort claim when RPC is missing or races (no SKIP LOCKED). */
+async function claimColdDmScrapeJobFallback(workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const { data: pending } = await sb
+    .from('cold_dm_scrape_jobs')
+    .select('id, attempt_count')
+    .eq('status', 'pending')
+    .order('started_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (!pending?.id) return null;
+  const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
+  const nowIso = new Date().toISOString();
+  const nextAttempt = (pending.attempt_count || 0) + 1;
+  const { data: updated, error } = await sb
+    .from('cold_dm_scrape_jobs')
+    .update({
+      status: 'running',
+      leased_by_worker: workerId,
+      leased_until: leaseUntil,
+      lease_heartbeat_at: nowIso,
+      attempt_count: nextAttempt,
+    })
+    .eq('id', pending.id)
+    .eq('status', 'pending')
+    .select('*')
+    .maybeSingle();
+  if (error || !updated) return null;
+  return updated;
+}
+
+async function heartbeatScrapeJobLease(jobId, workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !jobId || !workerId) return false;
+  const { data, error } = await sb.rpc('heartbeat_cold_dm_scrape_job', {
+    p_job_id: jobId,
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSeconds,
+  });
+  if (!error && data === true) return true;
+  if (!error && data === false) return false;
+  const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
+  const { data: rows, error: uerr } = await sb
+    .from('cold_dm_scrape_jobs')
+    .update({ leased_until: leaseUntil, lease_heartbeat_at: new Date().toISOString() })
+    .eq('id', jobId)
+    .eq('leased_by_worker', workerId)
+    .eq('status', 'running')
+    .select('id');
+  return !uerr && rows && rows.length > 0;
+}
+
+async function workerHeartbeat(workerId, workerType, meta = {}) {
+  const sb = getSupabase();
+  if (!sb || !workerId || !workerType) return;
+  try {
+    const os = require('os');
+    await sb.from('cold_dm_worker_heartbeats').upsert(
+      {
+        worker_id: workerId,
+        worker_type: workerType,
+        host: os.hostname(),
+        meta: meta || {},
+        last_seen_at: new Date().toISOString(),
+      },
+      { onConflict: 'worker_id' }
+    );
+  } catch (e) {
+    /* table may not exist until migration */
+  }
 }
 
 /** Returns Set of normalised usernames in cold_dm_scrape_blocklist (do not scrape as leads). */
@@ -1641,6 +1843,9 @@ module.exports = {
   getPlatformScraperSessions,
   getPlatformScraperSessionById,
   pickScraperSessionForJob,
+  reservePlatformScraperSessionForWorker,
+  heartbeatPlatformScraperSessionLease,
+  releasePlatformScraperSessionLease,
   recordScraperActions,
   savePlatformScraperSession,
   getConversationParticipantUsernames,
@@ -1651,6 +1856,9 @@ module.exports = {
   getScrapeJob,
   getLatestScrapeJob,
   cancelScrapeJob,
+  claimColdDmScrapeJob,
+  heartbeatScrapeJobLease,
+  workerHeartbeat,
   upsertLead,
   upsertLeadsBatch,
   getActiveCampaigns,

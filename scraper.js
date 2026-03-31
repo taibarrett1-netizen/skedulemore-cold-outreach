@@ -79,10 +79,23 @@ async function connectScraper(instagramUsername, instagramPassword) {
 async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) {
   const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
   const leadGroupId = options.leadGroupId || null;
-  const sb = require('./database/supabase').getSupabase();
+  const leaseOptions = options.leaseOptions || null;
+  const sbMod = require('./database/supabase');
+  const sb = sbMod.getSupabase();
   if (!sb || !clientId || !jobId) {
     logger.error('[Scraper] Missing clientId or jobId');
     return;
+  }
+
+  let leaseHbTimer = null;
+  if (leaseOptions?.jobId && leaseOptions?.workerId) {
+    const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+    leaseHbTimer = setInterval(() => {
+      sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
+      if (leaseOptions.platformSessionId) {
+        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
+      }
+    }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
   let browser;
@@ -99,6 +112,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
     if (!session) {
       session = await getScraperSession(clientId);
+    }
+    if (leaseOptions && platformSessionId) {
+      leaseOptions.platformSessionId = platformSessionId;
     }
     if (!session?.session_data?.cookies?.length) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
@@ -928,6 +944,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       logger.error('[Scraper] Failed to update job status', e);
     }
   } finally {
+    if (leaseHbTimer) clearInterval(leaseHbTimer);
     if (browser) await browser.close().catch(() => {});
   }
 }
@@ -951,10 +968,23 @@ function getShortcodeFromPostUrl(url) {
 async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
   const leadGroupId = options.leadGroupId || null;
-  const sb = require('./database/supabase').getSupabase();
+  const leaseOptions = options.leaseOptions || null;
+  const sbMod = require('./database/supabase');
+  const sb = sbMod.getSupabase();
   if (!sb || !clientId || !jobId || !postUrls || !Array.isArray(postUrls) || postUrls.length === 0) {
     logger.error('[Scraper] Comment scrape: missing clientId, jobId, or postUrls');
     return;
+  }
+
+  let leaseHbTimer = null;
+  if (leaseOptions?.jobId && leaseOptions?.workerId) {
+    const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+    leaseHbTimer = setInterval(() => {
+      sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
+      if (leaseOptions.platformSessionId) {
+        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
+      }
+    }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
   const BLACKLIST = new Set([
@@ -976,6 +1006,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     }
     if (!session) {
       session = await getScraperSession(clientId);
+    }
+    if (leaseOptions && platformSessionId) {
+      leaseOptions.platformSessionId = platformSessionId;
     }
     if (!session?.session_data?.cookies?.length) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
@@ -1245,6 +1278,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       logger.error('[Scraper] Failed to update job status', e);
     }
   } finally {
+    if (leaseHbTimer) clearInterval(leaseHbTimer);
     if (browser) await browser.close().catch(() => {});
   }
 }

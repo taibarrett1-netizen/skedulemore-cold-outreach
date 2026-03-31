@@ -15,28 +15,3 @@ cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-dashboa
 
 cd /root/ColdDMs
 python3 -m http.server 8080
-
-cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
-
-scp root@178.62.52.200:/root/ColdDMs/scraper-debug/followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png .
-open followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png
-
-curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
-  -H "Authorization: Bearer b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354" \
-  -H "Content-Type: application/json" \
-  -d '{"clientId":"real-uuid","instagramSessionId":"real-uuid"}'
-
-  Run this on the VPS (display :98 like your bot)
-# stop any broken x11vnc first if needed
-pkill x11vnc 2>/dev/null; sleep 1
-x11vnc -display :98 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 &
--nopw is enough when VNC only listens on 127.0.0.1 and you use an SSH tunnel.
-
-Mac
-ssh -L 5900:127.0.0.1:5900 root@178.62.52.200
-TigerVNC → 127.0.0.1:5900
-
-curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
-  -H "Authorization: Bearer b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354" \
-  -H "Content-Type: application/json" \
-  -d '{"clientId":"f0aff6c5-64f8-498b-83f5-b31e7291d34d","instagramSessionId":"e5c11f0f-8fa2-48f4-a06e-57381ef7c2e0"}'

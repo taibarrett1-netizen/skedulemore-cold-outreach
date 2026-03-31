@@ -173,7 +173,7 @@ async function coldDmOnSend(payload) {
     } else {
       const errText = await res.text();
       if (res.status === 404) {
-        logger.warn('cold-dm-on-send 404: Edge Function not deployed. Deploy "cold-dm-on-send" in your Supabase project so the dashboard can create cold-outreach conversations and match GHL contacts. See COLD_DM_HANDOFF.md §2a.');
+        logger.warn('cold-dm-on-send 404: Edge Function not deployed. Deploy "cold-dm-on-send" in your Supabase project so the dashboard can create cold-outreach conversations and match GHL contacts.');
       } else {
         logger.warn('cold-dm-on-send failed: ' + res.status + ' ' + errText);
       }
