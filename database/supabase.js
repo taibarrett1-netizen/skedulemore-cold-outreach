@@ -676,7 +676,7 @@ async function getClientNoWorkResumeAt(clientId) {
     return { message: 'No campaigns.', reason: 'no_campaigns', resumeAt: null };
   }
   const allCampaignIds = allCampaigns.map((c) => c.id).filter(Boolean);
-  const { count: totalPendingAcrossCampaigns } =
+  const { count: totalPendingAllCampaigns } =
     allCampaignIds.length > 0
       ? await sb
           .from('cold_dm_campaign_leads')
@@ -684,24 +684,27 @@ async function getClientNoWorkResumeAt(clientId) {
           .in('campaign_id', allCampaignIds)
           .eq('status', 'pending')
       : { count: 0 };
-  if ((totalPendingAcrossCampaigns ?? 0) === 0) {
+  if ((totalPendingAllCampaigns ?? 0) === 0) {
     return { message: null, reason: 'no_pending', resumeAt: null };
   }
-  const campaigns = await getActiveCampaigns(clientId);
-  const campaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
 
-  const { count: pendingCount } =
-    campaignIds.length > 0
+  const campaigns = await getActiveCampaigns(clientId);
+  const activeCampaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
+  const { count: pendingOnActiveCampaigns } =
+    activeCampaignIds.length > 0
       ? await sb
           .from('cold_dm_campaign_leads')
           .select('*', { count: 'exact', head: true })
-          .in('campaign_id', campaignIds)
+          .in('campaign_id', activeCampaignIds)
           .eq('status', 'pending')
       : { count: 0 };
-  const pendingTotal = pendingCount ?? 0;
+  const pendingTotal = pendingOnActiveCampaigns ?? 0;
+
   if (pendingTotal === 0) {
     return {
-      message: `Pending leads exist (${totalPendingAcrossCampaigns}) but none are currently sendable.`,
+      message:
+        `You have ${totalPendingAllCampaigns} pending lead(s), but none on an active campaign. ` +
+        'Open the campaign and set status to active (or press Start in the dashboard) so the bot can send.',
       reason: 'no_sendable_work',
       resumeAt: null,
     };
@@ -1562,6 +1565,7 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
 
 // --- Campaigns ---
 // Campaign config (timezone, schedule, limits, delays) is read from DB on every get-next-work / can-run check. Do not cache; re-evaluate when user changes campaign in dashboard.
+/** Campaigns with status = active only (sending / queue materialization). */
 async function getActiveCampaigns(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -1569,17 +1573,19 @@ async function getActiveCampaigns(clientId) {
     const { data, error } = await sb
       .from('cold_dm_campaigns')
       .select(
-        'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
+        'id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
       )
       .eq('client_id', clientId)
+      .eq('status', 'active')
       .order('created_at', { ascending: true });
     if (error) throw error;
     return data || [];
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_campaigns')
-      .select('id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec')
+      .select('id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec')
       .eq('client_id', clientId)
+      .eq('status', 'active')
       .order('created_at', { ascending: true });
     if (error) throw error;
     return (data || []).map((r) => ({ ...r, send_voice_note: false, voice_note_storage_path: null, voice_note_mode: 'after_text' }));
@@ -1672,19 +1678,22 @@ async function claimCampaignLeadLease(campaignLeadId, workerId, leaseSeconds = 6
   if (!sb || !campaignLeadId || !workerId) return false;
   const nowIso = new Date().toISOString();
   const leaseUntil = new Date(Date.now() + Math.max(60, parseInt(leaseSeconds, 10) || 600) * 1000).toISOString();
-  const { data, error } = await sb
-    .from('cold_dm_campaign_leads')
-    .update({
-      leased_by_worker: workerId,
-      leased_until: leaseUntil,
-      lease_heartbeat_at: nowIso,
-    })
-    .eq('id', campaignLeadId)
-    .eq('status', 'pending')
-    .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
-    .select('id')
-    .limit(1);
-  return !error && !!(data && data.length > 0);
+  const updatePayload = {
+    leased_by_worker: workerId,
+    leased_until: leaseUntil,
+    lease_heartbeat_at: nowIso,
+  };
+  const attempts = [
+    (q) => q.is('leased_until', null),
+    (q) => q.lte('leased_until', nowIso),
+  ];
+  for (const build of attempts) {
+    let query = sb.from('cold_dm_campaign_leads').update(updatePayload).eq('id', campaignLeadId).eq('status', 'pending');
+    query = build(query);
+    const { data, error } = await query.select('id').limit(1);
+    if (!error && data && data.length > 0) return true;
+  }
+  return false;
 }
 
 async function getNextPendingCampaignLead(clientId, workerId = null, leaseSeconds = 600) {
@@ -1783,15 +1792,20 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     let leadRow = null;
     for (;;) {
       const nowIso = new Date().toISOString();
-      const { data: pendingRow, error } = await sb
-        .from('cold_dm_campaign_leads')
-        .select('id, lead_id')
-        .eq('campaign_id', camp.id)
-        .eq('status', 'pending')
-        .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
+      const basePending = () =>
+        sb.from('cold_dm_campaign_leads').select('id, lead_id').eq('campaign_id', camp.id).eq('status', 'pending');
+      let { data: pendingRow, error } = await basePending()
+        .is('leased_until', null)
         .order('id', { ascending: true })
         .limit(1)
         .maybeSingle();
+      if (!error && !pendingRow?.lead_id) {
+        ({ data: pendingRow, error } = await basePending()
+          .lte('leased_until', nowIso)
+          .order('id', { ascending: true })
+          .limit(1)
+          .maybeSingle());
+      }
       if (error || !pendingRow?.lead_id) break;
       dbg.pendingCount += 1;
       const { data: leadData } = await sb
