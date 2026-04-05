@@ -30,6 +30,12 @@ const {
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
 
+/** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
+async function failScrapeJob(jobId, errorMessage) {
+  logger.error(`[Scraper] Job ${jobId} failed: ${errorMessage}`);
+  await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
+}
+
 puppeteer.use(StealthPlugin());
 
 const SCRAPE_DELAY_MIN_MS = 2000;
@@ -117,9 +123,11 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       leaseOptions.platformSessionId = platformSessionId;
     }
     if (!session?.session_data?.cookies?.length) {
-      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
+      await failScrapeJob(jobId, 'Scraper session not found or expired');
       return;
     }
+
+    logger.log(`[Scraper] Job ${jobId} session OK; launching browser for follower scrape`);
 
     browser = await puppeteer.launch({
       headless: HEADLESS,
@@ -139,7 +147,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await delay(randomDelay(1500, 3500));
 
     if (page.url().includes('/accounts/login')) {
-      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
+      await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
       return;
     }
     logger.log('[Scraper] Warming session before scrape...');
@@ -355,10 +363,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       } catch (screenshotErr) {
         logger.error('[Scraper] Failed to capture screenshot on followers modal error: %s', screenshotErr.message);
       }
-      await updateScrapeJob(jobId, {
-        status: 'failed',
-        error_message: 'Could not open followers list. Profile may be private or link not found.',
-      });
+      const modalFailMsg =
+        'Could not open followers list. Profile may be private or link not found.';
+      await failScrapeJob(jobId, modalFailMsg);
       return;
     }
 
@@ -1011,9 +1018,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       leaseOptions.platformSessionId = platformSessionId;
     }
     if (!session?.session_data?.cookies?.length) {
-      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
+      await failScrapeJob(jobId, 'Scraper session not found or expired');
       return;
     }
+
+    logger.log(`[Scraper] Job ${jobId} session OK; launching browser for comment scrape`);
 
     browser = await puppeteer.launch({
       headless: HEADLESS,
@@ -1026,7 +1035,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await delay(randomDelay(1500, 3500));
 
     if (page.url().includes('/accounts/login')) {
-      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
+      await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
       return;
     }
 

@@ -32,6 +32,9 @@ async function processOneJob(workerId, job) {
         reservedPlatformId = reserved.id;
         await sb.updateScrapeJob(job.id, { platform_scraper_session_id: reserved.id });
         job.platform_scraper_session_id = reserved.id;
+        logger.log(
+          `[scrape-worker] reserved platform session ${reserved.id} for job ${job.id}`
+        );
       }
     }
 
@@ -43,6 +46,12 @@ async function processOneJob(workerId, job) {
     };
 
     const scrapeType = job.scrape_type === 'comments' ? 'comments' : 'followers';
+    logger.log(
+      `[scrape-worker] begin scrape job=${job.id} type=${scrapeType} max_leads=${job.max_leads ?? '—'} ` +
+        (scrapeType === 'followers'
+          ? `target=@${String(job.target_username || '').replace(/^@/, '')}`
+          : `posts=${Array.isArray(job.post_urls) ? job.post_urls.length : 0}`)
+    );
     if (scrapeType === 'followers') {
       await runFollowerScrape(String(job.client_id), String(job.id), normalizeTarget(job), {
         maxLeads: job.max_leads,
@@ -57,6 +66,7 @@ async function processOneJob(workerId, job) {
         leaseOptions: leaseOpts,
       });
     }
+    logger.log(`[scrape-worker] scrape routine returned job=${job.id} (status updated in DB by scraper)`);
   } finally {
     if (reservedPlatformId) {
       await sb.releasePlatformScraperSessionLease(reservedPlatformId, workerId).catch(() => {});
@@ -82,7 +92,14 @@ async function main() {
       continue;
     }
 
-    logger.log(`[scrape-worker] claimed job ${job.id} client=${job.client_id} type=${job.scrape_type}`);
+    const postsN = Array.isArray(job.post_urls) ? job.post_urls.length : 0;
+    const tgt =
+      job.scrape_type === 'comments'
+        ? `${postsN} post(s)`
+        : `@${String(job.target_username || '').replace(/^@/, '') || '—'}`;
+    logger.log(
+      `[scrape-worker] claimed job ${job.id} client=${job.client_id} type=${job.scrape_type} target=${tgt} max_leads=${job.max_leads ?? '—'}`
+    );
     try {
       await processOneJob(workerId, job);
     } catch (e) {
