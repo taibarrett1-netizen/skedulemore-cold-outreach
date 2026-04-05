@@ -897,6 +897,12 @@ function computeLeaseUntil(leaseSec = 180) {
   return new Date(Date.now() + sec * 1000).toISOString();
 }
 
+/** Puppeteer scrape jobs need session_data.cookies (Instagram login); pool rows without cookies must not be reserved. */
+function platformSessionHasPuppeteerCookies(s) {
+  const c = s && s.session_data && s.session_data.cookies;
+  return Array.isArray(c) && c.length > 0;
+}
+
 /**
  * Reserve one platform scraper account for a worker.
  * Best-effort atomic reservation via compare-and-swap update.
@@ -914,6 +920,7 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
     .filter((s) => {
       const state = (s.account_state || 'active').toLowerCase();
       if (state !== 'active') return false;
+      if (!platformSessionHasPuppeteerCookies(s)) return false;
       if (s.cooldown_until && new Date(s.cooldown_until).getTime() > Date.now()) return false;
       if (s.leased_until && new Date(s.leased_until).getTime() > Date.now()) return false;
       return (usage[s.id] || 0) < (s.daily_actions_limit || 500);
@@ -995,20 +1002,16 @@ async function getPlatformScraperUsageToday(sessionIds) {
 }
 
 async function pickScraperSessionForJob(clientId) {
+  void clientId;
   const sessions = await getPlatformScraperSessions();
-  if (sessions.length === 0) {
-    const clientSession = await getScraperSession(clientId);
-    if (clientSession) return { source: 'client', session: clientSession, platformSessionId: null };
-    return null;
-  }
+  if (sessions.length === 0) return null;
   const sessionIds = sessions.map((s) => s.id);
   const usage = await getPlatformScraperUsageToday(sessionIds);
-  const candidates = sessions.filter((s) => (usage[s.id] || 0) < (s.daily_actions_limit || 500));
-  if (candidates.length === 0) {
-    const clientSession = await getScraperSession(clientId);
-    if (clientSession) return { source: 'client', session: clientSession, platformSessionId: null };
-    return null;
-  }
+  const candidates = sessions.filter(
+    (s) =>
+      platformSessionHasPuppeteerCookies(s) && (usage[s.id] || 0) < (s.daily_actions_limit || 500)
+  );
+  if (candidates.length === 0) return null;
   candidates.sort((a, b) => (usage[a.id] || 0) - (usage[b.id] || 0));
   const picked = candidates[0];
   return {

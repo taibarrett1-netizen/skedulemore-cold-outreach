@@ -15,7 +15,6 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const path = require('path');
 const fs = require('fs');
 const {
-  getScraperSession,
   saveScraperSession,
   createScrapeJob,
   updateScrapeJob,
@@ -25,6 +24,7 @@ const {
   getSentUsernames,
   getScrapeBlocklistUsernames,
   getPlatformScraperSessionById,
+  reservePlatformScraperSessionForWorker,
   recordScraperActions,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
@@ -34,6 +34,43 @@ const { applyMobileEmulation } = require('./utils/mobile-viewport');
 async function failScrapeJob(jobId, errorMessage) {
   logger.error(`[Scraper] Job ${jobId} failed: ${errorMessage}`);
   await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
+}
+
+/**
+ * Scrapes use only the shared platform pool (cold_dm_platform_scraper_sessions), not per-client cold_dm_scraper_sessions.
+ * Optionally re-reserves from the pool when the job points at a row with no Puppeteer cookies.
+ */
+async function resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions) {
+  const job = await getScrapeJob(jobId);
+  let session = null;
+  let platformSessionId = null;
+
+  if (job?.platform_scraper_session_id) {
+    const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
+    if (platformSession && Array.isArray(platformSession.session_data?.cookies) && platformSession.session_data.cookies.length > 0) {
+      session = platformSession;
+      platformSessionId = job.platform_scraper_session_id;
+    }
+  }
+
+  if (!session && leaseOptions?.workerId) {
+    const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+    const reserved = await reservePlatformScraperSessionForWorker(leaseOptions.workerId, sec);
+    if (reserved && Array.isArray(reserved.session_data?.cookies) && reserved.session_data.cookies.length > 0) {
+      session = {
+        session_data: reserved.session_data,
+        instagram_username: reserved.instagram_username,
+      };
+      platformSessionId = reserved.id;
+      await updateScrapeJob(jobId, { platform_scraper_session_id: reserved.id });
+    }
+  }
+
+  if (leaseOptions && platformSessionId) {
+    leaseOptions.platformSessionId = platformSessionId;
+  }
+
+  return { job, session, platformSessionId };
 }
 
 puppeteer.use(StealthPlugin());
@@ -106,24 +143,19 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
   let browser;
   try {
-    const job = await getScrapeJob(jobId);
-    let session = null;
-    let platformSessionId = null;
-    if (job?.platform_scraper_session_id) {
-      const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
-      if (platformSession) {
-        session = platformSession;
-        platformSessionId = job.platform_scraper_session_id;
-      }
-    }
-    if (!session) {
-      session = await getScraperSession(clientId);
-    }
-    if (leaseOptions && platformSessionId) {
-      leaseOptions.platformSessionId = platformSessionId;
-    }
+    const { job, session, platformSessionId } = await resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions);
     if (!session?.session_data?.cookies?.length) {
-      await failScrapeJob(jobId, 'Scraper session not found or expired');
+      const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
+      logger.error(
+        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
+          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ` +
+          `Fix: connect at least one platform scraper (admin) with a valid Instagram session so session_data.cookies is set.`
+      );
+      await failScrapeJob(
+        jobId,
+        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+      );
       return;
     }
 
@@ -1002,23 +1034,23 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   let browser;
   let platformSessionId = null;
   try {
-    const job = await getScrapeJob(jobId);
-    let session = null;
-    if (job?.platform_scraper_session_id) {
-      const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
-      if (platformSession) {
-        session = platformSession;
-        platformSessionId = job.platform_scraper_session_id;
-      }
-    }
-    if (!session) {
-      session = await getScraperSession(clientId);
-    }
-    if (leaseOptions && platformSessionId) {
-      leaseOptions.platformSessionId = platformSessionId;
-    }
+    const { session, platformSessionId: resolvedPlatformId } = await resolvePuppeteerSessionForScrapeJob(
+      jobId,
+      leaseOptions
+    );
+    platformSessionId = resolvedPlatformId;
     if (!session?.session_data?.cookies?.length) {
-      await failScrapeJob(jobId, 'Scraper session not found or expired');
+      const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
+      logger.error(
+        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
+          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ` +
+          `Fix: connect at least one platform scraper (admin) with a valid Instagram session so session_data.cookies is set.`
+      );
+      await failScrapeJob(
+        jobId,
+        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+      );
       return;
     }
 
