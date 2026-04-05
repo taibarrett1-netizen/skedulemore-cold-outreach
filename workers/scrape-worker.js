@@ -35,6 +35,11 @@ async function processOneJob(workerId, job) {
         logger.log(
           `[scrape-worker] reserved platform session ${reserved.id} for job ${job.id}`
         );
+      } else {
+        const hint = await sb.describePlatformScraperPoolForLogs().catch(() => '');
+        logger.error(
+          `[scrape-worker] could not reserve a platform scraper for job ${job.id} (need Puppeteer cookies on pool rows). ${hint}`
+        );
       }
     }
 

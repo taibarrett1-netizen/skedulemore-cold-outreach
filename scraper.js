@@ -25,6 +25,7 @@ const {
   getScrapeBlocklistUsernames,
   getPlatformScraperSessionById,
   reservePlatformScraperSessionForWorker,
+  describePlatformScraperPoolForLogs,
   recordScraperActions,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
@@ -146,11 +147,11 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const { job, session, platformSessionId } = await resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions);
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
+      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
         `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
           `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ` +
-          `Fix: connect at least one platform scraper (admin) with a valid Instagram session so session_data.cookies is set.`
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
       );
       await failScrapeJob(
         jobId,
@@ -1041,11 +1042,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     platformSessionId = resolvedPlatformId;
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
+      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
         `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
           `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ` +
-          `Fix: connect at least one platform scraper (admin) with a valid Instagram session so session_data.cookies is set.`
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
       );
       await failScrapeJob(
         jobId,

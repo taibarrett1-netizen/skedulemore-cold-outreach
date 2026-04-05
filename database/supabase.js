@@ -904,6 +904,38 @@ function platformSessionHasPuppeteerCookies(s) {
 }
 
 /**
+ * One-line summary for logs when reserve fails (empty pool, no cookies, all leased, etc.).
+ */
+async function describePlatformScraperPoolForLogs() {
+  const sessions = await getPlatformScraperSessions();
+  if (!sessions.length) {
+    return 'pool: 0 rows in cold_dm_platform_scraper_sessions — add platform scrapers in admin';
+  }
+  const usage = await getPlatformScraperUsageToday(sessions.map((s) => s.id));
+  const now = Date.now();
+  let withCookies = 0;
+  let eligible = 0;
+  for (const s of sessions) {
+    if (platformSessionHasPuppeteerCookies(s)) withCookies += 1;
+    const state = (s.account_state || 'active').toLowerCase();
+    const okState = state === 'active';
+    const okCd = !s.cooldown_until || new Date(s.cooldown_until).getTime() <= now;
+    const okLease = !s.leased_until || new Date(s.leased_until).getTime() <= now;
+    const okUsage = (usage[s.id] || 0) < (s.daily_actions_limit || 500);
+    if (okState && platformSessionHasPuppeteerCookies(s) && okCd && okLease && okUsage) eligible += 1;
+  }
+  return (
+    `pool: ${sessions.length} row(s), ${withCookies} with session_data.cookies (Puppeteer login), ` +
+      `${eligible} eligible for scrape (active + cookies + not leased + under daily limit). ` +
+      (withCookies === 0
+        ? 'Reconnect Instagram in admin Platform scrapers so Puppeteer saves cookies.'
+        : eligible === 0
+          ? 'All accounts may be leased, on cooldown, over daily limit, or not active.'
+          : '')
+  );
+}
+
+/**
  * Reserve one platform scraper account for a worker.
  * Best-effort atomic reservation via compare-and-swap update.
  */
@@ -1916,6 +1948,7 @@ module.exports = {
   getPlatformScraperSessions,
   getPlatformScraperSessionById,
   pickScraperSessionForJob,
+  describePlatformScraperPoolForLogs,
   reservePlatformScraperSessionForWorker,
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
