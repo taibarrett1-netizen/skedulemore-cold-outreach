@@ -58,31 +58,47 @@ function httpsJson(method, path, headers, bodyObj) {
   });
 }
 
+/** Trim and strip accidental surrounding quotes from .env / PM2 values */
+function normalizeSecret(val) {
+  let v = String(val || '').trim();
+  if (
+    v.length >= 2 &&
+    ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
+  ) {
+    v = v.slice(1, -1).trim();
+  }
+  return v;
+}
+
 /**
+ * Decodo OpenAPI uses `apiKey` in header `Authorization` (not necessarily RFC Bearer).
+ * Sending `Bearer <key>` often yields 401 "Invalid Api key" — default is **raw key only**.
+ *
  * @returns {Record<string, string>}
  */
 function getDecodoAuthHeaders() {
-  const full = (process.env.DECODO_AUTHORIZATION || '').trim();
+  const full = normalizeSecret(process.env.DECODO_AUTHORIZATION);
   if (full) {
     return { Authorization: full };
   }
-  const key = (process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN || '').trim();
+  const key = normalizeSecret(process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN);
   if (!key) {
     throw new Error(
       'Decodo: set DECODO_API_KEY (dashboard → API / Public API key). Legacy POST /v1/auth was removed; see https://help.decodo.com/reference/public-api-key-authentication'
     );
   }
-  const scheme = (process.env.DECODO_AUTH_SCHEME || 'bearer').toLowerCase();
+  const scheme = (process.env.DECODO_AUTH_SCHEME || 'raw').toLowerCase();
   if (scheme === 'raw') {
     return { Authorization: key };
+  }
+  if (scheme === 'bearer') {
+    if (key.toLowerCase().startsWith('bearer ')) return { Authorization: key };
+    return { Authorization: `Bearer ${key}` };
   }
   if (scheme === 'token') {
     return { Authorization: `Token ${key}` };
   }
-  if (key.toLowerCase().startsWith('bearer ')) {
-    return { Authorization: key };
-  }
-  return { Authorization: `Bearer ${key}` };
+  return { Authorization: key };
 }
 
 function stableSubuserUsername(clientId, instagramUsername) {
@@ -132,11 +148,20 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   const subPassword = randomSubuserPassword();
   const serviceType = (process.env.DECODO_SUBUSER_SERVICE_TYPE || 'residential_proxies').trim();
 
-  await httpsJson('POST', `${API_BASE}/v2/sub-users`, authHeaders, {
-    username: subUsername,
-    password: subPassword,
-    service_type: serviceType,
-  });
+  try {
+    await httpsJson('POST', `${API_BASE}/v2/sub-users`, authHeaders, {
+      username: subUsername,
+      password: subPassword,
+      service_type: serviceType,
+    });
+  } catch (e) {
+    if (e && e.statusCode === 401) {
+      const extra =
+        ' Decodo expects the raw key in Authorization by default. If you still see 401, try DECODO_AUTH_SCHEME=bearer, or paste the exact header into DECODO_AUTHORIZATION. Confirm the key is the Proxy Public API key (Settings → API keys), not a scraper-only key.';
+      e.message = (e.message || 'Decodo 401') + extra;
+    }
+    throw e;
+  }
 
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
   const providerRef = {
@@ -151,8 +176,8 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
 
 function isDecodoAutoConfigured() {
   if (process.env.DECODO_DISABLE_AUTO === '1' || process.env.DECODO_DISABLE_AUTO === 'true') return false;
-  const key = (process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN || '').trim();
-  const auth = (process.env.DECODO_AUTHORIZATION || '').trim();
+  const key = normalizeSecret(process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN);
+  const auth = normalizeSecret(process.env.DECODO_AUTHORIZATION);
   return !!(key || auth);
 }
 
