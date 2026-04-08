@@ -122,10 +122,19 @@ function getDecodoAuthHeaders() {
   return { Authorization: key };
 }
 
+/** @returns {number} Total max length for compact sub-user usernames (6–64). Default 32 — avoids Decodo generic 400 on long names. */
+function getCompactSubuserUsernameMaxTotal() {
+  const maxTotalRaw = (process.env.DECODO_SUBUSER_USERNAME_MAX_LEN || '32').trim();
+  let maxTotal = parseInt(maxTotalRaw, 10);
+  if (!Number.isFinite(maxTotal)) maxTotal = 32;
+  return Math.min(64, Math.max(6, maxTotal));
+}
+
 /**
- * Stable per (clientId, ig). Default `compact`: one letter prefix + hex (6–64 chars, letters+digits) — avoids `skm…` / `skm_…`
- * shapes that some Decodo accounts reject on POST /v2/sub-users.
- * Set DECODO_SUBUSER_USERNAME_PREFIX (1–3 letters, default `u`) or DECODO_SUBUSER_USERNAME_MODE=legacy for `skm_` + 18 hex.
+ * Stable per (clientId, ig). Default `compact`: one letter prefix + hex — avoids `skm…` / `skm_…` shapes that some
+ * Decodo accounts reject on POST /v2/sub-users.
+ * Default max length **32** (not 64): Decodo often returns generic 400 for 64-char usernames despite docs saying ≤64.
+ * Set DECODO_SUBUSER_USERNAME_MAX_LEN (6–64), DECODO_SUBUSER_USERNAME_PREFIX (1–3 letters), or legacy mode for `skm_` + 18 hex.
  */
 function stableSubuserUsername(clientId, instagramUsername) {
   const ig = String(instagramUsername || '')
@@ -142,8 +151,9 @@ function stableSubuserUsername(clientId, instagramUsername) {
   let prefix = (process.env.DECODO_SUBUSER_USERNAME_PREFIX || 'u').trim().toLowerCase();
   prefix = prefix.replace(/[^a-z]/g, '').slice(0, 3);
   if (!prefix) prefix = 'u';
-  const maxTail = Math.min(digest.length, 64 - prefix.length);
-  return `${prefix}${digest.slice(0, maxTail)}`;
+  const maxTotal = getCompactSubuserUsernameMaxTotal();
+  const maxTail = Math.min(digest.length, maxTotal - prefix.length);
+  return `${prefix}${digest.slice(0, Math.max(0, maxTail))}`;
 }
 
 /**
@@ -387,7 +397,7 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     if (e.statusCode === 400) {
       e.message =
         (e.message || 'Decodo 400') +
-        ' Common causes: wrong service_type (we retry alternate when env service type is unset), username/password rules, or trial/API restrictions. Set DECODO_DEBUG=1 on the VPS to log create attempts (lengths only).';
+        ' Common causes: wrong service_type (we retry alternate when env service type is unset), username length (default max 32 chars for compact — set DECODO_SUBUSER_USERNAME_MAX_LEN), password rules, or trial/API restrictions. With DECODO_DEBUG=1, error response bodies and POST lengths are logged.';
       await appendDecodoDiagnostics(e, authHeaders, serviceType, subscription);
     }
     return e;
@@ -478,12 +488,14 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   }
 
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
+  const legacyMode = (process.env.DECODO_SUBUSER_USERNAME_MODE || 'compact').toLowerCase() === 'legacy';
   const providerRef = {
     decodo_subuser: subUsername,
     gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
     gate_port: process.env.DECODO_GATE_PORT || '10001',
     service_type: serviceType,
     username_mode: (process.env.DECODO_SUBUSER_USERNAME_MODE || 'compact').toLowerCase(),
+    username_max_total: legacyMode ? undefined : getCompactSubuserUsernameMaxTotal(),
     api: 'v2',
   };
   return { proxyUrl, providerRef };
@@ -500,4 +512,5 @@ module.exports = {
   provisionDecodoSubuserProxy,
   isDecodoAutoConfigured,
   stableSubuserUsername,
+  getCompactSubuserUsernameMaxTotal,
 };
