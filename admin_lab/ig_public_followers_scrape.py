@@ -193,7 +193,7 @@ def node_to_row(node: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
-async def run_scrape(username: str, proxy: str, max_users: int, output: str) -> int:
+async def run_scrape(username: str, proxy: str, max_users: int, output: str, user_id: Optional[str] = None) -> int:
     doc_id = (os.getenv("ADMIN_LAB_IG_DOC_ID_FOLLOWERS") or "").strip()
     if not doc_id:
         print("ADMIN_LAB_IG_DOC_ID_FOLLOWERS is required", file=sys.stderr)
@@ -208,7 +208,9 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str) -> 
         follow_redirects=True,
         timeout=httpx.Timeout(90.0),
     ) as client:
-        uid = await fetch_profile_user_id(client, username)
+        uid = user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
+        if not uid:
+            uid = await fetch_profile_user_id(client, username)
         sys.stderr.write(f"[admin-lab] Resolved @{username} -> id={uid}\n")
 
         after: Optional[str] = None
@@ -254,13 +256,22 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str) -> 
 def main() -> None:
     p = argparse.ArgumentParser(description="Instagram public followers scrape (login-less, lab)")
     p.add_argument("--username", required=True)
+    p.add_argument("--user_id", required=False, help="Optional: bypass web_profile_info lookup (use numeric IG user id)")
     p.add_argument("--proxy", required=True, help="HTTP proxy URL, e.g. http://user:pass@host:port")
     p.add_argument("--max_users", type=int, default=500)
     p.add_argument("--output", required=True, help="Output CSV path")
     args = p.parse_args()
 
     t0 = time.time()
-    n = asyncio.run(run_scrape(args.username.strip().lstrip("@"), args.proxy.strip(), int(args.max_users), args.output))
+    n = asyncio.run(
+        run_scrape(
+            args.username.strip().lstrip("@"),
+            args.proxy.strip(),
+            int(args.max_users),
+            args.output,
+            args.user_id,
+        )
+    )
     sys.stderr.write(f"[admin-lab] Done: {n} users in {time.time() - t0:.1f}s -> {args.output}\n")
     print(f"ROWCOUNT={n}")
 
