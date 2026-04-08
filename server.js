@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
-const { rateLimit } = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const {
   isSupabaseConfigured,
@@ -111,9 +111,9 @@ const followUpLimiter = rateLimit({
   limit: Math.max(10, parseInt(process.env.FOLLOW_UP_RATE_LIMIT_PER_MIN || '60', 10) || 60),
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => {
+  keyGenerator: (req, res) => {
     const id = (req.body?.clientId || '').toString().trim();
-    return id ? `fu:${id}` : `fu:ip:${req.ip || 'unknown'}`;
+    return id ? `fu:${id}` : `fu:ip:${ipKeyGenerator(req, res)}`;
   },
 });
 
@@ -122,9 +122,9 @@ const connectLimiter = rateLimit({
   limit: Math.max(5, parseInt(process.env.IG_CONNECT_RATE_LIMIT_PER_15MIN || '20', 10) || 20),
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => {
+  keyGenerator: (req, res) => {
     const id = (req.body?.clientId || '').toString().trim();
-    return id ? `ig:${id}` : `ig:ip:${req.ip || 'unknown'}`;
+    return id ? `ig:${id}` : `ig:ip:${ipKeyGenerator(req, res)}`;
   },
 });
 
