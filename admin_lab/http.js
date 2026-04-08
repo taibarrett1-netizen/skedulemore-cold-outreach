@@ -18,6 +18,8 @@ const PENDING_ADMIN_LAB_2FA_TTL_MS = 10 * 60 * 1000;
 
 /** jobId -> { status, rowCount?, error?, downloadToken?, stderrTail?, createdAt, startedAt?, finishedAt? } */
 const scrapeJobs = new Map();
+/** jobId -> { status, userId?, cached?, expiresAt?, error?, stderrTail?, targetUsername?, createdAt, startedAt?, finishedAt? } */
+const resolveJobs = new Map();
 const labDownloadTokens = new Map(); // token -> { filePath, expiresAt }
 
 let adminLabSenderBusy = false;
@@ -371,6 +373,11 @@ function registerAdminLabRoutes(app) {
     res.json({ ok: true, jobId });
   });
 
+  /**
+   * Start username→user_id resolve in the background (returns jobId immediately).
+   * Long-running work must not block HTTP handlers: Supabase Edge has a short wall-clock limit, so the
+   * dashboard polls GET /api/admin-lab/scrape/resolve/status instead of waiting on this POST.
+   */
   app.post('/api/admin-lab/scrape/resolve', requireAdminLabSecret, (req, res) => {
     const { targetUsername, proxyUrl } = req.body || {};
     const un = typeof targetUsername === 'string' ? targetUsername.trim().replace(/^@/, '') : '';
@@ -392,9 +399,19 @@ function registerAdminLabRoutes(app) {
       });
     }
 
+    const jobId = crypto.randomBytes(12).toString('hex');
+    const startedAt = Date.now();
     const py = process.env.ADMIN_LAB_PYTHON || 'python3';
     const args = [PYTHON_SCRIPT, '--resolve_only', '--username', un, '--proxy', proxy];
+
+    resolveJobs.set(jobId, {
+      status: 'running',
+      targetUsername: un,
+      createdAt: startedAt,
+      startedAt,
+    });
     adminLabResolveBusy = true;
+
     const child = spawn(py, args, {
       cwd: projectRoot,
       env: { ...process.env },
@@ -422,27 +439,75 @@ function registerAdminLabRoutes(app) {
     child.on('error', (err) => {
       clearTimeout(killTimer);
       adminLabResolveBusy = false;
-      console.error('[admin-lab] resolve spawn error', err);
-      return res.status(500).json({ ok: false, error: err.message || String(err) });
+      console.error('[admin-lab] resolve spawn error', jobId, err);
+      resolveJobs.set(jobId, {
+        status: 'failed',
+        error: err.message || String(err),
+        stderrTail: stderrBuf.slice(-2000),
+        finishedAt: Date.now(),
+        targetUsername: un,
+        createdAt: startedAt,
+        startedAt,
+      });
     });
 
     child.on('close', (code) => {
       clearTimeout(killTimer);
       adminLabResolveBusy = false;
+      const finishedAt = Date.now();
       const parsed = parseAdminLabResolveStdout(stdoutBuf);
       if (parsed && parsed.ok && parsed.userId) {
-        return res.json({
-          ok: true,
+        resolveJobs.set(jobId, {
+          status: 'done',
           userId: String(parsed.userId),
           cached: !!parsed.cached,
           expiresAt: typeof parsed.expiresAt === 'string' ? parsed.expiresAt : undefined,
+          stderrTail: stderrBuf.slice(-2000),
+          finishedAt,
+          targetUsername: un,
+          createdAt: startedAt,
+          startedAt,
         });
+        return;
       }
       const errMsg =
         (parsed && parsed.error) ||
         stderrBuf.slice(-1500) ||
         `Python exited with code ${code}`;
-      return res.status(500).json({ ok: false, error: errMsg });
+      if (code !== 0) {
+        console.error(
+          `[admin-lab] resolve python exit ${code} job=${jobId} user=${un}`,
+          stderrBuf ? `\n${stderrBuf.slice(-2000)}` : '',
+        );
+      }
+      resolveJobs.set(jobId, {
+        status: 'failed',
+        error: errMsg,
+        stderrTail: stderrBuf.slice(-2000),
+        finishedAt,
+        targetUsername: un,
+        createdAt: startedAt,
+        startedAt,
+      });
+    });
+
+    res.json({ ok: true, jobId });
+  });
+
+  app.get('/api/admin-lab/scrape/resolve/status', requireAdminLabSecret, (req, res) => {
+    const jobId = String(req.query.jobId || '').trim();
+    if (!jobId) return res.status(400).json({ ok: false, error: 'jobId query parameter required' });
+    const job = resolveJobs.get(jobId);
+    if (!job) return res.status(404).json({ ok: false, error: 'Unknown jobId' });
+    return res.json({
+      ok: true,
+      status: job.status,
+      userId: job.userId,
+      cached: job.cached,
+      expiresAt: job.expiresAt,
+      error: job.error,
+      stderrTail: job.stderrTail,
+      targetUsername: job.targetUsername,
     });
   });
 
