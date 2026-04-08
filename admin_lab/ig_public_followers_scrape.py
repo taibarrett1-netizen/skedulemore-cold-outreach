@@ -14,6 +14,7 @@ import csv
 import json
 import os
 import random
+import re
 import sys
 import time
 from http.cookies import SimpleCookie
@@ -89,18 +90,71 @@ def walk_find_page_info(obj: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_user_id_from_html(html: str) -> Optional[str]:
+    """Best-effort parse of profile HTML / embedded JSON (when API is 429)."""
+    if not html or len(html) < 200:
+        return None
+    patterns = [
+        r'"profilePage_(\d{5,20})"',
+        r'"user_id"\s*:\s*"(\d{5,20})"',
+        r'"id"\s*:\s*"(\d{5,20})"\s*,\s*"username"',
+        r'"target_user_id"\s*:\s*"(\d{5,20})"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def fetch_user_id_from_profile_html(
+    client: httpx.AsyncClient,
+    username: str,
+    cookie_header: Optional[str],
+) -> Optional[str]:
+    url = f"https://www.instagram.com/{username}/"
+    headers: Dict[str, str] = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    try:
+        r = await client.get(url, headers=headers, timeout=45.0, follow_redirects=True)
+        if r.status_code >= 400:
+            return None
+        return _extract_user_id_from_html(r.text)
+    except Exception:
+        return None
+
+
 async def fetch_profile_user_id(
     client: httpx.AsyncClient,
     username: str,
     cookie_header: Optional[str] = None,
 ) -> str:
-    urls = [
-        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
-        f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
-    ]
+    # With session cookies, www-only tends to 429 less than i.instagram.com.
+    if cookie_header:
+        urls = [
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        ]
+        max_attempts = 7
+    else:
+        urls = [
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+            f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        ]
+        max_attempts = 4
     last_err: Optional[Exception] = None
     for url in urls:
-        for attempt in range(4):
+        for attempt in range(max_attempts):
             try:
                 headers = base_headers()
                 headers["Referer"] = f"https://www.instagram.com/{username}/"
@@ -112,7 +166,10 @@ async def fetch_profile_user_id(
                 r = await client.get(url, headers=headers, timeout=45.0)
                 if r.status_code == 429:
                     last_err = RuntimeError(f"HTTP 429 from web_profile_info ({url})")
-                    await asyncio.sleep(2 ** attempt + random.uniform(1, 4))
+                    # Longer cool-off — IG rate-limits this endpoint aggressively.
+                    wait = min(120.0, 8.0 * (1.6**attempt) + random.uniform(2, 12))
+                    sys.stderr.write(f"[admin-lab] web_profile_info 429, sleeping {wait:.1f}s\n")
+                    await asyncio.sleep(wait)
                     continue
                 if r.status_code >= 400:
                     body_preview = r.text[:240].replace("\n", " ")
@@ -133,6 +190,11 @@ async def fetch_profile_user_id(
             except Exception as e:
                 last_err = e
                 await asyncio.sleep(1.5 ** attempt + random.uniform(0.2, 1))
+    if cookie_header:
+        sys.stderr.write("[admin-lab] web_profile_info exhausted; trying profile HTML parse for user id\n")
+        html_uid = await fetch_user_id_from_profile_html(client, username, cookie_header)
+        if html_uid:
+            return str(html_uid)
     raise RuntimeError(f"web_profile_info failed: {last_err}")
 
 
