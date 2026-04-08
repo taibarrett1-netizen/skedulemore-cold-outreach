@@ -13,6 +13,7 @@ function httpsJson(method, path, headers, bodyObj) {
     const body = bodyObj != null ? JSON.stringify(bodyObj) : null;
     const hdr = {
       Accept: 'application/json',
+      'User-Agent': 'SkeduleMore-cold-dm/1',
       ...headers,
     };
     if (body !== null) {
@@ -148,11 +149,59 @@ function buildProxyUrlFromCredentials(username, password) {
   return `http://${u}:${p}@${host}:${port}`;
 }
 
+function unwrapArray(body) {
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.data)) return body.data;
+  if (body && Array.isArray(body.results)) return body.results;
+  return [];
+}
+
 /** @returns {Promise<Array<{ id?: number, username?: string }>>} */
 async function listDecodoSubUsers(authHeaders, serviceType) {
   const q = new URLSearchParams({ service_type: serviceType }).toString();
   const { body } = await httpsJson('GET', `${API_BASE}/v2/sub-users?${q}`, authHeaders, null);
-  return Array.isArray(body) ? body : [];
+  return unwrapArray(body);
+}
+
+/** @returns {Promise<object|null>} */
+async function fetchDecodoSubscription(authHeaders) {
+  try {
+    const { body } = await httpsJson('GET', `${API_BASE}/v2/subscriptions`, authHeaders, null);
+    return body && typeof body === 'object' ? body : null;
+  } catch (e) {
+    return { _fetchFailed: true, _statusCode: e.statusCode, _message: e.message || String(e) };
+  }
+}
+
+/**
+ * Explicit DECODO_SUBUSER_SERVICE_TYPE wins. Otherwise use service_type from GET /v2/subscriptions
+ * (posting the wrong type — e.g. residential vs shared — often yields a generic 400).
+ */
+function resolveServiceType(envOverride, subscription) {
+  const explicit = (envOverride || '').trim();
+  if (explicit) return explicit;
+  if (subscription && !subscription._fetchFailed && subscription.service_type) {
+    const st = String(subscription.service_type).trim();
+    if (st) return st;
+  }
+  return 'residential_proxies';
+}
+
+async function appendDecodoDiagnostics(err, authHeaders, serviceType, subscription) {
+  const parts = [];
+  if (subscription && subscription._fetchFailed) {
+    parts.push(`subscription=unavailable(${(subscription._message || '').slice(0, 120)})`);
+  } else if (subscription) {
+    parts.push(`subscription.service_type=${subscription.service_type}`);
+    parts.push(`users_limit=${subscription.users_limit}`);
+  }
+  try {
+    const n = (await listDecodoSubUsers(authHeaders, serviceType)).length;
+    parts.push(`sub_users_for_service_type=${n}`);
+  } catch (le) {
+    parts.push(`list_sub_users_failed=${(le.message || '').slice(0, 80)}`);
+  }
+  err.message = `${err.message} | ${parts.join('; ')}`;
 }
 
 async function putDecodoSubUserPassword(authHeaders, subUserId, password) {
@@ -169,9 +218,11 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   const authHeaders = getDecodoAuthHeaders();
   const subUsername = stableSubuserUsername(clientId, instagramUsername);
   const subPassword = randomSubuserPassword();
-  const serviceType = (process.env.DECODO_SUBUSER_SERVICE_TYPE || 'residential_proxies').trim();
 
-  const enrichError = (e) => {
+  const subscription = await fetchDecodoSubscription(authHeaders);
+  const serviceType = resolveServiceType(process.env.DECODO_SUBUSER_SERVICE_TYPE, subscription);
+
+  const enrichError = async (e) => {
     if (!e || e.decodoEnriched) return e;
     e.decodoEnriched = true;
     if (e.statusCode === 401) {
@@ -180,12 +231,15 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
       e.message = (e.message || 'Decodo 401') + extra;
     }
     if (e.statusCode === 400) {
-      const extra400 =
-        ' Read the JSON above: an "error" field often names username/password/service_type. Try DECODO_SUBUSER_SERVICE_TYPE=shared_proxies if you do not have residential. If the sub-user already existed, we retry with PUT; otherwise fix validation or remove the conflicting user in the Decodo dashboard.';
-      e.message = (e.message || 'Decodo 400') + extra400;
+      e.message =
+        (e.message || 'Decodo 400') +
+        ' If JSON has no "error" field: unset DECODO_SUBUSER_SERVICE_TYPE so we read service_type from GET /v2/subscriptions, or set it to match your plan (residential_proxies vs shared_proxies).';
+      await appendDecodoDiagnostics(e, authHeaders, serviceType, subscription);
     }
     return e;
   };
+
+  const usersLimit = subscription && subscription.users_limit != null ? parseInt(subscription.users_limit, 10) : NaN;
 
   try {
     let rows = [];
@@ -194,6 +248,15 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     } catch (_) {
       rows = [];
     }
+
+    if (Number.isFinite(usersLimit) && rows.length >= usersLimit) {
+      const err = new Error(
+        `Decodo: sub-user limit reached (${rows.length}/${usersLimit}). Remove a sub-user in the Decodo dashboard or upgrade the plan.`
+      );
+      err.statusCode = 400;
+      throw await enrichError(err);
+    }
+
     const existing = rows.find((r) => r && String(r.username) === subUsername);
 
     if (existing && existing.id != null) {
@@ -217,15 +280,16 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
           if (found && found.id != null) {
             await putDecodoSubUserPassword(authHeaders, found.id, subPassword);
           } else {
-            throw enrichError(postErr);
+            throw await enrichError(postErr);
           }
         } else {
-          throw enrichError(postErr);
+          throw await enrichError(postErr);
         }
       }
     }
   } catch (e) {
-    throw enrichError(e);
+    if (e && !e.decodoEnriched) await enrichError(e);
+    throw e;
   }
 
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
