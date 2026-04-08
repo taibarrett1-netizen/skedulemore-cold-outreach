@@ -416,9 +416,23 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
-async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null, messageGroupMessageId = null, failureReason = null) {
+/**
+ * @param {{ skipDailyStats?: boolean }} [options] - If skipDailyStats, insert cold_dm_sent_messages only (e.g. pre-send blocklist skip).
+ */
+async function logSentMessage(
+  clientId,
+  username,
+  message,
+  status = 'success',
+  campaignId = null,
+  messageGroupId = null,
+  messageGroupMessageId = null,
+  failureReason = null,
+  options = {}
+) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const skipDailyStats = options && options.skipDailyStats === true;
   const u = normalizeUsername(username);
   const date = await getTodayForClient(clientId);
   const insertPayload = {
@@ -433,6 +447,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
   if (status === 'failed' && failureReason) insertPayload.failure_reason = failureReason;
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
+  if (skipDailyStats) return;
 
   // Optimistic CAS retry to avoid lost updates under concurrent writes.
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -1826,6 +1841,17 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       if (scrapeBlocklistSet.has(unameNorm)) {
         dbg.skippedBlocklist += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'failed', 'blocklist').catch(() => {});
+        await logSentMessage(
+          clientId,
+          leadData.username,
+          messageText || null,
+          'failed',
+          camp.id,
+          camp.message_group_id || null,
+          messageGroupMessageId || null,
+          'blocklist',
+          { skipDailyStats: true }
+        ).catch((e) => console.error('[getNextPendingCampaignLead] logSentMessage blocklist', e && e.message));
         continue;
       }
       const sent = await alreadySent(clientId, leadData.username);
