@@ -198,10 +198,51 @@ function randomSubuserPassword() {
   return out;
 }
 
-function buildProxyUrlFromCredentials(username, password) {
+/**
+ * Decodo residential gate auth: username line should start with `user-` + sub-user name (see help.decodo.com residential user:pass).
+ * Set DECODO_GATE_USERNAME_PREFIX= (empty) only if your plan uses raw sub-user names without the prefix.
+ */
+function getDecodoGateUsernamePrefix() {
+  const raw = process.env.DECODO_GATE_USERNAME_PREFIX;
+  if (raw === undefined || raw === null) return 'user-';
+  return String(raw).trim();
+}
+
+/** Stable alphanumeric id for sticky session (same client + IG → same egress IP while session lives). */
+function stickySessionKeyForAssignment(clientId, instagramUsername) {
+  const ig = String(instagramUsername || '')
+    .trim()
+    .replace(/^@/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .slice(0, 24);
+  return crypto.createHash('sha256').update(`${clientId}:${ig}`).digest('hex').slice(0, 12);
+}
+
+/**
+ * @param {string} username - Decodo sub-user name (API), without gate prefix
+ * @param {object} [opts]
+ * @param {string} [opts.gateUsernamePrefix] - override env prefix
+ * @param {string|null} [opts.stickySessionId] - if set with stickyDurationMinutes, appends -session-{id}-sessionduration-{m}
+ * @param {number|null} [opts.stickyDurationMinutes] - 1–1440
+ */
+function buildProxyUrlFromCredentials(username, password, opts = {}) {
   const host = (process.env.DECODO_GATE_HOST || 'gate.decodo.com').trim();
   const port = String(process.env.DECODO_GATE_PORT || '10001').trim();
-  const u = encodeURIComponent(username);
+  let user = String(username || '').trim();
+  const prefixRaw = opts.gateUsernamePrefix !== undefined ? opts.gateUsernamePrefix : getDecodoGateUsernamePrefix();
+  if (prefixRaw) {
+    const pref = prefixRaw.endsWith('-') ? prefixRaw : `${prefixRaw}-`;
+    if (!user.startsWith(pref)) user = `${pref}${user}`;
+  }
+  const sid = opts.stickySessionId;
+  let mins = opts.stickyDurationMinutes;
+  if (mins != null) mins = parseInt(String(mins), 10);
+  if (sid && Number.isFinite(mins) && mins >= 1 && mins <= 1440) {
+    const safe = String(sid).replace(/[^a-zA-Z0-9]/g, '').slice(0, 32) || 'skm';
+    user = `${user}-session-${safe}-sessionduration-${Math.floor(mins)}`;
+  }
+  const u = encodeURIComponent(user);
   const p = encodeURIComponent(password);
   return `http://${u}:${p}@${host}:${port}`;
 }
@@ -501,10 +542,22 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     throw e;
   }
 
-  const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
+  const stickyOff = process.env.DECODO_STICKY_SESSION === '0' || process.env.DECODO_STICKY_SESSION === 'false';
+  const useSticky = !stickyOff && serviceType === 'residential_proxies';
+  let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '180', 10);
+  if (!Number.isFinite(stickyMins)) stickyMins = 180;
+  stickyMins = Math.min(1440, Math.max(1, stickyMins));
+  const stickyKey = useSticky ? stickySessionKeyForAssignment(clientId, instagramUsername) : null;
+  const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword, {
+    stickySessionId: stickyKey,
+    stickyDurationMinutes: stickyKey ? stickyMins : null,
+  });
   const legacyMode = (process.env.DECODO_SUBUSER_USERNAME_MODE || 'compact').toLowerCase() === 'legacy';
   const providerRef = {
     decodo_subuser: subUsername,
+    gate_username_prefix: getDecodoGateUsernamePrefix() || undefined,
+    sticky_session: stickyKey ? stickyKey : undefined,
+    sticky_session_duration_minutes: stickyKey ? stickyMins : undefined,
     gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
     gate_port: process.env.DECODO_GATE_PORT || '10001',
     service_type: serviceType,
@@ -527,4 +580,7 @@ module.exports = {
   isDecodoAutoConfigured,
   stableSubuserUsername,
   getCompactSubuserUsernameMaxTotal,
+  buildProxyUrlFromCredentials,
+  getDecodoGateUsernamePrefix,
+  stickySessionKeyForAssignment,
 };

@@ -52,6 +52,13 @@ This document is for integrating **Cold DM / Cold Outreach** into your **AI sett
 
 **Implementation note:** The Cold DM repo (VPS) must be adapted to: (a) accept the one-time connect endpoint, (b) persist only session data to Supabase, and (c) read session from Supabase when running the bot. The current repo uses .env for credentials; for this integration that is replaced by “session in Supabase, password only in memory during connect.”
 
+### 4a. Residential proxy, sticky IP, and improving password-only (no 2FA) success
+
+- **Why VPS “just worked” but residential is harder:** A **stable datacenter IP** you already used can already be “familiar” to Meta. **Residential** is better for **one IP per account**, but **rotating** exits look like a new network every request — that raises risk. **2FA** is a strong trust signal; not every Instagram account has it enabled.
+- **Sticky session:** For Decodo residential, a **sticky** session keeps the **same egress IP** for up to N minutes (see [Decodo sticky sessions](https://help.decodo.com/docs/residential-proxy-custom-sticky-sessions)). The Cold DM module appends `-session-{stableId}-sessionduration-{minutes}` to the **gate** username for **residential** auto-provision (defaults in `.env.example`: `DECODO_STICKY_SESSION`, `DECODO_STICKY_SESSION_DURATION_MINUTES`). The gate username also uses Decodo’s **`user-` prefix** by default (`DECODO_GATE_USERNAME_PREFIX`). **Reconnect** an account after upgrading the VPS so `proxy_url` in Supabase is regenerated with the new format.
+- **Browser warmup (do this):** On a normal machine, configure **Chrome or Firefox** to use the **same HTTP proxy URL** the bot will use for that Instagram account (copy `proxy_url` from `cold_dm_instagram_sessions` or your `cold_dm_proxy_assignments` row after provision). Open **https://www.instagram.com**, sign in, and complete any **suspicious activity / checkpoint** UI. That ties **human + that IP** once; then run **Connect** on the VPS (same sticky assignment) so Puppeteer reuses a consistent path. Optional: use a privacy/incognito window with only that proxy profile so you do not leak your home IP in the same session.
+- **Tuning:** Increase `DECODO_STICKY_SESSION_DURATION_MINUTES` (up to 1440), add **country** targeting via Decodo’s docs if accounts expect a fixed geo, and keep **delays** reasonable on Connect. If Meta still blocks automation-only logins, **2FA at connect time** remains the most reliable fallback.
+
 ---
 
 ## 5. Supabase Schema (Same Project as Setter)

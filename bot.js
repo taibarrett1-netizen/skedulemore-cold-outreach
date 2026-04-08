@@ -110,6 +110,86 @@ function wantsVoiceNotes(sendOpts = {}) {
   return !!((sendOpts.voiceNotePath || '').trim());
 }
 
+/** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
+function instagramAuthUrlFailureReason(url) {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    if (path.includes('/accounts/login')) return null;
+    if (path.includes('/challenge')) {
+      return 'Instagram opened a security challenge (/challenge). Complete it in a normal browser, then retry Connect.';
+    }
+    if (path.includes('/checkpoint')) {
+      return 'Instagram requires a checkpoint. Open instagram.com in a normal browser, finish the security step, then retry.';
+    }
+    if (path.includes('/accounts/suspended') || path.includes('/accounts/disabled')) {
+      return 'Instagram shows this account as suspended or disabled.';
+    }
+    if (path.includes('/accounts/recovery')) {
+      return 'Instagram is asking for account recovery.';
+    }
+  } catch (_) {}
+  return null;
+}
+
+/** Visible copy that often appears when Meta blocks or challenges the login (feed can load URL=/ while this shows). */
+async function detectInstagramDomBlockAfterLogin(page) {
+  return page.evaluate(() => {
+    const chunks = [];
+    if (document.body) chunks.push(document.body.innerText || '');
+    document.querySelectorAll('[role="dialog"], [role="alertdialog"]').forEach((el) => {
+      chunks.push(el.textContent || '');
+    });
+    const t = chunks.join('\n').toLowerCase();
+    const patterns = [
+      'we detected an unusual login',
+      'unusual login attempt',
+      'suspicious login',
+      'blocked your attempt',
+      'couldn\'t log you in',
+      'there was a problem logging you',
+      'confirm it\'s you',
+      'help us confirm you own',
+      'help us confirm',
+      'verify this was you',
+      'temporarily locked',
+      'temporarily blocked',
+      'your account has been disabled',
+      'we suspended your account',
+    ];
+    for (const p of patterns) {
+      if (t.includes(p)) return p;
+    }
+    return null;
+  });
+}
+
+async function pageHasInstagramSessionCookie(page) {
+  const cookies = await page.cookies();
+  return cookies.some((c) => c.name === 'sessionid' && c.value && String(c.value).length >= 8);
+}
+
+/**
+ * After navigation away from the login form, ensure we are not on a challenge URL, no block modal text,
+ * and Instagram set a web session cookie — otherwise the dashboard would show "connected" incorrectly.
+ */
+async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
+  const url = page.url();
+  const urlReason = instagramAuthUrlFailureReason(url);
+  if (urlReason) throw new Error(urlReason);
+  const domHit = await detectInstagramDomBlockAfterLogin(page);
+  if (domHit) {
+    throw new Error(
+      `Instagram blocked or challenged this login (${domHit}). Log in once in Chrome/Firefox (same network if possible), complete any prompt, or use 2FA — then retry Connect.`
+    );
+  }
+  const hasSession = await pageHasInstagramSessionCookie(page);
+  if (!hasSession) {
+    throw new Error(
+      `No Instagram session cookie after ${contextLabel || 'login'}. The session was not established (blocked, incomplete, or verification required).`
+    );
+  }
+}
+
 function buildVoiceSendConfig(sendOpts = {}) {
   const modeRaw = String(sendOpts.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').toLowerCase();
   const mode = modeRaw === 'voice_only' ? 'voice_only' : 'after_text';
@@ -463,6 +543,7 @@ async function login(page, credentials) {
     logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
     throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
+  await assertHealthyInstagramSessionOrThrow(page, 'login');
   logger.log('Logged in to Instagram.');
 }
 
@@ -2097,6 +2178,7 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
     if (dismissed) await delay(2000);
     else break;
   }
+  await assertHealthyInstagramSessionOrThrow(page, '2FA');
   const cookies = await page.cookies();
   await browser.close().catch(() => {});
   logger.log('2FA completed, session saved.');
