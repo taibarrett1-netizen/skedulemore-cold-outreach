@@ -79,6 +79,37 @@ async function loadLabSession() {
   }
 }
 
+function hasSessionIdCookie(cookies) {
+  if (!Array.isArray(cookies)) return false;
+  return cookies.some((c) => c && c.name === 'sessionid' && c.value);
+}
+
+/**
+ * bot.js logs "Logged in" when the URL no longer contains /accounts/login — that can still be a
+ * challenge/suspension page without sessionid. Load home and wait until sessionid exists or fail clearly.
+ */
+async function waitForWebSessionOrThrow(page) {
+  const deadline = Date.now() + 45000;
+  await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 45000 }).catch(() => {});
+  while (Date.now() < deadline) {
+    const cookies = await page.cookies();
+    if (hasSessionIdCookie(cookies)) return cookies;
+    const u = page.url();
+    if (u.includes('/accounts/login') || u.includes('/challenge') || u.includes('/suspended')) {
+      const snippet = await page.evaluate(() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400)).catch(() => '');
+      throw new Error(
+        `Instagram did not establish a web session (no sessionid cookie). Final URL: ${u}. ${snippet ? `Page: ${snippet.replace(/\s+/g, ' ').slice(0, 200)}` : ''} Open Instagram in a normal browser, approve "This was me" / complete any check, then Connect again with the same proxy.`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  const cookies = await page.cookies();
+  if (hasSessionIdCookie(cookies)) return cookies;
+  throw new Error(
+    'Timed out waiting for sessionid cookie after login. Instagram may require manual approval in the app or blocked this login — try again after confirming the session on a phone.',
+  );
+}
+
 /**
  * Minimal adapter so sendDM does not touch Supabase campaign state.
  */
@@ -118,7 +149,7 @@ async function adminLabConnect({ username, password, proxyUrl, twoFactorCode }) 
       password,
       twoFactorCode: twoFactorCode || undefined,
     });
-    const cookies = await page.cookies();
+    const cookies = await waitForWebSessionOrThrow(page);
     await saveAdminLabSession({
       cookies,
       username,
