@@ -195,11 +195,13 @@ function registerAdminLabRoutes(app) {
     if (!un) {
       return res.status(400).json({ ok: false, error: 'targetUsername is required' });
     }
+    const scrapeMode = (process.env.ADMIN_LAB_SCRAPE_MODE || 'graphql').trim().toLowerCase();
     const docId = (process.env.ADMIN_LAB_IG_DOC_ID_FOLLOWERS || '').trim();
-    if (!docId) {
+    if (!docId && scrapeMode !== 'api_v1') {
       return res.status(503).json({
         ok: false,
-        error: 'ADMIN_LAB_IG_DOC_ID_FOLLOWERS is not set on the VPS (GraphQL doc_id for followers edge).',
+        error:
+          'ADMIN_LAB_IG_DOC_ID_FOLLOWERS is not set (needed for graphql/auto scrape modes). For api_v1-only, set ADMIN_LAB_SCRAPE_MODE=api_v1.',
       });
     }
     const proxy =
@@ -248,7 +250,7 @@ function registerAdminLabRoutes(app) {
 
     const child = spawn(py, args, {
       cwd: projectRoot,
-      env: { ...process.env, ADMIN_LAB_IG_DOC_ID_FOLLOWERS: docId },
+      env: { ...process.env, ...(docId ? { ADMIN_LAB_IG_DOC_ID_FOLLOWERS: docId } : {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -265,10 +267,12 @@ function registerAdminLabRoutes(app) {
 
     child.on('error', (err) => {
       adminLabScrapeRunning = false;
+      const tail = stderrBuf.slice(-2000);
+      console.error('[admin-lab] scrape spawn error', jobId, err.message || err, tail ? `\nstderr: ${tail}` : '');
       scrapeJobs.set(jobId, {
         status: 'failed',
         error: err.message || String(err),
-        stderrTail: stderrBuf.slice(-2000),
+        stderrTail: tail,
         finishedAt: Date.now(),
         targetUsername: un,
         createdAt: startedAt,
@@ -280,10 +284,15 @@ function registerAdminLabRoutes(app) {
       adminLabScrapeRunning = false;
       const finishedAt = Date.now();
       if (code !== 0) {
+        const tail = stderrBuf.slice(-2000);
+        console.error(
+          `[admin-lab] scrape python exit ${code} job=${jobId} user=${un}`,
+          tail ? `\n${tail}` : '',
+        );
         scrapeJobs.set(jobId, {
           status: 'failed',
           error: `Python exited with code ${code}`,
-          stderrTail: stderrBuf.slice(-2000),
+          stderrTail: tail,
           finishedAt,
           targetUsername: un,
           createdAt: startedAt,

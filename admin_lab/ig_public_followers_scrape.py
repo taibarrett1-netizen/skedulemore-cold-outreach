@@ -287,12 +287,12 @@ def node_to_row(node: Dict[str, Any]) -> Dict[str, str]:
 
 
 async def run_scrape(username: str, proxy: str, max_users: int, output: str, user_id: Optional[str] = None) -> int:
+    mode = (os.getenv("ADMIN_LAB_SCRAPE_MODE") or "graphql").strip().lower()
     doc_id = (os.getenv("ADMIN_LAB_IG_DOC_ID_FOLLOWERS") or "").strip()
-    if not doc_id:
-        print("ADMIN_LAB_IG_DOC_ID_FOLLOWERS is required", file=sys.stderr)
+    if mode in ("graphql", "auto") and not doc_id:
+        print("ADMIN_LAB_IG_DOC_ID_FOLLOWERS is required for graphql/auto modes", file=sys.stderr)
         sys.exit(2)
 
-    mode = (os.getenv("ADMIN_LAB_SCRAPE_MODE") or "graphql").strip().lower()
     # When using api_v1, keep counts modest.
     first = min(40, max(12, int(os.getenv("ADMIN_LAB_GRAPHQL_FIRST", "40"))))
     api_count = min(50, max(12, int(os.getenv("ADMIN_LAB_API_V1_COUNT", "24"))))
