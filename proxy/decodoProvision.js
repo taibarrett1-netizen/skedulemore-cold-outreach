@@ -103,8 +103,9 @@ function getDecodoAuthHeaders() {
 }
 
 /**
- * Stable per (clientId, ig). Default `compact`: letters+digits only (no `_`) — some Decodo accounts reject `skm_…` via API.
- * Set DECODO_SUBUSER_USERNAME_MODE=legacy for old `skm_` + 18 hex (only if you already have assignments using that shape).
+ * Stable per (clientId, ig). Default `compact`: one letter prefix + hex (6–64 chars, letters+digits) — avoids `skm…` / `skm_…`
+ * shapes that some Decodo accounts reject on POST /v2/sub-users.
+ * Set DECODO_SUBUSER_USERNAME_PREFIX (1–3 letters, default `u`) or DECODO_SUBUSER_USERNAME_MODE=legacy for `skm_` + 18 hex.
  */
 function stableSubuserUsername(clientId, instagramUsername) {
   const ig = String(instagramUsername || '')
@@ -118,7 +119,11 @@ function stableSubuserUsername(clientId, instagramUsername) {
   if (legacy) {
     return `skm_${digest.slice(0, 18)}`;
   }
-  return `skm${digest.slice(0, 24)}`;
+  let prefix = (process.env.DECODO_SUBUSER_USERNAME_PREFIX || 'u').trim().toLowerCase();
+  prefix = prefix.replace(/[^a-z]/g, '').slice(0, 3);
+  if (!prefix) prefix = 'u';
+  const maxTail = Math.min(digest.length, 64 - prefix.length);
+  return `${prefix}${digest.slice(0, maxTail)}`;
 }
 
 /**
@@ -185,15 +190,29 @@ function pickSubscriptionPayload(body) {
 /** Normalize Decodo subscription shapes (top-level vs data[] vs camelCase). */
 function extractSubscriptionFields(body) {
   const p = pickSubscriptionPayload(body);
-  if (!p || typeof p !== 'object') return { service_type: undefined, users_limit: undefined, _payloadKeys: [] };
+  if (!p || typeof p !== 'object') {
+    return {
+      service_type: undefined,
+      users_limit: undefined,
+      traffic: undefined,
+      traffic_limit: undefined,
+      _payloadKeys: [],
+    };
+  }
   const st = p.service_type ?? p.serviceType ?? p.type;
   /** Residential trials use `proxy_users_limit`; older docs used `users_limit`. */
   const ul =
     p.users_limit ?? p.usersLimit ?? p.user_limit ?? p.proxy_users_limit ?? p.proxyUsersLimit ?? p.proxy_user_limit;
   const n = ul != null && ul !== '' ? parseInt(String(ul), 10) : NaN;
+  const tr = p.traffic ?? p.used_traffic ?? p.usedTraffic;
+  const tlim = p.traffic_limit ?? p.trafficLimit;
+  const traffic = tr != null && tr !== '' ? parseFloat(String(tr)) : NaN;
+  const trafficLimit = tlim != null && tlim !== '' ? parseFloat(String(tlim)) : NaN;
   return {
     service_type: st != null && st !== '' ? String(st).trim() : undefined,
     users_limit: Number.isFinite(n) ? n : undefined,
+    traffic: Number.isFinite(traffic) ? traffic : undefined,
+    traffic_limit: Number.isFinite(trafficLimit) ? trafficLimit : undefined,
     _payloadKeys: Object.keys(p),
   };
 }
@@ -208,6 +227,8 @@ async function fetchDecodoSubscription(authHeaders) {
       ...base,
       service_type: extracted.service_type,
       users_limit: Number.isFinite(extracted.users_limit) ? extracted.users_limit : undefined,
+      traffic: extracted.traffic,
+      traffic_limit: extracted.traffic_limit,
       _subscriptionPayloadKeys: extracted._payloadKeys,
     };
   } catch (e) {
@@ -325,6 +346,16 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   const subscription = await fetchDecodoSubscription(authHeaders);
   let serviceType = await resolveServiceType(process.env.DECODO_SUBUSER_SERVICE_TYPE, subscription, authHeaders);
 
+  if (process.env.DECODO_DEBUG === '1') {
+    console.error('[decodoProvision] subscription snapshot', {
+      service_type: subscription.service_type,
+      users_limit: subscription.users_limit,
+      traffic: subscription.traffic,
+      traffic_limit: subscription.traffic_limit,
+      fetchFailed: subscription._fetchFailed,
+    });
+  }
+
   const enrichError = async (e) => {
     if (!e || e.decodoEnriched) return e;
     e.decodoEnriched = true;
@@ -346,6 +377,25 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     subscription && subscription.users_limit != null && subscription.users_limit !== ''
       ? parseInt(String(subscription.users_limit), 10)
       : NaN;
+
+  const tr = subscription && subscription.traffic;
+  const trLim = subscription && subscription.traffic_limit;
+  if (
+    subscription &&
+    !subscription._fetchFailed &&
+    typeof tr === 'number' &&
+    Number.isFinite(tr) &&
+    typeof trLim === 'number' &&
+    Number.isFinite(trLim) &&
+    trLim > 0 &&
+    tr >= trLim
+  ) {
+    const err = new Error(
+      'Decodo: traffic quota appears exhausted (traffic >= traffic_limit). Add bandwidth or wait for reset, then retry.'
+    );
+    err.statusCode = 400;
+    throw await enrichError(err);
+  }
 
   try {
     let rows = [];
