@@ -174,6 +174,9 @@ app.use('/api', (req, res, next) => {
   return res.status(401).json({ error: 'Unauthorized' });
 });
 
+const { registerAdminLabRoutes } = require('./admin_lab/http');
+registerAdminLabRoutes(app);
+
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
 const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 * 1024 } });
 

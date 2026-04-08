@@ -1,0 +1,3 @@
+# Minimal deps for Admin Cold Outreach Lab follower scrape (install on the VPS).
+# pip install -r admin_lab/requirements-lab.txt
+httpx>=0.27.0
