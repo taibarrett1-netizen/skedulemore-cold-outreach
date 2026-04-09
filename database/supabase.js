@@ -1976,16 +1976,33 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
 
   const { data: existingJobs, error: existingErr } = await sb
     .from('cold_dm_send_jobs')
-    .select('campaign_lead_id')
+    .select('id, campaign_lead_id, status')
     .eq('client_id', clientId)
-    .eq('campaign_id', campaignId)
-    .in('status', ['pending', 'running', 'retry']);
+    .eq('campaign_id', campaignId);
   if (existingErr) throw existingErr;
-  const existingLeadIds = new Set((existingJobs || []).map((r) => r.campaign_lead_id).filter(Boolean));
+
+  const activeLeadIds = new Set();
+  const staleJobIds = [];
+  for (const j of existingJobs || []) {
+    if (!j.campaign_lead_id) continue;
+    if (['pending', 'running', 'retry'].includes(j.status)) {
+      activeLeadIds.add(j.campaign_lead_id);
+    } else {
+      staleJobIds.push(j.id);
+    }
+  }
+
+  if (staleJobIds.length > 0) {
+    for (let i = 0; i < staleJobIds.length; i += 200) {
+      const batch = staleJobIds.slice(i, i + 200);
+      await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+    }
+    console.log(`[syncSendJobsForCampaign] cleaned ${staleJobIds.length} stale send job(s) for campaign ${campaignId}`);
+  }
 
   const rows = [];
   for (const row of leadRows) {
-    if (!row?.id || existingLeadIds.has(row.id)) continue;
+    if (!row?.id || activeLeadIds.has(row.id)) continue;
     const username = usernameByLeadId.get(row.lead_id);
     if (!username) continue;
     rows.push({
@@ -2005,23 +2022,22 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   try {
     const { error } = await sb.from('cold_dm_send_jobs').upsert(rows, {
       onConflict: 'client_id,idempotency_key',
-      ignoreDuplicates: true,
+      ignoreDuplicates: false,
     });
     if (error) throw error;
-    return rows.length;
   } catch (e) {
     insertError = e;
   }
   if (insertError?.code === '42P10') {
-    console.error('[syncSendJobsForCampaign] ON CONFLICT index missing; falling back to individual inserts');
-    let inserted = 0;
+    console.error('[syncSendJobsForCampaign] ON CONFLICT index issue; falling back to individual inserts');
     for (const row of rows) {
-      const { error: singleErr } = await sb.from('cold_dm_send_jobs').insert(row);
-      if (!singleErr) inserted += 1;
+      await sb.from('cold_dm_send_jobs').insert(row).catch(() => {});
     }
-    return inserted;
+  } else if (insertError) {
+    throw insertError;
   }
-  throw insertError;
+  console.log(`[syncSendJobsForCampaign] created ${rows.length} send job(s) for campaign ${campaignId}`);
+  return rows.length;
 }
 
 async function syncSendJobsForClient(clientId, campaignId = null) {
