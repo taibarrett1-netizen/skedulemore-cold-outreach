@@ -92,6 +92,24 @@ function normalizeSecret(val) {
 }
 
 /**
+ * Shared gate credentials mode (cost-safe): one Decodo username/password reused for all client IG accounts,
+ * with per-account sticky session params in the proxy username.
+ *
+ * Supported env aliases:
+ * - DECODO_SHARED_USERNAME / DECODO_SHARED_PASSWORD (preferred)
+ * - DECODO_GATE_USERNAME / DECODO_GATE_PASSWORD (fallback)
+ */
+function getSharedGateCredentials() {
+  const userRaw = normalizeSecret(process.env.DECODO_SHARED_USERNAME || process.env.DECODO_GATE_USERNAME);
+  const passRaw = normalizeSecret(process.env.DECODO_SHARED_PASSWORD || process.env.DECODO_GATE_PASSWORD);
+  if (!userRaw || !passRaw) return null;
+  // Keep base username clean; buildProxyUrlFromCredentials will add prefix and routing params.
+  const user = userRaw.replace(/^user-/i, '').replace(/-country-[a-z]{2}.*$/i, '').trim();
+  if (!user) return null;
+  return { username: user, password: passRaw };
+}
+
+/**
  * Decodo OpenAPI uses `apiKey` in header `Authorization` (not necessarily RFC Bearer).
  * Sending `Bearer <key>` often yields 401 "Invalid Api key" — default is **raw key only**.
  *
@@ -262,13 +280,21 @@ function parseDecodoGateUserFromProxyUrl(proxyUrl) {
  */
 function decodoStoredProxyUrlNeedsRefresh(clientId, instagramUsername, storedProxyUrl, providerRef) {
   if (!storedProxyUrl || typeof storedProxyUrl !== 'string') return false;
-  if (providerRef && providerRef.service_type === 'shared_proxies') return false;
+  const shared = getSharedGateCredentials();
+  if (!shared && providerRef && providerRef.service_type === 'shared_proxies') return false;
 
   const isResidential = !providerRef?.service_type || providerRef.service_type === 'residential_proxies';
   if (!isResidential) return false;
 
   const gateUser = parseDecodoGateUserFromProxyUrl(storedProxyUrl);
   if (!gateUser) return false;
+
+  if (shared) {
+    const expectedPrefixRaw = getDecodoGateUsernamePrefix();
+    const expectedPrefix = expectedPrefixRaw ? (expectedPrefixRaw.endsWith('-') ? expectedPrefixRaw : `${expectedPrefixRaw}-`) : '';
+    const expectedBase = `${expectedPrefix}${shared.username}`;
+    if (!gateUser.startsWith(expectedBase)) return true;
+  }
 
   const wantCountry = getDecodoGateCountryCodeEffective();
   const mCountry = gateUser.match(/-country-([a-z]{2})(?=-|$)/);
@@ -526,9 +552,45 @@ async function createDecodoSubUser(authHeaders, username, password, primaryServi
  * If the sub-user already exists (e.g. orphaned from a failed DB write), we rotate password via PUT.
  */
 async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
-  const authHeaders = getDecodoAuthHeaders();
+  const sharedGate = getSharedGateCredentials();
   const subUsername = stableSubuserUsername(clientId, instagramUsername);
   const subPassword = randomSubuserPassword();
+
+  // Shared credentials mode: skip /v2/sub-users completely (no per-client paid Decodo users).
+  if (sharedGate) {
+    const serviceType = (process.env.DECODO_SHARED_SERVICE_TYPE || 'residential_proxies').trim() || 'residential_proxies';
+    const stickyOff = process.env.DECODO_STICKY_SESSION === '0' || process.env.DECODO_STICKY_SESSION === 'false';
+    const useSticky = !stickyOff && serviceType === 'residential_proxies';
+    let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '60', 10);
+    if (!Number.isFinite(stickyMins)) stickyMins = 60;
+    stickyMins = Math.min(1440, Math.max(30, stickyMins));
+    const stickyKey = useSticky ? stickySessionKeyForAssignment(clientId, instagramUsername) : null;
+    const proxyUrl = buildProxyUrlFromCredentials(sharedGate.username, sharedGate.password, {
+      useResidentialDefaultCountry: serviceType === 'residential_proxies',
+      stickySessionId: stickyKey,
+      stickyDurationMinutes: stickyKey ? stickyMins : null,
+    });
+    const gateCountry =
+      serviceType === 'residential_proxies'
+        ? getDecodoGateCountryCodeEffective()
+        : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY) || undefined;
+    const gateCity = serviceType === 'residential_proxies' && gateCountry ? getDecodoGateCitySlug() || undefined : undefined;
+    const providerRef = {
+      mode: 'shared_credentials',
+      gate_username_prefix: getDecodoGateUsernamePrefix() || undefined,
+      gate_country: gateCountry || undefined,
+      gate_city: gateCity,
+      sticky_session: stickyKey || undefined,
+      sticky_session_duration_minutes: stickyKey ? stickyMins : undefined,
+      gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
+      gate_port: process.env.DECODO_GATE_PORT || '10001',
+      service_type: serviceType,
+      api: 'shared-gate',
+    };
+    return { proxyUrl, providerRef };
+  }
+
+  const authHeaders = getDecodoAuthHeaders();
 
   const subscription = await fetchDecodoSubscription(authHeaders);
   let serviceType = await resolveServiceType(process.env.DECODO_SUBUSER_SERVICE_TYPE, subscription, authHeaders);
@@ -680,6 +742,8 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
 
 function isDecodoAutoConfigured() {
   if (process.env.DECODO_DISABLE_AUTO === '1' || process.env.DECODO_DISABLE_AUTO === 'true') return false;
+  const shared = getSharedGateCredentials();
+  if (shared) return true;
   const key = normalizeSecret(process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN);
   const auth = normalizeSecret(process.env.DECODO_AUTHORIZATION);
   return !!(key || auth);
@@ -698,4 +762,5 @@ module.exports = {
   getDecodoGateCitySlug,
   parseDecodoGateUserFromProxyUrl,
   decodoStoredProxyUrlNeedsRefresh,
+  getSharedGateCredentials,
 };
