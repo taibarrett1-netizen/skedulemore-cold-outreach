@@ -364,7 +364,7 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
   }
   const hasSession = await pageHasInstagramSessionCookie(page);
   if (!hasSession) {
-    if (process.env.LOGIN_DEBUG === '1' || process.env.LOGIN_DEBUG === 'true') {
+    if (envLoginDebugEnabled()) {
       const ck = await page.cookies();
       logger.error(
         `[login] Missing sessionid after ${contextLabel || 'login'}; cookie names=${ck.length ? ck.map((c) => c.name).join(', ') : '(none)'} url=${url}`
@@ -777,6 +777,29 @@ function readEnvFromFile() {
   return out;
 }
 
+/** Only explicit truthy strings enable login debug logs (avoids accidental on from PM2/env drift). */
+function envLoginDebugEnabled() {
+  const v = String(process.env.LOGIN_DEBUG ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
+ * Instagram login inputs are React-controlled. Puppeteer typing alone can leave React state stale,
+ * which surfaces as "The login information you entered is incorrect" even with valid credentials.
+ */
+async function setReactLoginInputValue(elementHandle, value) {
+  const str = value == null ? '' : String(value);
+  await elementHandle.evaluate((el, v) => {
+    if (!el || el.tagName !== 'INPUT') return;
+    const proto = window.HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(el, v);
+    else el.value = v;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  }, str);
+}
+
 async function login(page, credentials) {
   const username = credentials?.username ?? readEnvFromFile().INSTAGRAM_USERNAME ?? process.env.INSTAGRAM_USERNAME;
   const password = credentials?.password ?? readEnvFromFile().INSTAGRAM_PASSWORD ?? process.env.INSTAGRAM_PASSWORD;
@@ -935,7 +958,7 @@ async function login(page, credentials) {
   for (const el of inputs) {
     if (el !== userEl && el !== passEl) el.dispose();
   }
-  const LOGIN_DEBUG = process.env.LOGIN_DEBUG === '1' || process.env.LOGIN_DEBUG === 'true';
+  const LOGIN_DEBUG = envLoginDebugEnabled();
   const loginResponses = [];
   const allInstagramRequests = [];
   const respHandler = async (response) => {
@@ -958,20 +981,13 @@ async function login(page, credentials) {
   page.on('response', respHandler);
 
   logger.log('Login form found, entering credentials...');
-  await userEl.click({ clickCount: 3 }).catch(() => {});
-  await page.keyboard.down('Control').catch(() => {});
-  await page.keyboard.press('KeyA').catch(() => {});
-  await page.keyboard.up('Control').catch(() => {});
-  await page.keyboard.press('Backspace').catch(() => {});
-  await userEl.type(username, { delay: 80 + Math.floor(Math.random() * 60) });
+  await userEl.click({ clickCount: 1 }).catch(() => {});
+  await setReactLoginInputValue(userEl, username);
   await userEl.dispose();
   await humanDelay();
-  await passEl.click({ clickCount: 3 }).catch(() => {});
-  await page.keyboard.down('Control').catch(() => {});
-  await page.keyboard.press('KeyA').catch(() => {});
-  await page.keyboard.up('Control').catch(() => {});
-  await page.keyboard.press('Backspace').catch(() => {});
-  await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
+  await passEl.click({ clickCount: 1 }).catch(() => {});
+  await setReactLoginInputValue(passEl, password);
+  await passEl.dispose();
   await humanDelay();
 
   const submitStyle = (process.env.LOGIN_SUBMIT || 'click').toLowerCase();
@@ -1002,7 +1018,7 @@ async function login(page, credentials) {
     if (clicked) submitMethod = submitStyle === 'enterthenclick' ? 'enterKeyThenClick' : 'click';
   }
 
-  if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
+  if (LOGIN_DEBUG) logger.log('Login submitMethod=' + submitMethod);
   await saveLoginDebugScreenshot(page, 'before_submit');
 
   logger.log('Submitted login form, waiting for redirect...');
@@ -1209,8 +1225,13 @@ async function login(page, credentials) {
     const bodySnippet = await page.evaluate(() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 600)).catch(() => '');
     let hint = '';
     const lower = bodySnippet.toLowerCase();
-    if (lower.indexOf('password was incorrect') !== -1 || lower.indexOf('incorrect password') !== -1) hint = ' Wrong password.';
-    else if (lower.indexOf('username you entered') !== -1 || lower.indexOf("doesn't belong to an account") !== -1) hint = ' Username not found.';
+    if (
+      lower.indexOf('login information you entered is incorrect') !== -1 ||
+      lower.indexOf('password was incorrect') !== -1 ||
+      lower.indexOf('incorrect password') !== -1
+    ) {
+      hint = ' Instagram says the username or password is wrong. Double-check both, or reset the password in the Instagram app.';
+    } else if (lower.indexOf('username you entered') !== -1 || lower.indexOf("doesn't belong to an account") !== -1) hint = ' Username not found.';
     else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1 || lower.indexOf('confirm it\'s you') !== -1 || lower.indexOf('security code') !== -1) hint = ' Instagram may require manual verification. Log in once in a normal browser (Chrome/Firefox), complete any challenge, then try again here.';
     else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again in 30–60 minutes.';
     else hint = ' If your password is correct, log in once in a normal browser to clear any security check, then retry.';
