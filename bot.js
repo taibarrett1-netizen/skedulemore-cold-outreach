@@ -1008,7 +1008,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (wantsVoiceNotes(voiceCfg) && !isFfmpegAvailable()) {
     return { ok: false, reason: 'ffmpeg_missing', pageSnippet: 'Install ffmpeg on the VPS: sudo apt install ffmpeg' };
   }
-  if (wantsVoiceNotes(voiceCfg)) await applyDesktopEmulation(page);
+  // Desktop layout for all sends: mobile thread header merges back-arrow + name in innerText ("BackTai"); desktop DMs behave better for automation.
+  await applyDesktopEmulation(page);
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
   for (let termsRound = 0; termsRound < 3; termsRound++) {
@@ -1027,35 +1028,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
   }
 
-  // Instagram sometimes shows "Not now"/notifications prompts even after login.
-  // If an overlay is present, our search element may not be "visible" yet, so we retry a bit.
-  for (let i = 0; i < 3; i++) {
-    const dismissed = await page.evaluate(function () {
-      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
-      for (let d = 0; d < dialogs.length; d++) {
-        const txt = (dialogs[d].textContent || '').toLowerCase();
-        if (txt.indexOf('save your login') !== -1 || txt.indexOf('not now') !== -1 || txt.indexOf('turn on notifications') !== -1) {
-          const notNow = Array.from(dialogs[d].querySelectorAll('span, button, div[role="button"]')).find(function (el) {
-            return (el.textContent || '').trim().toLowerCase() === 'not now';
-          });
-          if (notNow) {
-            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
-            if (btn) {
-              btn.click();
-              return true;
-            }
-          }
-        }
-      }
-      return false;
-    });
-    if (dismissed) {
-      logger.log('Dismissed direct/new prompt');
-      await delay(1500);
-    } else {
-      break;
-    }
-  }
+  await dismissInstagramHomeModals(page, logger);
+  await delay(500);
 
   // Wait for the direct/new search UI to render (may be an input, textarea, or contenteditable element).
   await page
@@ -1253,6 +1227,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
   await delay(2000);
 
+  await dismissInstagramHomeModals(page, logger);
+  await delay(600);
+
   const composeDiagnostic = () =>
     page.evaluate(() => {
       const textareas = document.querySelectorAll('textarea');
@@ -1278,6 +1255,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   try {
     await page.waitForSelector(composeSelector, { timeout: 20000 });
     composeFound = true;
+    await dismissInstagramHomeModals(page, logger);
+    await delay(500);
   } catch (e) {
     const diag = await composeDiagnostic().catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
