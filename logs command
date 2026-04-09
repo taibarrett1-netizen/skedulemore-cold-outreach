@@ -15,3 +15,5 @@ cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-dashboa
 
 cd /root/ColdDMs
 python3 -m http.server 8080
+
+scp root@178.62.52.200:/root/ColdDMs/logs/login-debug/FILE.png ~/Downloads/

@@ -244,6 +244,34 @@ async function detectInstagramEmailVerificationState(page) {
   });
 }
 
+/** Cookie consent blocks typing/clicks on login form; dismiss it before filling credentials. */
+async function dismissInstagramCookieConsent(page) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const clicked = await page.evaluate(() => {
+      const roots = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], div'));
+      const targets = roots.filter((el) => {
+        const t = (el.textContent || '').toLowerCase();
+        return t.includes('allow the use of cookies') || t.includes('allow all cookies') || t.includes('cookie');
+      });
+      for (const root of targets) {
+        const clickables = Array.from(root.querySelectorAll('button, [role="button"], a, span'));
+        const preferred =
+          clickables.find((el) => /allow all cookies|allow all|accept all/i.test((el.textContent || '').trim())) ||
+          clickables.find((el) => /decline optional cookies|only allow essential|essential cookies/i.test((el.textContent || '').trim()));
+        if (preferred && preferred.offsetParent) {
+          const btn = preferred.closest('[role="button"]') || preferred.closest('button') || preferred;
+          btn.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!clicked) return false;
+    await delay(900);
+  }
+  return true;
+}
+
 function buildVoiceSendConfig(sendOpts = {}) {
   const modeRaw = String(sendOpts.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').toLowerCase();
   const mode = modeRaw === 'voice_only' ? 'voice_only' : 'after_text';
@@ -361,6 +389,13 @@ async function login(page, credentials) {
   if (!currentUrl.includes('/accounts/login')) {
     logger.log('Already logged in (session restored).');
     return;
+  }
+
+  const cookieDismissed = await dismissInstagramCookieConsent(page);
+  if (cookieDismissed) {
+    logger.log('Dismissed Instagram cookie consent modal.');
+    await saveLoginDebugScreenshot(page, 'after_cookie_dismiss');
+    await delay(600);
   }
 
   // Instagram changes input attributes; find by type and order: first visible text input = username, first password = password
