@@ -41,6 +41,7 @@ const {
   loadLeadsFromCSV,
   connectInstagram,
   completeInstagram2FA,
+  completeInstagramEmailVerification,
   sendFollowUp,
   scheduleDebugFollowUpBrowser,
 } = require('./bot');
@@ -672,6 +673,7 @@ app.post('/api/voice/upload', uploadVoice.single('file'), (req, res) => {
 // Pending 2FA sessions: id -> { page, browser, username, clientId, createdAt }. Cleared when code is submitted or after TTL.
 const pending2FAMap = new Map();
 const pendingScraper2FAMap = new Map();
+const pendingEmailVerifyMap = new Map();
 const PENDING_2FA_TTL_MS = 2 * 60 * 1000;
 
 function cleanupExpired2FA() {
@@ -679,6 +681,16 @@ function cleanupExpired2FA() {
   for (const [id, data] of pending2FAMap.entries()) {
     if (now - data.createdAt > PENDING_2FA_TTL_MS) {
       pending2FAMap.delete(id);
+      if (data.browser) data.browser.close().catch(() => {});
+    }
+  }
+}
+
+function cleanupExpiredEmailVerify() {
+  const now = Date.now();
+  for (const [id, data] of pendingEmailVerifyMap.entries()) {
+    if (now - data.createdAt > PENDING_2FA_TTL_MS) {
+      pendingEmailVerifyMap.delete(id);
       if (data.browser) data.browser.close().catch(() => {});
     }
   }
@@ -697,7 +709,8 @@ function cleanupExpiredScraper2FA() {
 // --- API: Instagram connect (one-time; password never stored) ---
 // If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
-  const { username, password, clientId } = req.body || {};
+  const { username, password, clientId, platformScraperPool } = req.body || {};
+  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -741,16 +754,50 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         pending2FAId: pendingId,
       });
     }
+    if (result.emailVerificationRequired) {
+      cleanupExpiredEmailVerify();
+      const pendingId = require('crypto').randomBytes(16).toString('hex');
+      pendingEmailVerifyMap.set(pendingId, {
+        page: result.page,
+        browser: result.browser,
+        username: result.username,
+        clientId,
+        createdAt: Date.now(),
+        proxyUrl: proxyMeta.proxyUrl,
+        proxyAssignmentId: proxyMeta.proxyAssignmentId,
+        platformScraperPool: isPlatformPool,
+      });
+      return res.status(200).json({
+        ok: false,
+        code: 'email_verification_required',
+        message: result.maskedEmail
+          ? `Enter the code sent to ${result.maskedEmail}.`
+          : 'Enter the verification code sent to your email.',
+        maskedEmail: result.maskedEmail || null,
+        pendingEmailId: pendingId,
+      });
+    }
     await saveSession(clientId, { cookies: result.cookies }, result.username, {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
+    if (isPlatformPool) {
+      await savePlatformScraperSession({ cookies: result.cookies }, result.username, req.body?.daily_actions_limit || 500).catch(() => {});
+    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
     console.error('[API] Instagram connect failed', e);
     if (e.code === 'TWO_FACTOR_REQUIRED') {
       return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
+    }
+    if (e.code === 'EMAIL_VERIFICATION_REQUIRED') {
+      return res.status(200).json({
+        ok: false,
+        code: 'email_verification_required',
+        message: e.message || 'Enter the verification code sent to your email.',
+        maskedEmail: e.maskedEmail || null,
+      });
     }
     res.status(500).json({ ok: false, error: e.message || 'Login failed' });
   }
@@ -789,6 +836,50 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
     console.error('[API] Instagram 2FA complete failed', e);
     if (pending.browser) pending.browser.close().catch(() => {});
     res.status(500).json({ ok: false, error: e.message || '2FA failed' });
+  }
+});
+
+app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) => {
+  const { pendingEmailId, emailCode, clientId, platformScraperPool, daily_actions_limit } = req.body || {};
+  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
+  if (!pendingEmailId || !emailCode || !clientId) {
+    return res.status(400).json({ ok: false, error: 'pendingEmailId, emailCode, and clientId are required' });
+  }
+  const pending = pendingEmailVerifyMap.get(pendingEmailId);
+  if (!pending) {
+    return res.status(400).json({ ok: false, error: 'Session expired. Start Connect again and enter the new code when prompted.' });
+  }
+  if (String(pending.clientId) !== String(clientId)) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session does not belong to this clientId' });
+  }
+  if (!!pending.platformScraperPool !== !!isPlatformPool) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session type mismatch' });
+  }
+  if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
+    pendingEmailVerifyMap.delete(pendingEmailId);
+    if (pending.browser) pending.browser.close().catch(() => {});
+    return res.status(400).json({ ok: false, error: 'Session expired. Start Connect again and enter the new code when prompted.' });
+  }
+  pendingEmailVerifyMap.delete(pendingEmailId);
+  try {
+    const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
+    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+      proxyUrl: pending.proxyUrl,
+      proxyAssignmentId: pending.proxyAssignmentId,
+    });
+    if (isPlatformPool) {
+      await savePlatformScraperSession({ cookies: result.cookies }, result.username, daily_actions_limit || 500).catch(() => {});
+      return res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
+    }
+    await updateSettingsInstagramUsername(clientId, result.username);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Instagram email verification complete failed', e);
+    if (pending.browser) pending.browser.close().catch(() => {});
+    res.status(500).json({ ok: false, error: e.message || 'Email verification failed' });
   }
 });
 

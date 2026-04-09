@@ -204,6 +204,22 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
   }
 }
 
+/** Detect Instagram "check your email" checkpoint and extract masked email if shown. */
+async function detectInstagramEmailVerificationState(page) {
+  return page.evaluate(() => {
+    const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+    const lower = body.toLowerCase();
+    const needs =
+      lower.includes('check your email') ||
+      lower.includes('enter the code we sent to') ||
+      lower.includes('we sent the code to') ||
+      (lower.includes('code') && lower.includes('try another way'));
+    if (!needs) return { required: false, maskedEmail: null };
+    const m = body.match(/(?:sent to|to)\s+([A-Za-z0-9._%*+\-]+@[A-Za-z0-9.\-*]+\.[A-Za-z]{2,})/i);
+    return { required: true, maskedEmail: m ? m[1] : null };
+  });
+}
+
 function buildVoiceSendConfig(sendOpts = {}) {
   const modeRaw = String(sendOpts.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').toLowerCase();
   const mode = modeRaw === 'voice_only' ? 'voice_only' : 'after_text';
@@ -487,6 +503,18 @@ async function login(page, credentials) {
     logger.log('2FA code accepted.');
   }
 
+  const emailCheckpoint = await detectInstagramEmailVerificationState(page);
+  if (emailCheckpoint.required) {
+    page.off('response', respHandler);
+    const err = new Error(
+      `Email verification required.${emailCheckpoint.maskedEmail ? ` Enter the code sent to ${emailCheckpoint.maskedEmail}.` : ''}`
+    );
+    err.code = 'EMAIL_VERIFICATION_REQUIRED';
+    err.page = page;
+    err.maskedEmail = emailCheckpoint.maskedEmail || null;
+    throw err;
+  }
+
   if (page.url().includes('/accounts/login')) {
     logger.log('Still on login page; retrying submit (click only)...');
     const retryClick = await page.evaluate(function () {
@@ -512,6 +540,18 @@ async function login(page, credentials) {
       }
       await delay(1500);
     }
+  }
+
+  const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
+  if (emailCheckpointAfterRetry.required) {
+    page.off('response', respHandler);
+    const err = new Error(
+      `Email verification required.${emailCheckpointAfterRetry.maskedEmail ? ` Enter the code sent to ${emailCheckpointAfterRetry.maskedEmail}.` : ''}`
+    );
+    err.code = 'EMAIL_VERIFICATION_REQUIRED';
+    err.page = page;
+    err.maskedEmail = emailCheckpointAfterRetry.maskedEmail || null;
+    throw err;
   }
 
   for (let i = 0; i < 3; i++) {
@@ -2067,6 +2107,16 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       keepBrowserOpen = true;
       return { twoFactorRequired: true, page: e.page, browser, username: instagramUsername };
     }
+    if (e.code === 'EMAIL_VERIFICATION_REQUIRED' && e.page) {
+      keepBrowserOpen = true;
+      return {
+        emailVerificationRequired: true,
+        page: e.page,
+        browser,
+        username: instagramUsername,
+        maskedEmail: e.maskedEmail || null,
+      };
+    }
     throw e;
   } finally {
     if (!keepBrowserOpen) await browser.close().catch(() => {});
@@ -2199,6 +2249,65 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
   return { cookies, username: instagramUsername };
 }
 
+/**
+ * Complete Instagram email-code verification on an existing session.
+ */
+async function completeInstagramEmailVerification(page, browser, emailCode, instagramUsername) {
+  const code = String(emailCode || '').replace(/\s+/g, '').slice(0, 12);
+  if (!code) throw new Error('Invalid email verification code.');
+  logger.log('Entering email verification code on existing session...');
+  const focused = await page.evaluate(() => {
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden' && !el.disabled);
+    const codeInput =
+      visible.find((el) => {
+        const p = (el.placeholder || '').toLowerCase();
+        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+        return p.includes('code') || a.includes('code') || el.type === 'tel';
+      }) || visible[0];
+    if (!codeInput) return false;
+    codeInput.focus();
+    codeInput.click();
+    codeInput.value = '';
+    return true;
+  });
+  if (!focused) throw new Error('Email verification code input not found.');
+  await delay(250);
+  await page.keyboard.type(code, { delay: 70 + Math.floor(Math.random() * 30) });
+  await delay(500);
+  const continueClicked = await page.evaluate(() => {
+    const labels = ['Continue', 'Next', 'Submit', 'Confirm'];
+    const buttons = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]'));
+    for (const label of labels) {
+      const btn = buttons.find((el) => (el.textContent || el.value || '').trim() === label);
+      if (btn && btn.offsetParent) {
+        btn.scrollIntoView({ block: 'center' });
+        btn.click();
+        return true;
+      }
+    }
+    const generic = buttons.find((el) => /continue|next|submit|confirm/i.test((el.textContent || el.value || '').trim()));
+    if (generic && generic.offsetParent) {
+      generic.click();
+      return true;
+    }
+    return false;
+  });
+  if (continueClicked) {
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await delay(2500);
+  }
+  const state = await detectInstagramEmailVerificationState(page);
+  if (state.required) {
+    throw new Error('Email verification code may be wrong or expired. Try again with a fresh code.');
+  }
+  await assertHealthyInstagramSessionOrThrow(page, 'email verification');
+  const cookies = await page.cookies();
+  await browser.close().catch(() => {});
+  logger.log('Email verification completed, session saved.');
+  return { cookies, username: instagramUsername };
+}
+
 module.exports = {
   runBot,
   getDailyStats,
@@ -2209,5 +2318,6 @@ module.exports = {
   login,
   connectInstagram,
   completeInstagram2FA,
+  completeInstagramEmailVerification,
   scheduleDebugFollowUpBrowser,
 };
