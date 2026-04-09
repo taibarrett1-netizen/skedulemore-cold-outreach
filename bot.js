@@ -1236,6 +1236,36 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       const editables = document.querySelectorAll('div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"]');
       const roleBoxes = document.querySelectorAll('[role="textbox"]');
       const visible = (el) => el.offsetParent !== null;
+      const vis = (el) => {
+        try {
+          return el && el.offsetParent !== null;
+        } catch {
+          return false;
+        }
+      };
+      const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
+      const compose = composers.find((el) => {
+        const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        return ph.includes('message') || aria.includes('message');
+      });
+      let paneScopedSnippet = '';
+      if (compose) {
+        const vw = document.documentElement.clientWidth || 1200;
+        const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
+        const maxPaneWidth = vw - minLeft + 120;
+        let best = compose;
+        let el = compose;
+        for (let depth = 0; depth < 28 && el; depth++) {
+          el = el.parentElement;
+          if (!el || el === document.body || el === document.documentElement) break;
+          const r = el.getBoundingClientRect();
+          if (r.left < minLeft) break;
+          if (r.width <= maxPaneWidth) best = el;
+          else break;
+        }
+        paneScopedSnippet = (best.innerText || '').slice(0, 400).replace(/\n/g, ' ');
+      }
       return {
         url: window.location.href,
         textarea: textareas.length,
@@ -1245,6 +1275,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         roleTextbox: roleBoxes.length,
         roleTextboxVisible: Array.from(roleBoxes).filter(visible).length,
         bodySnippet: document.body ? document.body.innerText.slice(0, 400).replace(/\n/g, ' ') : '',
+        paneScopedSnippet,
       };
     });
 
@@ -1304,8 +1335,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         };
 
         /**
-         * Open conversation column only. [role=main] often wraps inbox + thread (full width);
-         * we climb from the Message composer and keep the topmost ancestor still laid out in the thread column (right side).
+         * Open conversation column only: anchor minLeft to the Message composer’s X position;
+         * stop climbing when a parent spans too wide (inbox + thread row).
          */
         function threadPaneRoot() {
           const vis = (el) => {
@@ -1323,14 +1354,16 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           });
           if (!compose) return document.body;
           const vw = document.documentElement.clientWidth || 1200;
-          const minLeft = Math.max(120, vw * 0.2);
+          const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
+          const maxPaneWidth = vw - minLeft + 120;
           let best = compose;
           let el = compose;
           for (let depth = 0; depth < 28 && el; depth++) {
             el = el.parentElement;
             if (!el || el === document.body || el === document.documentElement) break;
             const r = el.getBoundingClientRect();
-            if (r.left >= minLeft) {
+            if (r.left < minLeft) break;
+            if (r.width <= maxPaneWidth) {
               best = el;
             } else {
               break;
@@ -1341,9 +1374,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
         const pane = threadPaneRoot();
 
-        // 1) Prefer DM thread header relation (within open thread pane only).
-        const headerRoots = Array.from(pane.querySelectorAll('header, [role="banner"]'));
-        for (const root of headerRoots) {
+        const extractNameFromHeaderRoot = (root) => {
           const lines = (root.innerText || '')
             .split(/\n/)
             .map((x) => clean(x))
@@ -1355,6 +1386,24 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             const next = i + 1 < lines.length ? normalizeCandidateName(lines[i + 1]) : '';
             if (next) return next;
           }
+          return null;
+        };
+
+        // 1) DM thread header: prefer header/banner whose text includes the handle (smallest area first), then others.
+        const allHeaderRoots = Array.from(pane.querySelectorAll('header, [role="banner"]'));
+        const headerMatchesNeedle = (root) => containsUsernameToken(root.innerText || '');
+        const matchingHeaders = allHeaderRoots.filter(headerMatchesNeedle).sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          const aa = ra.width * ra.height;
+          const ba = rb.width * rb.height;
+          if (aa !== ba) return aa - ba;
+          return ra.top - rb.top;
+        });
+        const otherHeaders = allHeaderRoots.filter((h) => !headerMatchesNeedle(h));
+        for (const root of [...matchingHeaders, ...otherHeaders]) {
+          const got = extractNameFromHeaderRoot(root);
+          if (got) return got;
         }
 
         // 2) Prefer thread header title/name when available (pane only).
@@ -1494,6 +1543,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (composeFound) {
     const diag = await composeDiagnostic().catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+    if (diag.paneScopedSnippet) {
+      logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
+    }
     noComposeReason = null;
 
     const composeEl = await page.evaluateHandle(() => {
