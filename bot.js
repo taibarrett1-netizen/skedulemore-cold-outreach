@@ -717,11 +717,11 @@ async function login(page, credentials) {
   }
 
   logger.log('Loading Instagram login page...');
-  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2', timeout: 45000 });
+  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
   const afterGotoUrl = page.url();
   const afterGotoTitle = await page.title().catch(() => '');
   logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
-  await delay(3000);
+  await delay(4000);
   const currentUrl = page.url();
   if (!currentUrl.includes('/accounts/login')) {
     logger.log('Already logged in (session restored).');
@@ -735,7 +735,73 @@ async function login(page, credentials) {
     await delay(600);
   }
 
-  // Instagram changes input attributes; find by type and order: first visible text input = username, first password = password
+  const findLoginFields = async () => {
+    return page.evaluate(() => {
+      const visible = (el) => {
+        try {
+          return !!el && el.offsetParent !== null && (el.getClientRects?.().length || 0) > 0 && !el.disabled;
+        } catch {
+          return false;
+        }
+      };
+      const norm = (s) => (s || '').toString().toLowerCase().replace(/\s+/g, ' ').trim();
+      const inputs = Array.from(document.querySelectorAll('input'));
+      const samples = inputs.slice(0, 10).map((el) => ({
+        type: norm(el.type || ''),
+        name: norm(el.name || ''),
+        autocomplete: norm(el.autocomplete || ''),
+        placeholder: norm(el.placeholder || ''),
+        aria: norm(el.getAttribute('aria-label') || ''),
+        visible: visible(el),
+      }));
+      const pickBy = (...preds) => inputs.find((el) => visible(el) && preds.some((fn) => fn(el)));
+      const userEl =
+        pickBy(
+          (el) => norm(el.name || '') === 'username',
+          (el) => norm(el.autocomplete || '') === 'username',
+          (el) => norm(el.placeholder || '').includes('username'),
+          (el) => norm(el.placeholder || '').includes('email'),
+          (el) => norm(el.type || '') === 'text',
+          (el) => norm(el.type || '') === 'email',
+          (el) => norm(el.type || '') === ''
+        ) || null;
+      const passEl =
+        pickBy(
+          (el) => norm(el.name || '') === 'password',
+          (el) => norm(el.autocomplete || '') === 'current-password',
+          (el) => norm(el.placeholder || '').includes('password'),
+          (el) => norm(el.type || '') === 'password'
+        ) || null;
+      return {
+        ok: !!userEl && !!passEl,
+        userIndex: userEl ? inputs.indexOf(userEl) : -1,
+        passIndex: passEl ? inputs.indexOf(passEl) : -1,
+        sample: samples,
+        url: location.href,
+        title: document.title || '',
+        bodySnippet: (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 400),
+      };
+    });
+  };
+
+  let loginDiag = await findLoginFields().catch(() => null);
+  for (let attempt = 0; attempt < 2 && (!loginDiag || !loginDiag.ok); attempt++) {
+    logger.warn(
+      `Login fields not ready yet on attempt ${attempt + 1}/3 for @${username}. Retrying page load before failing.`
+    );
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await delay(4000 + attempt * 1000);
+    loginDiag = await findLoginFields().catch(() => null);
+  }
+  if (!loginDiag || !loginDiag.ok) {
+    const failUrl = page.url();
+    const failTitle = await page.title().catch(() => '');
+    logger.error('Login form fields not found');
+    logger.log(`Page at failure: URL=${failUrl} title=${failTitle}`);
+    logger.log(`Login field diag: ${JSON.stringify(loginDiag || {}, null, 0).slice(0, 2000)}`);
+    throw new Error('Login form fields not found. Instagram may be loading a different shell or security interstitial.');
+  }
+
   const inputs = await page.$$('input');
   let userEl = null;
   let passEl = null;
@@ -743,10 +809,13 @@ async function login(page, credentials) {
     const props = await el.evaluate((node) => ({
       type: node.type,
       visible: node.offsetParent !== null,
+      name: node.name || '',
+      autocomplete: node.autocomplete || '',
+      placeholder: node.placeholder || '',
     }));
-    if (props.visible && (props.type === 'text' || props.type === 'email' || props.type === '')) {
+    if (props.visible && (props.name === 'username' || props.autocomplete === 'username' || props.type === 'text' || props.type === 'email' || props.type === '')) {
       if (!userEl) userEl = el;
-    } else if (props.visible && props.type === 'password') {
+    } else if (props.visible && (props.name === 'password' || props.autocomplete === 'current-password' || props.type === 'password')) {
       passEl = el;
       break;
     }
@@ -756,7 +825,7 @@ async function login(page, credentials) {
     const failUrl = page.url();
     const failTitle = await page.title().catch(() => '');
     const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
-    logger.error('Login form fields not found');
+    logger.error('Login form fields not found after retry');
     logger.log(`Page at failure: URL=${failUrl} title=${failTitle}`);
     logger.log(`Page body snippet: ${bodyText.replace(/\n/g, ' ').slice(0, 300)}`);
     throw new Error('Login form fields not found. Instagram may have changed the page.');
@@ -826,7 +895,7 @@ async function login(page, credentials) {
   await saveLoginDebugScreenshot(page, 'before_submit');
 
   logger.log('Submitted login form, waiting for redirect...');
-  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
 
   const loginWaitMs = Math.min(parseInt(process.env.LOGIN_WAIT_MS, 10) || 20000, 90000);
   const pollIntervalMs = 1000;
@@ -931,7 +1000,7 @@ async function login(page, credentials) {
     });
     if (retryClick) {
       await delay(1000);
-      const retryDeadline = Date.now() + 20000;
+      const retryDeadline = Date.now() + 30000;
       while (Date.now() < retryDeadline) {
         await delay(pollIntervalMs);
         if (!page.url().includes('/accounts/login')) break;
@@ -1095,20 +1164,20 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
   // Desktop layout for all sends: mobile thread header merges back-arrow + name in innerText ("BackTai"); desktop DMs behave better for automation.
   await applyDesktopEmulation(page);
-  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
+  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await humanDelay();
   for (let termsRound = 0; termsRound < 3; termsRound++) {
     if (!isInstagramTermsUnblockUrl(page.url())) break;
     const handled = await handleInstagramTermsUnblock(page).catch(() => false);
     if (handled && !isInstagramTermsUnblockUrl(page.url())) {
       if (!page.url().toLowerCase().includes('/direct/')) {
-        await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+        await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       }
       await delay(1200);
       break;
     }
     if (isInstagramTermsUnblockUrl(page.url())) {
-      await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+      await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       await delay(2000);
     }
   }

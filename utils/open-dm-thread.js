@@ -46,7 +46,7 @@ async function typeInstagramDmPlainTextWithKeyboard(page, msg, delayOpts) {
 }
 
 async function navigateToDmThread(page, u) {
-  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
+  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await humanDelay();
 
   for (let i = 0; i < 3; i++) {
