@@ -272,6 +272,56 @@ async function dismissInstagramCookieConsent(page) {
   return true;
 }
 
+/** Handle Instagram /terms/unblock interstitial by scrolling and accepting terms. */
+async function handleInstagramTermsUnblock(page) {
+  const isTermsUnblockUrl = (url) => typeof url === 'string' && url.toLowerCase().includes('/terms/unblock');
+  if (!isTermsUnblockUrl(page.url())) return false;
+
+  logger.warn('Instagram terms/unblock interstitial detected. Attempting auto-accept...');
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const clicked = await page.evaluate(() => {
+      const body = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+      if (!body.includes('terms') && !body.includes('unblock') && !body.includes('accept')) return false;
+
+      // Some variants require scrolling before the accept CTA is enabled/visible.
+      const scrollers = [document.scrollingElement, document.documentElement, document.body].filter(Boolean);
+      for (const s of scrollers) {
+        try {
+          s.scrollTop = Math.max(s.scrollTop || 0, Math.floor((s.scrollHeight || 0) * 0.35));
+        } catch {
+          // ignore
+        }
+      }
+
+      const clickables = Array.from(document.querySelectorAll('button, [role="button"], a, span'));
+      const target =
+        clickables.find((el) => /accept|agree|continue|i agree|ok/i.test((el.textContent || '').trim())) ||
+        clickables.find((el) => /next/i.test((el.textContent || '').trim()));
+      if (!target || target.offsetParent === null) return false;
+      const btn = target.closest('button, [role="button"], a') || target;
+      btn.click();
+      return true;
+    });
+
+    if (!clicked) {
+      await delay(900);
+      continue;
+    }
+
+    // Wait incrementally; this page usually redirects after a short delay.
+    for (let i = 0; i < 5; i++) {
+      await delay(1200);
+      const now = page.url();
+      if (!isTermsUnblockUrl(now)) {
+        logger.log(`terms/unblock accepted; redirected to ${now}`);
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function buildVoiceSendConfig(sendOpts = {}) {
   const modeRaw = String(sendOpts.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').toLowerCase();
   const mode = modeRaw === 'voice_only' ? 'voice_only' : 'after_text';
@@ -674,6 +724,16 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (wantsVoiceNotes(voiceCfg)) await applyDesktopEmulation(page);
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
+  if (page.url().toLowerCase().includes('/terms/unblock')) {
+    const handled = await handleInstagramTermsUnblock(page);
+    if (handled) {
+      // Ensure we land on DM new thread page after terms acceptance.
+      if (!page.url().toLowerCase().includes('/direct/')) {
+        await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+      }
+      await delay(1200);
+    }
+  }
 
   // Instagram sometimes shows "Not now"/notifications prompts even after login.
   // If an overlay is present, our search element may not be "visible" yet, so we retry a bit.
@@ -798,6 +858,24 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       })
       .catch(() => null);
     await searchHandle.dispose().catch(() => {});
+    const diagUrl = (diag?.url || '').toLowerCase();
+    if (diagUrl.includes('/terms/unblock') || diagUrl.includes('/challenge/') || diagUrl.includes('/checkpoint/')) {
+      if (diagUrl.includes('/terms/unblock')) {
+        const handled = await handleInstagramTermsUnblock(page).catch(() => false);
+        if (handled) {
+          return {
+            ok: false,
+            reason: 'retry_needed_after_terms_unblock',
+            pageSnippet: 'Accepted Instagram terms/unblock. Retrying DM open flow.',
+          };
+        }
+      }
+      return {
+        ok: false,
+        reason: 'account_unblock_required',
+        pageSnippet: `Instagram redirected to security/unblock page before DM search (url=${diag?.url || 'unknown'}). Open this account in a normal browser and complete the unblock/checkpoint, then retry.`,
+      };
+    }
     throw new Error(`Search input not found on direct/new page (url=${diag?.url || 'unknown'} visible=${diag?.visibleCount ?? 'n/a'})`);
   }
 
@@ -1689,6 +1767,7 @@ async function sendDM(page, username, adapter, options = {}) {
       const terminalReasons = [
         'user_not_found',
         'search_result_select_failed',
+        'account_unblock_required',
         'no_compose',
         'account_private',
         'rate_limited',
