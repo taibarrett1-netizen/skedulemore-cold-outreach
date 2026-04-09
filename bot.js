@@ -226,6 +226,29 @@ async function saveDmSearchDebugScreenshot(page, label) {
  * Always logs URL + page text snippet + light DOM counts when picking a search result fails.
  * PNG only if DM_SEARCH_DEBUG_SCREENSHOTS or LOGIN_DEBUG* is set.
  */
+/**
+ * One screenshot immediately before typing into the DM composer (focused, message not yet entered).
+ * Use to inspect thread header / layout (e.g. stray "Back" in accessibility text). Independent of LOGIN_DEBUG*.
+ */
+function wantsComposeTypingScreenshot() {
+  return process.env.DM_COMPOSE_TYPING_SCREENSHOT === '1' || process.env.DM_COMPOSE_TYPING_SCREENSHOT === 'true';
+}
+
+async function saveComposeTypingDebugScreenshot(page, username) {
+  if (!wantsComposeTypingScreenshot() || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const u = String(username || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_compose_before_type_${u}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[compose] typing-view screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[compose] typing-view screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   const u = String(username || '').trim().replace(/^@/, '');
   let url = '';
@@ -1472,6 +1495,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     if (compose && shouldSendText) {
       await delay(500);
       await compose.click();
+      await saveComposeTypingDebugScreenshot(page, u);
       await typeInstagramDmPlainTextInComposer(page, compose, msg, {
         delay: 60 + Math.floor(Math.random() * 40),
       });
@@ -1513,6 +1537,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }, msg) : false;
   if (keyboardSent) {
     await delay(300);
+    await saveComposeTypingDebugScreenshot(page, u);
     await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
     await humanDelay();
     await page.keyboard.press('Enter');
