@@ -1003,8 +1003,10 @@ async function login(page, credentials) {
 
 const MAX_SEND_RETRIES = 3;
 
-async function runComposeDiagnostic(page) {
-  return page.evaluate(() => {
+async function runComposeDiagnostic(page, usernameForPane = null) {
+  const needleArg = (usernameForPane || '').replace(/^@/, '').trim();
+  return page.evaluate((needleRaw) => {
+    const needleLc = (needleRaw || '').toLowerCase();
     const textareas = document.querySelectorAll('textarea');
     const editables = document.querySelectorAll('div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"]');
     const roleBoxes = document.querySelectorAll('[role="textbox"]');
@@ -1042,7 +1044,7 @@ async function runComposeDiagnostic(page) {
     if (compose) {
       const vw = document.documentElement.clientWidth || 1200;
       const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
-      const maxPaneWidth = vw - minLeft + 120;
+      const maxPaneWidth = vw - minLeft + 320;
       let best = compose;
       let el = compose;
       for (let depth = 0; depth < 28 && el; depth++) {
@@ -1052,6 +1054,23 @@ async function runComposeDiagnostic(page) {
         if (r.left < minLeft) break;
         if (r.width <= maxPaneWidth) best = el;
         else break;
+      }
+      let elPane = best;
+      for (let step = 0; step < 24; step++) {
+        const raw = (elPane.innerText || '').trim();
+        const okNeedle = needleLc && raw.length >= 40 && raw.toLowerCase().includes(needleLc);
+        const okBulk = !needleLc && raw.length >= 140;
+        if (okNeedle || okBulk) {
+          best = elPane;
+          break;
+        }
+        const p = elPane.parentElement;
+        if (!p || p === document.body || p === document.documentElement) break;
+        const r = p.getBoundingClientRect();
+        if (r.left < minLeft - 120) break;
+        if (r.left <= 20 && r.width >= vw * 0.93) break;
+        elPane = p;
+        best = p;
       }
       paneScopedSnippet = (best.innerText || '').slice(0, 400).replace(/\n/g, ' ');
     }
@@ -1066,7 +1085,7 @@ async function runComposeDiagnostic(page) {
       bodySnippet: document.body ? document.body.innerText.slice(0, 400).replace(/\n/g, ' ') : '',
       paneScopedSnippet,
     };
-  });
+  }, needleArg);
 }
 
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
@@ -1306,7 +1325,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
   } catch (e) {
-    const diag = await runComposeDiagnostic(page).catch(() => ({}));
+    const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
     if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private')) noComposeReason = 'account_private';
     else if (bodySnippet.includes("can't message") || bodySnippet.includes("can't send") || bodySnippet.includes('message request') || bodySnippet.includes("don't accept")) noComposeReason = 'messages_restricted';
@@ -1469,7 +1488,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (!compose) return { el: document.body, composeFound: false };
           const vw = document.documentElement.clientWidth || 1200;
           const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
-          const maxPaneWidth = vw - minLeft + 120;
+          const maxPaneWidth = vw - minLeft + 320;
           let best = compose;
           let el = compose;
           let depthUsed = 0;
@@ -1485,12 +1504,31 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
               break;
             }
           }
+          const n = needle.toLowerCase();
+          let elPane = best;
+          let paneExpandSteps = 0;
+          for (let step = 0; step < 24; step++) {
+            const raw = (elPane.innerText || '').trim();
+            if (n && raw.length >= 40 && raw.toLowerCase().includes(n)) {
+              best = elPane;
+              break;
+            }
+            const p = elPane.parentElement;
+            if (!p || p === document.body || p === document.documentElement) break;
+            const r = p.getBoundingClientRect();
+            if (r.left < minLeft - 120) break;
+            if (r.left <= 20 && r.width >= vw * 0.93) break;
+            elPane = p;
+            best = p;
+            paneExpandSteps += 1;
+          }
           return {
             el: best,
             composeFound: true,
             composeRect: compose.getBoundingClientRect(),
             paneRect: best.getBoundingClientRect(),
             climbDepth: depthUsed,
+            paneExpandSteps,
             minLeft,
             maxPaneWidth,
           };
@@ -1503,6 +1541,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           threadPane: {
             composeFound: paneInfo.composeFound,
             climbDepth: paneInfo.climbDepth ?? 0,
+            paneExpandSteps: paneInfo.paneExpandSteps ?? 0,
+            paneIncludesUsername:
+              !!(needle && (pane.innerText || '').toLowerCase().includes(needle.toLowerCase())),
             minLeft: paneInfo.minLeft,
             maxPaneWidth: paneInfo.maxPaneWidth,
             paneTag: pane.tagName,
@@ -1743,7 +1784,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     if (!fullNameOut) {
       fullNameOut = [derivedNames.first_name, derivedNames.last_name].filter(Boolean).join(' ');
     }
-    const diag = await runComposeDiagnostic(page).catch(() => ({}));
+    const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
     if (diag.paneScopedSnippet) {
       logger.log(
@@ -1807,7 +1848,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   };
 
   if (composeFound) {
-    const diag = await runComposeDiagnostic(page).catch(() => ({}));
+    const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
     if (diag.paneScopedSnippet) {
       logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
