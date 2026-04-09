@@ -1954,7 +1954,20 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     .eq('client_id', clientId)
     .eq('id', campaignId)
     .maybeSingle();
-  if (!campaign || campaign.status !== 'active') return 0;
+  if (!campaign) return 0;
+  if (campaign.status !== 'active') {
+    const { count: stillPending } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', campaignId)
+      .eq('status', 'pending');
+    if ((stillPending ?? 0) > 0) {
+      await sb.from('cold_dm_campaigns').update({ status: 'active', updated_at: new Date().toISOString() }).eq('id', campaignId);
+      console.log(`[syncSendJobsForCampaign] reactivated campaign ${campaignId} (was ${campaign.status}, ${stillPending} pending leads)`);
+    } else {
+      return 0;
+    }
+  }
 
   const { data: leadRows, error: leadErr } = await sb
     .from('cold_dm_campaign_leads')
@@ -2065,8 +2078,22 @@ async function buildSendWorkFromJob(jobId) {
     .eq('id', job.campaign_id)
     .eq('client_id', job.client_id)
     .maybeSingle();
-  if (!campaign || campaign.status !== 'active') {
-    return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
+  if (!campaign) {
+    return { job, disposition: 'cancelled', reason: 'campaign_not_found' };
+  }
+  if (campaign.status !== 'active') {
+    const { count: stillPending } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', campaign.id)
+      .eq('status', 'pending');
+    if ((stillPending ?? 0) > 0) {
+      await sb.from('cold_dm_campaigns').update({ status: 'active', updated_at: new Date().toISOString() }).eq('id', campaign.id);
+      console.log(`[buildSendWorkFromJob] reactivated campaign ${campaign.id} (was ${campaign.status}, ${stillPending} pending leads)`);
+      campaign.status = 'active';
+    } else {
+      return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
+    }
   }
   const { data: leadLink } = await sb
     .from('cold_dm_campaign_leads')
