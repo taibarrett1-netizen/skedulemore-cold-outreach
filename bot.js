@@ -106,7 +106,7 @@ const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
 const LOGIN_DEBUG_SCREENSHOT_DIR = path.join(process.cwd(), 'logs', 'login-debug');
-const GLOBAL_SEND_GAP_MS = Math.max(0, parseInt(process.env.SEND_WORKER_GLOBAL_GAP_MS || '90000', 10) || 90000);
+const GLOBAL_SEND_GAP_MS = Math.max(0, parseInt(process.env.SEND_WORKER_GLOBAL_GAP_MS || '240000', 10) || 240000);
 const GLOBAL_SEND_GATE_FILE = path.join(os.tmpdir(), 'cold_dm_global_send_gate.json');
 const GLOBAL_SEND_GATE_LOCK_FILE = `${GLOBAL_SEND_GATE_FILE}.lock`;
 
@@ -699,33 +699,46 @@ async function respectGlobalSendGap(minGapMs = GLOBAL_SEND_GAP_MS) {
   if (gapMs <= 0) return 0;
   const now = Date.now();
   return withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
-    let lastSentAt = 0;
+    let resumeAt = 0;
     try {
       const raw = await fs.promises.readFile(GLOBAL_SEND_GATE_FILE, 'utf8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.lastSentAt === 'number') lastSentAt = parsed.lastSentAt;
+      if (parsed && typeof parsed.resumeAt === 'number') resumeAt = parsed.resumeAt;
+      else if (parsed && typeof parsed.lastSentAt === 'number') {
+        const storedGap = typeof parsed.cooldownMs === 'number' ? parsed.cooldownMs : gapMs;
+        resumeAt = parsed.lastSentAt + Math.max(0, storedGap);
+      }
     } catch {}
-    const elapsed = now - lastSentAt;
-    if (elapsed < gapMs) {
-      return gapMs - elapsed;
+    if (resumeAt > now) {
+      return resumeAt - now;
     }
     await fs.promises.writeFile(
       GLOBAL_SEND_GATE_FILE,
-      JSON.stringify({ lastSentAt: now, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
+      JSON.stringify({ resumeAt: now, cooldownMs: 0, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
       'utf8'
     );
     return 0;
   });
 }
 
-async function updateGlobalSendGateAfterSuccess() {
-  if (GLOBAL_SEND_GAP_MS <= 0) return;
+async function updateGlobalSendGateAfterSuccess(minGapMs = GLOBAL_SEND_GAP_MS) {
+  const gapMs = Math.max(0, Number(minGapMs) || 0);
+  if (gapMs <= 0) return;
   const now = Date.now();
   try {
     await withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
       await fs.promises.writeFile(
         GLOBAL_SEND_GATE_FILE,
-        JSON.stringify({ lastSentAt: now, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
+        JSON.stringify(
+          {
+            resumeAt: now + gapMs,
+            cooldownMs: gapMs,
+            updatedAt: new Date().toISOString(),
+            pid: process.pid,
+          },
+          null,
+          0
+        ),
         'utf8'
       );
     });
@@ -2881,12 +2894,26 @@ async function sendDM(page, username, adapter, options = {}) {
     senderAccountName = (await sb.getUserAccountName(options.clientId).catch(() => null)) || '';
   }
   const preferThreadName = options.preferThreadName !== false;
+  const hasCampaignCooldown =
+    options.minDelaySec != null &&
+    options.maxDelaySec != null &&
+    Number.isFinite(Number(options.minDelaySec)) &&
+    Number.isFinite(Number(options.maxDelaySec));
+  if (!hasCampaignCooldown) {
+    const statusMessage = 'Campaign is missing min/max send delay settings. Set them before starting.';
+    logger.warn(statusMessage);
+    return { ok: false, reason: 'missing_delay_config', statusMessage };
+  }
+  const sendCooldownMs = randomDelay(
+    Math.max(0, Number(options.minDelaySec)) * 1000,
+    Math.max(0, Number(options.maxDelaySec)) * 1000
+  );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
       const gapMs = await respectGlobalSendGap(options.globalSendGapMs || GLOBAL_SEND_GAP_MS).catch(() => 0);
       if (gapMs > 0) {
-        const gapMin = Math.max(1, Math.round(gapMs / 60000));
-        logger.log(`Global send cooldown active. Waiting ${gapMin} min before sending @${u}.`);
+        const gapSec = Math.max(1, Math.ceil(gapMs / 1000));
+        logger.log(`Shared cooldown active. Waiting ${gapSec} sec before sending @${u}.`);
         await delay(gapMs);
       }
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
@@ -2900,7 +2927,7 @@ async function sendDM(page, username, adapter, options = {}) {
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
-        await updateGlobalSendGateAfterSuccess().catch(() => {});
+        await updateGlobalSendGateAfterSuccess(sendCooldownMs).catch(() => {});
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
           sb.upsertLeadIdentity(options.clientId, u, {
@@ -2925,7 +2952,7 @@ async function sendDM(page, username, adapter, options = {}) {
           coldDmOnSend(payload).catch(() => {});
         }
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
-        return { ok: true };
+        return { ok: true, cooldownMs: sendCooldownMs };
       }
       const terminalReasons = [
         'user_not_found',
@@ -3293,13 +3320,18 @@ async function runBotMultiTenant() {
       const msg = sendResult.statusMessage || 'daily limit reached';
       logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
       sb.setClientStatusMessage(clientId, msg).catch(() => {});
+    } else if (!sendResult.ok && sendResult.reason === 'missing_delay_config') {
+      delayMs = 10 * 60 * 1000;
+      const msg = sendResult.statusMessage || 'campaign missing delay settings';
+      logger.warn(msg);
+      sb.setClientStatusMessage(clientId, msg).catch(() => {});
     } else {
-      delayMs =
-        work.minDelaySec != null && work.maxDelaySec != null
-          ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
-          : randomDelay(minDelayMs, maxDelayMs);
-      logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
-      sb.setClientStatusMessage(clientId, `Waiting. Next send in ${Math.round(delayMs / 60000)} min.`).catch(() => {});
+      delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
+      const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
+      const minSec = Math.max(0, Number(work.minDelaySec) || 0);
+      const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
+      logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
+      sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
     }
     await delay(delayMs);
   }
@@ -3507,7 +3539,7 @@ async function runBot() {
       work.type === 'campaign' && work.minDelaySec != null && work.maxDelaySec != null
         ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
         : randomDelay(minDelayMs, maxDelayMs);
-    logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+    logger.log(`Local next send in ${Math.round(delayMs / 60000)} minutes.`);
     await delay(delayMs);
     setImmediate(runOne);
   };

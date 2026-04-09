@@ -87,6 +87,22 @@ function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function hasValidCampaignSendDelayConfig(camp) {
+  const min = Number(camp?.min_delay_sec);
+  const max = Number(camp?.max_delay_sec);
+  return Number.isFinite(min) && Number.isFinite(max) && min >= 0 && max >= min;
+}
+
+function describeCampaignSendDelayConfigProblem(camp) {
+  const min = camp?.min_delay_sec;
+  const max = camp?.max_delay_sec;
+  if (min == null && max == null) return 'missing min_delay_sec and max_delay_sec';
+  if (min == null) return 'missing min_delay_sec';
+  if (max == null) return 'missing max_delay_sec';
+  if (Number(max) < Number(min)) return `max_delay_sec (${max}) is lower than min_delay_sec (${min})`;
+  return 'invalid send delay settings';
+}
+
 /**
  * Normalize schedule time to HH:mm:ss. Handles DB TIME (e.g. "03:00:00") and ISO timestamps (e.g. "2026-01-01T03:00:00.000Z").
  */
@@ -803,11 +819,23 @@ async function getClientNoWorkResumeAt(clientId) {
     };
   }
 
+  const delayProblems = await getCampaignsMissingSendDelays(clientId).catch(() => []);
+  if (delayProblems.length > 0) {
+    const first = delayProblems[0];
+    const extra = delayProblems.length > 1 ? ` (+${delayProblems.length - 1} more)` : '';
+    return {
+      message: `Campaign "${first.name || first.id}" is missing send delay settings (${first.reason}). Set min/max delay in campaign settings before starting${extra}.`,
+      reason: 'missing_delay_config',
+      resumeAt: null,
+    };
+  }
+
   let earliestScheduleResume = null;
   let firstWindow = null;
   let tzLabel = 'UTC';
   let allOutside = true;
   for (const camp of campaigns) {
+    if (!hasValidCampaignSendDelayConfig(camp)) continue;
     const { count: campPending } = await sb
       .from('cold_dm_campaign_leads')
       .select('*', { count: 'exact', head: true })
@@ -1718,6 +1746,76 @@ async function getActiveCampaigns(clientId) {
   }
 }
 
+async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return [];
+  let q = sb
+    .from('cold_dm_campaigns')
+    .select('id, name, status, min_delay_sec, max_delay_sec')
+    .eq('client_id', clientId);
+  if (campaignId) q = q.eq('id', campaignId);
+  const { data: campaigns, error } = await q.order('created_at', { ascending: true });
+  if (error) throw error;
+  if (!campaigns?.length) return [];
+
+  const problems = [];
+  for (const camp of campaigns) {
+    if (hasValidCampaignSendDelayConfig(camp)) continue;
+
+    let shouldBlock = camp.status === 'active';
+    if (!shouldBlock) {
+      const { count: pendingCount, error: pendingErr } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', camp.id)
+        .eq('status', 'pending');
+      if (pendingErr) throw pendingErr;
+      shouldBlock = (pendingCount ?? 0) > 0;
+    }
+
+    if (!shouldBlock) {
+      const { data: leadGroupRows, error: leadGroupErr } = await sb
+        .from('cold_dm_campaign_lead_groups')
+        .select('lead_group_id')
+        .eq('campaign_id', camp.id);
+      if (leadGroupErr) throw leadGroupErr;
+      const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+      if (leadGroupIds.length > 0) {
+        const { data: mappedLeads, error: mappedLeadsErr } = await sb
+          .from('cold_dm_leads')
+          .select('username')
+          .eq('client_id', clientId)
+          .in('lead_group_id', leadGroupIds);
+        if (mappedLeadsErr) throw mappedLeadsErr;
+        const usernames = (mappedLeads || [])
+          .map((r) => normalizeUsername(r.username || '').toLowerCase())
+          .filter(Boolean);
+        if (usernames.length > 0) {
+          const { data: sentRows, error: sentErr } = await sb
+            .from('cold_dm_sent_messages')
+            .select('username')
+            .eq('client_id', clientId)
+            .in('username', usernames);
+          if (sentErr) throw sentErr;
+          const sentSet = new Set((sentRows || []).map((r) => normalizeUsername(r.username || '').toLowerCase()));
+          shouldBlock = usernames.some((u) => !sentSet.has(u));
+        }
+      }
+    }
+
+    if (shouldBlock) {
+      problems.push({
+        id: camp.id,
+        name: camp.name || null,
+        status: camp.status,
+        reason: describeCampaignSendDelayConfigProblem(camp),
+      });
+    }
+  }
+
+  return problems;
+}
+
 /**
  * Returns a short hint for why there is no sendable work for this client.
  */
@@ -1729,6 +1827,12 @@ async function getNoWorkHint(clientId) {
     .select('id, name, status')
     .eq('client_id', clientId);
   if (!campaigns?.length) return 'No campaigns.';
+  const delayProblems = await getCampaignsMissingSendDelays(clientId).catch(() => []);
+  if (delayProblems.length > 0) {
+    const first = delayProblems[0];
+    const extra = delayProblems.length > 1 ? ` (+${delayProblems.length - 1} more)` : '';
+    return `Campaign "${first.name || first.id}" is missing send delay settings (${first.reason}). Set min/max delay in campaign settings before starting${extra}.`;
+  }
   const withPending = await Promise.all(
     campaigns.map(async (c) => {
       const { count } = await sb
@@ -1847,6 +1951,12 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) {
       dbg.inSchedule = false;
       dbg.reason = 'outside_schedule';
+      campaignDebug.push(dbg);
+      continue;
+    }
+    if (!hasValidCampaignSendDelayConfig(camp)) {
+      dbg.reason = 'missing_delay_config';
+      dbg.blockedBy = 'missing_delay_config';
       campaignDebug.push(dbg);
       continue;
     }
@@ -2127,6 +2237,7 @@ async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) 
   let reactivated = 0;
   for (const camp of campaigns) {
     if (camp.status === 'active') continue;
+    if (!hasValidCampaignSendDelayConfig(camp)) continue;
     const { count: pendingCount } = await sb
       .from('cold_dm_campaign_leads')
       .select('*', { count: 'exact', head: true })
@@ -2272,6 +2383,7 @@ module.exports = {
   getClientNoWorkReason,
   getClientNoWorkResumeAt,
   getNoWorkHint,
+  getCampaignsMissingSendDelays,
   getFirstNameBlocklist,
   getUserAccountName,
   addCampaignLeadsFromGroups,

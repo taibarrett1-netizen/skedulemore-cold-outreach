@@ -33,6 +33,7 @@ const {
   savePlatformScraperSession,
   addCampaignLeadsFromGroups,
   getNoWorkHint,
+  getCampaignsMissingSendDelays,
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
@@ -939,6 +940,18 @@ app.post('/api/control/start', async (req, res) => {
           `[API] Reactivated ${reactivated} campaign(s) with pending leads for clientId=${clientId}` +
             (campaignId ? ` campaignId=${campaignId}` : '')
         );
+      }
+      const delayProblems = await getCampaignsMissingSendDelays(clientId, campaignId).catch(() => []);
+      if (delayProblems.length > 0) {
+        const labels = delayProblems
+          .slice(0, 3)
+          .map((c) => `"${c.name || c.id}"`)
+          .join(', ');
+        const extra = delayProblems.length > 3 ? ` (+${delayProblems.length - 3} more)` : '';
+        const errorMessage =
+          `Campaign ${labels}${extra} missing min/max send delay settings. Set those in campaign settings before pressing Start.`;
+        await setClientStatusMessage(clientId, errorMessage).catch(() => {});
+        return res.status(400).json({ ok: false, error: errorMessage, problems: delayProblems });
       }
       const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
       if (noWorkHint) {
