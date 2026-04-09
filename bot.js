@@ -134,6 +134,64 @@ async function saveLoginDebugScreenshot(page, label) {
   }
 }
 
+function wantsTermsUnblockDebugScreenshot() {
+  return (
+    process.env.TERMS_UNBLOCK_DEBUG_SCREENSHOTS === '1' ||
+    process.env.TERMS_UNBLOCK_DEBUG_SCREENSHOTS === 'true' ||
+    process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
+    process.env.LOGIN_DEBUG === '1' ||
+    process.env.LOGIN_DEBUG === 'true'
+  );
+}
+
+/** Full-page PNG when Instagram shows /terms/unblock (see button labels). Same folder as login-debug. */
+async function saveTermsUnblockDebugScreenshot(page, label) {
+  if (!wantsTermsUnblockDebugScreenshot() || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const safe = String(label || 'terms')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .slice(0, 48);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_${safe}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[terms/unblock] debug screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[terms/unblock] debug screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
+async function logTermsUnblockVisibleButtons(page) {
+  if (!wantsTermsUnblockDebugScreenshot() || !page) return;
+  try {
+    const rows = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll('button, [role="button"], a, div[tabindex="0"]').forEach((el) => {
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.width < 2 || r.height < 2) return;
+          const st = window.getComputedStyle(el);
+          if (st.visibility === 'hidden' || st.display === 'none') return;
+          const t = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+          const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+          const aTrim = String(a).trim().slice(0, 120);
+          if (!t && !aTrim) return;
+          out.push({ tag: el.tagName, text: t, ariaLabel: aTrim });
+        } catch {
+          // ignore
+        }
+      });
+      return out.slice(0, 40);
+    });
+    logger.log(`[terms/unblock] visible buttons/links (text + aria-label): ${JSON.stringify(rows)}`);
+  } catch (e) {
+    logger.warn('[terms/unblock] button dump failed: ' + (e.message || e));
+  }
+}
+
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
 function instagramAuthUrlFailureReason(url) {
   try {
@@ -272,54 +330,179 @@ async function dismissInstagramCookieConsent(page) {
   return true;
 }
 
-/** Handle Instagram /terms/unblock interstitial by scrolling and accepting terms. */
+function isInstagramTermsUnblockUrl(url) {
+  return typeof url === 'string' && url.toLowerCase().includes('/terms/unblock');
+}
+
+/**
+ * Instagram /terms/unblock: long terms + scroll, then Accept; often a second modal
+ * "Review and Agree" / "You're all set!" with OK. Prioritize OK on that modal, then Accept.
+ */
 async function handleInstagramTermsUnblock(page) {
-  const isTermsUnblockUrl = (url) => typeof url === 'string' && url.toLowerCase().includes('/terms/unblock');
-  if (!isTermsUnblockUrl(page.url())) return false;
+  if (!isInstagramTermsUnblockUrl(page.url())) return false;
 
-  logger.warn('Instagram terms/unblock interstitial detected. Attempting auto-accept...');
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const clicked = await page.evaluate(() => {
-      const body = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
-      if (!body.includes('terms') && !body.includes('unblock') && !body.includes('accept')) return false;
+  logger.warn('Instagram terms/unblock interstitial detected. Scrolling and clicking Accept / OK...');
+  await saveTermsUnblockDebugScreenshot(page, 'terms_unblock_initial');
+  await logTermsUnblockVisibleButtons(page);
 
-      // Some variants require scrolling before the accept CTA is enabled/visible.
-      const scrollers = [document.scrollingElement, document.documentElement, document.body].filter(Boolean);
-      for (const s of scrollers) {
+  const maxPasses = 40;
+
+  for (let pass = 0; pass < maxPasses; pass++) {
+    if (!isInstagramTermsUnblockUrl(page.url())) {
+      logger.log(`terms/unblock cleared; url=${page.url()}`);
+      return true;
+    }
+
+    if (pass === 10) {
+      await saveTermsUnblockDebugScreenshot(page, 'terms_unblock_after_scroll');
+      await logTermsUnblockVisibleButtons(page);
+    }
+
+    // Keyboard scroll backup (some layouts only respond to this).
+    if (pass % 3 === 0) {
+      await page.keyboard.press('End').catch(() => {});
+      await delay(200);
+    }
+
+    const step = await page.evaluate(() => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const lower = (s) => norm(s).toLowerCase();
+
+      function visible(el) {
+        if (!el) return false;
         try {
-          s.scrollTop = Math.max(s.scrollTop || 0, Math.floor((s.scrollHeight || 0) * 0.35));
+          const st = window.getComputedStyle(el);
+          if (st.visibility === 'hidden' || st.display === 'none' || parseFloat(st.opacity || '1') === 0) return false;
+          const r = el.getBoundingClientRect();
+          return r.width >= 2 && r.height >= 2 && r.bottom > 0 && r.top < window.innerHeight + 200;
+        } catch {
+          return false;
+        }
+      }
+
+      function clickEl(el) {
+        if (!el) return false;
+        const btn = el.closest('button, [role="button"], a') || el;
+        try {
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        } catch {
+          btn.click();
+        }
+        return true;
+      }
+
+      // Scroll window and inner scroll regions (terms are often in a nested div).
+      const roots = [document.scrollingElement, document.documentElement, document.body].filter(Boolean);
+      for (const r of roots) {
+        try {
+          r.scrollTop = (r.scrollHeight || 0) - (r.clientHeight || 0);
         } catch {
           // ignore
         }
       }
+      document.querySelectorAll('div, main, section, article').forEach((el) => {
+        try {
+          if (el.scrollHeight > (el.clientHeight || 0) + 80) {
+            el.scrollTop = el.scrollHeight;
+          }
+        } catch {
+          // ignore
+        }
+      });
 
-      const clickables = Array.from(document.querySelectorAll('button, [role="button"], a, span'));
-      const target =
-        clickables.find((el) => /accept|agree|continue|i agree|ok/i.test((el.textContent || '').trim())) ||
-        clickables.find((el) => /next/i.test((el.textContent || '').trim()));
-      if (!target || target.offsetParent === null) return false;
-      const btn = target.closest('button, [role="button"], a') || target;
-      btn.click();
-      return true;
+      const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+      const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div[tabindex="0"]'));
+      const labelOf = (el) => {
+        const t = lower(el.textContent);
+        const a = lower(el.getAttribute && el.getAttribute('aria-label'));
+        return { t, a, combined: `${t} ${a}`.trim() };
+      };
+
+      // 1) Success overlay: "Review and Agree" / "You're all set!" → blue OK
+      const successHint =
+        bodyText.includes("you're all set") ||
+        bodyText.includes('you’re all set') ||
+        bodyText.includes('review and agree') ||
+        bodyText.includes('thank you for reviewing');
+      if (successHint) {
+        for (const el of nodes) {
+          const { t, a } = labelOf(el);
+          if (!visible(el)) continue;
+          const okWord =
+            t === 'ok' ||
+            t === 'done' ||
+            t === 'got it' ||
+            t === 'close' ||
+            (t.length > 0 && t.length <= 28 && /^(ok|done)$/i.test(t)) ||
+            /^(ok|done|close)\b/i.test((a || '').trim()) ||
+            /\b(ok|done)\b/i.test(a);
+          if (okWord) {
+            return { action: 'ok_modal', label: t || a || 'ok', ok: clickEl(el) };
+          }
+        }
+        // Blue bar button: sometimes only inner span; pick largest visible primary-looking button in dialog
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+        for (const d of dialogs) {
+          const btns = Array.from(d.querySelectorAll('button, [role="button"]')).filter(visible);
+          const primary = btns.find((b) => {
+            const { t } = labelOf(b);
+            return t === 'ok' || t === 'done' || /^ok$/i.test(t);
+          });
+          if (primary) return { action: 'ok_modal_dialog', label: norm(primary.textContent), ok: clickEl(primary) };
+          if (btns.length === 1) return { action: 'ok_modal_single', label: norm(btns[0].textContent), ok: clickEl(btns[0]) };
+        }
+      }
+
+      // 2) Primary terms CTAs (exact-ish; avoid matching random "next" in nav)
+      const primaryRes = [
+        /^accept$/i,
+        /^i agree$/i,
+        /^agree$/i,
+        /^agree and continue$/i,
+        /^continue$/i,
+        /^review now$/i,
+      ];
+      for (const el of nodes) {
+        const t = norm(el.textContent);
+        const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+        const pick = t || aria;
+        if (!pick || pick.length > 96) continue;
+        if (!visible(el)) continue;
+        if (primaryRes.some((re) => re.test(pick))) {
+          return { action: 'primary_cta', label: pick, ok: clickEl(el) };
+        }
+      }
+
+      // 3) Looser: line is mostly an accept phrase
+      for (const el of nodes) {
+        const t = lower(el.textContent);
+        if (!t || t.length > 72) continue;
+        if (!visible(el)) continue;
+        if (
+          /\baccept\b/.test(t) ||
+          /\bagree\b/.test(t) ||
+          (t.includes('continue') && (t.includes('agree') || t.includes('terms')))
+        ) {
+          return { action: 'loose_cta', label: t.slice(0, 48), ok: clickEl(el) };
+        }
+      }
+
+      return { action: 'scroll_only', label: '', ok: false };
     });
 
-    if (!clicked) {
-      await delay(900);
+    if (step.ok) {
+      logger.log(`terms/unblock pass ${pass + 1}: ${step.action} "${step.label || ''}"`);
+      await delay(1600);
       continue;
     }
 
-    // Wait incrementally; this page usually redirects after a short delay.
-    for (let i = 0; i < 5; i++) {
-      await delay(1200);
-      const now = page.url();
-      if (!isTermsUnblockUrl(now)) {
-        logger.log(`terms/unblock accepted; redirected to ${now}`);
-        return true;
-      }
-    }
+    await page.evaluate(() => {
+      window.scrollBy(0, Math.min(900, window.innerHeight));
+    });
+    await delay(350);
   }
 
-  return false;
+  return !isInstagramTermsUnblockUrl(page.url());
 }
 
 function buildVoiceSendConfig(sendOpts = {}) {
@@ -724,14 +907,19 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (wantsVoiceNotes(voiceCfg)) await applyDesktopEmulation(page);
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
-  if (page.url().toLowerCase().includes('/terms/unblock')) {
-    const handled = await handleInstagramTermsUnblock(page);
-    if (handled) {
-      // Ensure we land on DM new thread page after terms acceptance.
+  for (let termsRound = 0; termsRound < 3; termsRound++) {
+    if (!isInstagramTermsUnblockUrl(page.url())) break;
+    const handled = await handleInstagramTermsUnblock(page).catch(() => false);
+    if (handled && !isInstagramTermsUnblockUrl(page.url())) {
       if (!page.url().toLowerCase().includes('/direct/')) {
         await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
       }
       await delay(1200);
+      break;
+    }
+    if (isInstagramTermsUnblockUrl(page.url())) {
+      await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+      await delay(2000);
     }
   }
 
