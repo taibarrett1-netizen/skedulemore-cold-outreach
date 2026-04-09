@@ -3303,12 +3303,18 @@ async function runBotMultiTenant() {
       continue;
     }
 
-    const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch(() => null);
+    logger.log(`[send-worker] claimed job ${claimedJob.id} for ${claimedJob.username || '?'}`);
+    const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
+      logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);
+      return null;
+    });
     if (!resolved) {
+      logger.error(`[send-worker] job ${claimedJob.id} resolution returned null (job_resolution_failed)`);
       await sb.updateSendJob(claimedJob.id, { status: 'failed', last_error_class: 'job_resolution_failed', last_error_message: 'Could not resolve send job payload.' }, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(1000, 3000));
       continue;
     }
+    logger.log(`[send-worker] job ${claimedJob.id} disposition=${resolved.disposition} reason=${resolved.reason || 'none'}`);
     if (resolved.disposition === 'cancelled') {
       await sb.updateSendJob(claimedJob.id, {
         status: 'cancelled',
