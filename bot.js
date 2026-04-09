@@ -114,9 +114,7 @@ function wantsVoiceNotes(sendOpts = {}) {
 async function saveLoginDebugScreenshot(page, label) {
   const enabled =
     process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
-    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
-    process.env.LOGIN_DEBUG === '1' ||
-    process.env.LOGIN_DEBUG === 'true';
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true';
   if (!enabled || !page) return null;
   try {
     fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
@@ -139,9 +137,7 @@ function wantsTermsUnblockDebugScreenshot() {
     process.env.TERMS_UNBLOCK_DEBUG_SCREENSHOTS === '1' ||
     process.env.TERMS_UNBLOCK_DEBUG_SCREENSHOTS === 'true' ||
     process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
-    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
-    process.env.LOGIN_DEBUG === '1' ||
-    process.env.LOGIN_DEBUG === 'true'
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true'
   );
 }
 
@@ -197,9 +193,7 @@ function wantsDmSearchDebugScreenshot() {
     process.env.DM_SEARCH_DEBUG_SCREENSHOTS === '1' ||
     process.env.DM_SEARCH_DEBUG_SCREENSHOTS === 'true' ||
     process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
-    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
-    process.env.LOGIN_DEBUG === '1' ||
-    process.env.LOGIN_DEBUG === 'true'
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true'
   );
 }
 
@@ -812,9 +806,13 @@ async function login(page, credentials) {
   };
 
   let loginDiag = await findLoginFields().catch(() => null);
-  for (let attempt = 0; attempt < 2 && (!loginDiag || !loginDiag.ok); attempt++) {
+  const loginReloadAttempts = Math.max(
+    0,
+    Math.min(2, parseInt(process.env.LOGIN_FORM_RELOAD_ATTEMPTS || '1', 10) || 1)
+  );
+  for (let attempt = 0; attempt < loginReloadAttempts && (!loginDiag || !loginDiag.ok); attempt++) {
     logger.warn(
-      `Login fields not ready yet on attempt ${attempt + 1}/3 for @${username}. Retrying page load before failing.`
+      `Login fields not ready yet on attempt ${attempt + 1}/${loginReloadAttempts + 1} for @${username}. Retrying page load before failing.`
     );
     await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
     await delay(4000 + attempt * 1000);
@@ -879,6 +877,7 @@ async function login(page, credentials) {
   const loginResponses = [];
   const allInstagramRequests = [];
   const respHandler = async (response) => {
+    if (!LOGIN_DEBUG) return;
     const url = response.url();
     const status = response.status();
     const req = response.request();
@@ -1113,8 +1112,10 @@ async function login(page, credentials) {
     else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again in 30–60 minutes.';
     else hint = ' If your password is correct, log in once in a normal browser to clear any security check, then retry.';
     logger.error('Login failed. submitMethod=' + submitMethod + ' url=' + urlAfterLogin);
-    logger.error('Login API responses (count=' + loginResponses.length + '): ' + (loginResponses.length ? JSON.stringify(loginResponses.slice(-5)) : 'none captured'));
-    if (allInstagramRequests.length) logger.error('Recent Instagram requests: ' + JSON.stringify(allInstagramRequests.slice(-10)));
+    if (LOGIN_DEBUG) {
+      logger.error('Login API responses (count=' + loginResponses.length + '): ' + (loginResponses.length ? JSON.stringify(loginResponses.slice(-5)) : 'none captured'));
+      if (allInstagramRequests.length) logger.error('Recent Instagram requests: ' + JSON.stringify(allInstagramRequests.slice(-10)));
+    }
     logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
     throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
