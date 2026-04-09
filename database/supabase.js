@@ -1864,12 +1864,28 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
     p_worker_id: workerId,
     p_lease_seconds: leaseSeconds,
   });
-  if (!error) {
-    const rows = Array.isArray(data) ? data : data != null ? [data] : [];
-    if (rows.length > 0) return rows[0];
-    return null;
+  if (error) {
+    console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
+    return claimColdDmSendJobFallback(workerId, leaseSeconds);
   }
-  return claimColdDmSendJobFallback(workerId, leaseSeconds);
+  const rows = Array.isArray(data) ? data : data != null ? [data] : [];
+  if (rows.length > 0) return rows[0];
+
+  const { data: pendingCheck } = await sb
+    .from('cold_dm_send_jobs')
+    .select('id, status, available_at')
+    .in('status', ['pending', 'retry'])
+    .order('created_at', { ascending: true })
+    .limit(5);
+  if (pendingCheck?.length) {
+    const nowIso = new Date().toISOString();
+    console.error(
+      `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} pending/retry jobs exist. ` +
+      `First: id=${pendingCheck[0].id} status=${pendingCheck[0].status} available_at=${pendingCheck[0].available_at} now=${nowIso}`
+    );
+    return claimColdDmSendJobFallback(workerId, leaseSeconds);
+  }
+  return null;
 }
 
 async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
