@@ -1301,9 +1301,39 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return t;
         };
 
-        // 1) Prefer DM thread header relation:
-        // line with username (small) + nearby line with display name (larger).
-        const headerRoots = Array.from(document.querySelectorAll('header, [role="banner"]'));
+        /** Open thread column only (anchored from Message composer — not inbox list). */
+        function threadPaneRoot() {
+          const vis = (el) => {
+            try {
+              return el && el.offsetParent !== null;
+            } catch {
+              return false;
+            }
+          };
+          const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
+          const compose = composers.find((el) => {
+            const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            return ph.includes('message') || aria.includes('message');
+          });
+          if (!compose) return document.body;
+          let main = compose.closest('[role="main"]') || compose.closest('main');
+          if (main) return main;
+          let el = compose;
+          const vw = document.documentElement.clientWidth || 1200;
+          for (let depth = 0; depth < 14 && el; depth++) {
+            el = el.parentElement;
+            if (!el) break;
+            const r = el.getBoundingClientRect();
+            if (r.width >= vw * 0.28 && r.height >= 180) return el;
+          }
+          return compose.parentElement || document.body;
+        }
+
+        const pane = threadPaneRoot();
+
+        // 1) Prefer DM thread header relation (within open thread pane only).
+        const headerRoots = Array.from(pane.querySelectorAll('header, [role="banner"]'));
         for (const root of headerRoots) {
           const lines = (root.innerText || '')
             .split(/\n/)
@@ -1318,7 +1348,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           }
         }
 
-        // 2) Prefer thread header title/name when available.
+        // 2) Prefer thread header title/name when available (pane only).
         const headerCandidates = [];
         const selectors = [
           'header h1',
@@ -1329,19 +1359,18 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           '[role="banner"] [role="heading"]',
         ];
         for (const sel of selectors) {
-          document.querySelectorAll(sel).forEach((el) => {
+          pane.querySelectorAll(sel).forEach((el) => {
             const txt = normalizeCandidateName(el.textContent || '');
             if (txt) headerCandidates.push(txt);
           });
         }
         if (headerCandidates.length) {
-          // Pick the longest non-generic heading, usually the full profile name.
           headerCandidates.sort((a, b) => b.length - a.length);
           return headerCandidates[0];
         }
 
-        // 3) Try visible links that point to this profile and use nearby text.
-        const profileLink = Array.from(document.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).find((a) => {
+        // 3) Visible profile link in pane → nearby text.
+        const profileLink = Array.from(pane.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).find((a) => {
           const href = (a.getAttribute('href') || '').toLowerCase();
           return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
         });
@@ -1351,8 +1380,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (txt) return txt;
         }
 
-        // 4) Legacy fallback: infer from body text around username.
-        const body = document.body ? document.body.innerText : '';
+        // 4) Fallback: text in pane only.
+        const body = pane.innerText || '';
         const idx = body.toLowerCase().indexOf(needle);
         if (idx > 0) {
           const before = body.slice(0, idx).trim();
