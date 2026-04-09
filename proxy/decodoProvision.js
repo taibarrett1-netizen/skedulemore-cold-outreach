@@ -240,6 +240,75 @@ function getDecodoGateCountryCodeEffective() {
   return normalizeDecodoGateCountryCode(t);
 }
 
+/** Decodo `-city-slug` (with `country` set). E.g. `london`, `new_york`. */
+function getDecodoGateCitySlug() {
+  const t = (process.env.DECODO_GATE_CITY || '').trim().toLowerCase().replace(/\s+/g, '_');
+  return t.replace(/[^a-z0-9_]/g, '').slice(0, 64) || '';
+}
+
+function parseDecodoGateUserFromProxyUrl(proxyUrl) {
+  try {
+    const u = new URL(String(proxyUrl).trim());
+    if (!u.username) return null;
+    return decodeURIComponent(u.username);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * True if stored assignment URL was built under old rules (e.g. no `-country-gb`) and must be rebuilt
+ * so Decodo actually applies UK/sticky — otherwise Supabase keeps a random-world exit (e.g. Kuwait).
+ */
+function decodoStoredProxyUrlNeedsRefresh(clientId, instagramUsername, storedProxyUrl, providerRef) {
+  if (!storedProxyUrl || typeof storedProxyUrl !== 'string') return false;
+  if (providerRef && providerRef.service_type === 'shared_proxies') return false;
+
+  const isResidential = !providerRef?.service_type || providerRef.service_type === 'residential_proxies';
+  if (!isResidential) return false;
+
+  const gateUser = parseDecodoGateUserFromProxyUrl(storedProxyUrl);
+  if (!gateUser) return false;
+
+  const wantCountry = getDecodoGateCountryCodeEffective();
+  const mCountry = gateUser.match(/-country-([a-z]{2})(?=-|$)/);
+  const hasCountry = mCountry ? mCountry[1] : null;
+  if (wantCountry) {
+    if (hasCountry !== wantCountry) return true;
+  } else if (hasCountry) {
+    return true;
+  }
+
+  const wantCity = getDecodoGateCitySlug();
+  if (wantCountry && wantCity) {
+    const mc = gateUser.match(/-city-([a-z0-9_]+)(?=-|$)/);
+    const hasCity = mc ? mc[1] : null;
+    if (hasCity !== wantCity) return true;
+  } else if (gateUser.match(/-city-[a-z0-9_]+(?=-|$)/) && !wantCity) {
+    return true;
+  }
+
+  const stickyOff = process.env.DECODO_STICKY_SESSION === '0' || process.env.DECODO_STICKY_SESSION === 'false';
+  if (stickyOff) {
+    if (gateUser.includes('-session-')) return true;
+  } else {
+    const key = stickySessionKeyForAssignment(clientId, instagramUsername);
+    let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '60', 10);
+    if (!Number.isFinite(stickyMins)) stickyMins = 60;
+    stickyMins = Math.min(1440, Math.max(30, stickyMins));
+    const needle = `-session-${key}-sessionduration-${stickyMins}`;
+    if (!gateUser.includes(needle)) return true;
+  }
+
+  const pref = getDecodoGateUsernamePrefix();
+  if (pref) {
+    const expectedStart = pref.endsWith('-') ? pref : `${pref}-`;
+    if (!gateUser.startsWith(expectedStart)) return true;
+  }
+
+  return false;
+}
+
 /**
  * @param {string} username - Decodo sub-user name (API), without gate prefix
  * @param {object} [opts]
@@ -265,6 +334,9 @@ function buildProxyUrlFromCredentials(username, password, opts = {}) {
       ? getDecodoGateCountryCodeEffective()
       : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY));
   if (cc) user = `${user}-country-${cc}`;
+  const citySlug = opts.citySlug !== undefined ? String(opts.citySlug || '').trim() : getDecodoGateCitySlug();
+  const cityNorm = citySlug.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 64);
+  if (cc && cityNorm) user = `${user}-city-${cityNorm}`;
   const sid = opts.stickySessionId;
   let mins = opts.stickyDurationMinutes;
   if (mins != null) mins = parseInt(String(mins), 10);
@@ -588,10 +660,12 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     serviceType === 'residential_proxies'
       ? getDecodoGateCountryCodeEffective()
       : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY) || undefined;
+  const gateCity = serviceType === 'residential_proxies' && gateCountry ? getDecodoGateCitySlug() || undefined : undefined;
   const providerRef = {
     decodo_subuser: subUsername,
     gate_username_prefix: getDecodoGateUsernamePrefix() || undefined,
     gate_country: gateCountry || undefined,
+    gate_city: gateCity,
     sticky_session: stickyKey ? stickyKey : undefined,
     sticky_session_duration_minutes: stickyKey ? stickyMins : undefined,
     gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
@@ -621,4 +695,7 @@ module.exports = {
   stickySessionKeyForAssignment,
   normalizeDecodoGateCountryCode,
   getDecodoGateCountryCodeEffective,
+  getDecodoGateCitySlug,
+  parseDecodoGateUserFromProxyUrl,
+  decodoStoredProxyUrlNeedsRefresh,
 };

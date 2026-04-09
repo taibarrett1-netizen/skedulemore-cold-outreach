@@ -399,12 +399,25 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
 
   const { data: existing, error: selErr } = await sb
     .from('cold_dm_proxy_assignments')
-    .select('id, proxy_url')
+    .select('id, proxy_url, provider_ref')
     .eq('client_id', clientId)
     .eq('instagram_username', ig)
     .maybeSingle();
   if (selErr) throw selErr;
   if (existing?.proxy_url) {
+    if (decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref)) {
+      const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig);
+      const { error: upErr } = await sb
+        .from('cold_dm_proxy_assignments')
+        .update({
+          proxy_url: proxyUrl,
+          provider_ref: providerRef,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', existing.id);
+      if (upErr) throw upErr;
+      return { proxyUrl, proxyAssignmentId: existing.id };
+    }
     return { proxyUrl: existing.proxy_url, proxyAssignmentId: existing.id };
   }
 
