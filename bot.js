@@ -826,23 +826,33 @@ async function login(page, credentials) {
   }
 
   const inputs = await page.$$('input');
-  let userEl = null;
-  let passEl = null;
-  for (const el of inputs) {
-    const props = await el.evaluate((node) => ({
+  const getFieldMeta = async (el) =>
+    el.evaluate((node) => ({
       type: node.type,
       visible: node.offsetParent !== null,
       name: node.name || '',
       autocomplete: node.autocomplete || '',
       placeholder: node.placeholder || '',
+      aria: node.getAttribute('aria-label') || '',
+      value: node.value || '',
     }));
-    if (props.visible && (props.name === 'username' || props.autocomplete === 'username' || props.type === 'text' || props.type === 'email' || props.type === '')) {
-      if (!userEl) userEl = el;
-    } else if (props.visible && (props.name === 'password' || props.autocomplete === 'current-password' || props.type === 'password')) {
-      passEl = el;
-      break;
+  const findField = async (chooser) => {
+    for (const el of inputs) {
+      const meta = await getFieldMeta(el);
+      if (!meta.visible) continue;
+      if (chooser(meta)) return { el, meta };
     }
-  }
+    return { el: null, meta: null };
+  };
+  const userChoice =
+    (await findField((p) => p.name === 'username' || p.autocomplete === 'username')) ||
+    (await findField((p) => p.placeholder.toLowerCase().includes('username') || p.placeholder.toLowerCase().includes('email'))) ||
+    (await findField((p) => p.type === 'text' || p.type === 'email' || p.type === ''));
+  const passChoice =
+    (await findField((p) => p.name === 'password' || p.autocomplete === 'current-password')) ||
+    (await findField((p) => p.placeholder.toLowerCase().includes('password') || p.type === 'password'));
+  const userEl = userChoice.el;
+  const passEl = passChoice.el;
   if (!userEl || !passEl) {
     inputs.forEach((el) => el.dispose());
     const failUrl = page.url();
@@ -878,11 +888,19 @@ async function login(page, credentials) {
   page.on('response', respHandler);
 
   logger.log('Login form found, entering credentials...');
-  await userEl.click();
+  await userEl.click({ clickCount: 3 }).catch(() => {});
+  await page.keyboard.down('Control').catch(() => {});
+  await page.keyboard.press('KeyA').catch(() => {});
+  await page.keyboard.up('Control').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
   await userEl.type(username, { delay: 80 + Math.floor(Math.random() * 60) });
   await userEl.dispose();
   await humanDelay();
-  await passEl.click();
+  await passEl.click({ clickCount: 3 }).catch(() => {});
+  await page.keyboard.down('Control').catch(() => {});
+  await page.keyboard.press('KeyA').catch(() => {});
+  await page.keyboard.up('Control').catch(() => {});
+  await page.keyboard.press('Backspace').catch(() => {});
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
 
