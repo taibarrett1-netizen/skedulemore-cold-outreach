@@ -248,14 +248,14 @@ function normalizeDecodoGateCountryCode(code) {
 
 /**
  * Country pin for residential routing.
- * Default: no pin (random pool / provider default). Set DECODO_GATE_COUNTRY=us (or any ISO2) to force a country.
+ * Default: Germany (`de`). Set DECODO_GATE_COUNTRY=us (or any ISO2) to force a different country.
  * Disable pin explicitly: DECODO_GATE_COUNTRY=none.
  */
 function getDecodoGateCountryCodeEffective() {
   const raw = process.env.DECODO_GATE_COUNTRY;
-  if (raw === undefined || raw === null) return '';
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 'de';
   const t = String(raw).trim().toLowerCase();
-  if (t === '' || t === 'none' || t === 'off' || t === '-' || t === 'any') return '';
+  if (t === 'none' || t === 'off' || t === '-' || t === 'any') return '';
   return normalizeDecodoGateCountryCode(t);
 }
 
@@ -359,7 +359,7 @@ function buildProxyUrlFromCredentials(username, password, opts = {}) {
     explicitCc ||
     (opts.useResidentialDefaultCountry !== false
       ? getDecodoGateCountryCodeEffective()
-      : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY));
+      : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY || 'de'));
   if (cc) user = `${user}-country-${cc}`;
   const citySlug = opts.citySlug !== undefined ? String(opts.citySlug || '').trim() : getDecodoGateCitySlug();
   const cityNorm = citySlug.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 64);

@@ -12,11 +12,11 @@ pm2 logs --lines 0
 cd ~/ColdDMs && git pull origin main && npm install && pm2 restart all
 cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-dashboard
 
-
+screenshot=/root/ColdDMs/logs/login-debug/1775764011860_before_submit.png
 cd /root/ColdDMs
 python3 -m http.server 8080
 
-scp root@178.62.52.200:/root/ColdDMs/logs/login-debug/1775760956859_before_submit.png ~/Downloads/
+scp root@178.62.52.200:/root/ColdDMs/logs/login-debug/1775764207691_email_checkpoint.png ~/Downloads/
 
 python3 - <<'PY'
 import requests

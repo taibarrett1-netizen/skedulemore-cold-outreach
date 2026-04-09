@@ -528,6 +528,7 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const ig = normalizeInstagramKey(instagramUsername);
   if (!ig) throw new Error('instagram username required for proxy resolution');
+  const forceGermany = (process.env.DECODO_GATE_COUNTRY || '').trim().toLowerCase() === 'de' || !(process.env.DECODO_GATE_COUNTRY || '').trim();
 
   const { data: existing, error: selErr } = await sb
     .from('cold_dm_proxy_assignments')
@@ -537,7 +538,9 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
     .maybeSingle();
   if (selErr) throw selErr;
   if (existing?.proxy_url) {
-    if (decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref)) {
+    const needsRefresh = decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref);
+    const missingGermanyPin = forceGermany && !String(existing.proxy_url).includes('-country-de');
+    if (needsRefresh || missingGermanyPin) {
       const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig);
       const { error: upErr } = await sb
         .from('cold_dm_proxy_assignments')

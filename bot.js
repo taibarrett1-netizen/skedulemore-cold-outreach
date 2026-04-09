@@ -3751,8 +3751,11 @@ async function runBot() {
  */
 async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null, options = {}) {
   const proxyUrl = options && options.proxyUrl;
-  const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
-  if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
+  const enableMobile = process.env.ENABLE_MOBILE_LOGIN === '1' || process.env.ENABLE_MOBILE_LOGIN === 'true';
+  const disableMobile = process.env.DISABLE_MOBILE_LOGIN === '1' || process.env.DISABLE_MOBILE_LOGIN === 'true';
+  const useMobile = enableMobile && !disableMobile;
+  if (useMobile) logger.log('Using mobile view for login (ENABLE_MOBILE_LOGIN is set).');
+  else logger.log('Using desktop view for login (default for login stability).');
   // NEW: Chrome fake mic with file injection (no PulseAudio needed).
   ensureChromeFakeMicPlaceholder(logger);
   const connectLaunch = {
