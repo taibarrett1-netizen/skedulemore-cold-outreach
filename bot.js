@@ -400,6 +400,57 @@ async function detectInstagramEmailVerificationState(page) {
   });
 }
 
+/** Detect code-entry challenge pages that should use the existing pending-code UI. */
+async function detectInstagramInteractiveChallengeState(page) {
+  return page.evaluate(() => {
+    const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
+    const lower = body.toLowerCase();
+    const path = location.pathname.toLowerCase();
+    const visibleInputs = Array.from(document.querySelectorAll('input')).filter((el) => {
+      try {
+        if (!el || el.disabled || el.type === 'hidden') return false;
+        const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0')) return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      } catch {
+        return false;
+      }
+    });
+    const hasCodeInput = visibleInputs.length > 0;
+    const emailMatch = body.match(/(?:sent to|to)\s+([A-Za-z0-9._%*+\-]+@[A-Za-z0-9.\-*]+\.[A-Za-z]{2,})/i);
+    const emailRequired =
+      hasCodeInput &&
+      (
+        lower.includes('check your email') ||
+        lower.includes('email verification') ||
+        lower.includes('enter the code we sent to') ||
+        lower.includes('we sent the code to') ||
+        lower.includes('sent to your email')
+      );
+    if (emailRequired) {
+      return { required: true, kind: 'email', maskedEmail: emailMatch ? emailMatch[1] : null };
+    }
+    const twoFactorRequired =
+      hasCodeInput &&
+      (
+        path.includes('/accounts/login/two_factor') ||
+        lower.includes('two-factor') ||
+        lower.includes('2fa') ||
+        lower.includes('security code') ||
+        lower.includes('6-digit code') ||
+        lower.includes('authentication app') ||
+        lower.includes('authenticator app') ||
+        lower.includes('whatsapp') ||
+        lower.includes('try another way')
+      );
+    if (twoFactorRequired) {
+      return { required: true, kind: 'two_factor', maskedEmail: null };
+    }
+    return { required: false, kind: null, maskedEmail: null };
+  });
+}
+
 /** Cookie consent blocks typing/clicks on login form; dismiss it before filling credentials. */
 async function dismissInstagramCookieConsent(page) {
   for (let attempt = 0; attempt < 4; attempt++) {
@@ -971,6 +1022,26 @@ async function login(page, credentials) {
   }
   await delay(1500);
 
+  const interactiveChallenge = await detectInstagramInteractiveChallengeState(page);
+  if (interactiveChallenge.required && interactiveChallenge.kind === 'two_factor') {
+    page.off('response', respHandler);
+    const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
+    err.code = 'TWO_FACTOR_REQUIRED';
+    err.page = page;
+    throw err;
+  }
+  if (interactiveChallenge.required && interactiveChallenge.kind === 'email') {
+    await saveLoginDebugScreenshot(page, 'email_checkpoint');
+    page.off('response', respHandler);
+    const err = new Error(
+      `Email verification required.${interactiveChallenge.maskedEmail ? ` Enter the code sent to ${interactiveChallenge.maskedEmail}.` : ''}`
+    );
+    err.code = 'EMAIL_VERIFICATION_REQUIRED';
+    err.page = page;
+    err.maskedEmail = interactiveChallenge.maskedEmail || null;
+    throw err;
+  }
+
   // Handle two-factor authentication page
   if (page.url().includes('/accounts/login/two_factor')) {
     const twoFactorCode = credentials?.twoFactorCode ? String(credentials.twoFactorCode).replace(/\D/g, '').slice(0, 6) : '';
@@ -1043,7 +1114,8 @@ async function login(page, credentials) {
     throw err;
   }
 
-  if (page.url().includes('/accounts/login')) {
+  const shouldRetryLoginSubmit = !['0', 'false'].includes(String(process.env.LOGIN_RETRY_SUBMIT || '1').toLowerCase());
+  if (shouldRetryLoginSubmit && page.url().includes('/accounts/login')) {
     logger.log('Still on login page; retrying submit (click only)...');
     const retryClick = await page.evaluate(function () {
       var xpaths = [
@@ -1068,6 +1140,26 @@ async function login(page, credentials) {
       }
       await delay(1500);
     }
+  }
+
+  const interactiveChallengeAfterRetry = await detectInstagramInteractiveChallengeState(page);
+  if (interactiveChallengeAfterRetry.required && interactiveChallengeAfterRetry.kind === 'two_factor') {
+    page.off('response', respHandler);
+    const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
+    err.code = 'TWO_FACTOR_REQUIRED';
+    err.page = page;
+    throw err;
+  }
+  if (interactiveChallengeAfterRetry.required && interactiveChallengeAfterRetry.kind === 'email') {
+    await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
+    page.off('response', respHandler);
+    const err = new Error(
+      `Email verification required.${interactiveChallengeAfterRetry.maskedEmail ? ` Enter the code sent to ${interactiveChallengeAfterRetry.maskedEmail}.` : ''}`
+    );
+    err.code = 'EMAIL_VERIFICATION_REQUIRED';
+    err.page = page;
+    err.maskedEmail = interactiveChallengeAfterRetry.maskedEmail || null;
+    throw err;
   }
 
   const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
