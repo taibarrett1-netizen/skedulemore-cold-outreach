@@ -1022,11 +1022,9 @@ async function getClientNoWorkResumeAt(clientId) {
     return { message: unsendableHint, reason: 'no_sendable_work', resumeAt: null };
   }
   return {
-    message:
-      `Pending leads exist (${pendingTotal}) but none are currently sendable. ` +
-      'Check lead groups assigned, message group/template configured, and per-campaign limits/schedule.',
-    reason: 'no_sendable_work',
-    resumeAt: null,
+    message: null,
+    reason: 'pending_ready',
+    resumeAt: new Date(Date.now() + 15_000),
   };
 }
 
@@ -1987,12 +1985,27 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     });
   }
   if (rows.length === 0) return 0;
-  const { error } = await sb.from('cold_dm_send_jobs').upsert(rows, {
-    onConflict: 'client_id,idempotency_key',
-    ignoreDuplicates: true,
-  });
-  if (error) throw error;
-  return rows.length;
+  let insertError = null;
+  try {
+    const { error } = await sb.from('cold_dm_send_jobs').upsert(rows, {
+      onConflict: 'client_id,idempotency_key',
+      ignoreDuplicates: true,
+    });
+    if (error) throw error;
+    return rows.length;
+  } catch (e) {
+    insertError = e;
+  }
+  if (insertError?.code === '42P10') {
+    console.error('[syncSendJobsForCampaign] ON CONFLICT index missing; falling back to individual inserts');
+    let inserted = 0;
+    for (const row of rows) {
+      const { error: singleErr } = await sb.from('cold_dm_send_jobs').insert(row);
+      if (!singleErr) inserted += 1;
+    }
+    return inserted;
+  }
+  throw insertError;
 }
 
 async function syncSendJobsForClient(clientId, campaignId = null) {
@@ -2407,6 +2420,8 @@ async function getMostSpecificNoWorkHint(clientId) {
   const campaigns = await getActiveCampaigns(clientId);
   if (!campaigns?.length) return '';
 
+  let anyWithPending = false;
+
   for (const camp of campaigns) {
     const { count: campPending } = await sb
       .from('cold_dm_campaign_leads')
@@ -2414,6 +2429,8 @@ async function getMostSpecificNoWorkHint(clientId) {
       .eq('campaign_id', camp.id)
       .eq('status', 'pending');
     if ((campPending ?? 0) === 0) continue;
+
+    anyWithPending = true;
 
     if (!hasValidCampaignSendDelayConfig(camp)) {
       return `Campaign "${camp.name || camp.id}" is missing send delay settings (${describeCampaignSendDelayConfigProblem(camp)}). Set min/max delay in campaign settings before starting.`;
@@ -2452,6 +2469,9 @@ async function getMostSpecificNoWorkHint(clientId) {
     }
   }
 
+  if (anyWithPending) {
+    return '';
+  }
   return 'No campaigns with pending leads.';
 }
 

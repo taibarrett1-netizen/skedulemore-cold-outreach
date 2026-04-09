@@ -3220,7 +3220,11 @@ async function runBotMultiTenant() {
     if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();
       for (const cid of clientIds) {
-        await sb.syncSendJobsForClient(cid).catch(() => 0);
+        const synced = await sb.syncSendJobsForClient(cid).catch((e) => {
+          logger.error(`[send-worker] syncSendJobsForClient failed for ${cid}: ${e?.message || e}`);
+          return 0;
+        });
+        if (synced > 0) logger.log(`[send-worker] synced ${synced} send job(s) for client ${cid}`);
       }
       claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     }
@@ -3252,6 +3256,12 @@ async function runBotMultiTenant() {
           await sb.setClientStatusMessage(cid, info.message).catch(() => {});
         }
         if (info.reason === 'no_pending') continue;
+        if (info.reason === 'pending_ready') {
+          await sb.setClientStatusMessage(cid, 'Syncing send jobs…').catch(() => {});
+          earliestResumeAt = info.resumeAt || new Date(Date.now() + 15_000);
+          resumeReason = 'pending_ready';
+          continue;
+        }
         if (info.resumeAt && (!earliestResumeAt || info.resumeAt.getTime() < earliestResumeAt.getTime())) {
           earliestResumeAt = info.resumeAt;
           resumeReason = info.reason;
