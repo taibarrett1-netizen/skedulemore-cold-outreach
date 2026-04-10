@@ -3295,8 +3295,10 @@ async function runBotMultiTenant() {
         process.exit(0);
       }
       const sleepMs = Math.max(1000, earliestResumeAt.getTime() - Date.now());
+      const sleepSec = Math.ceil(sleepMs / 1000);
       const sleepMin = Math.round(sleepMs / 60000);
-      logger.log(`Paused (${resumeReason}). Resuming in ${sleepMin} min at ${earliestResumeAt.toISOString().slice(0, 16)}.`);
+      const sleepLabel = sleepSec < 60 ? `${sleepSec}s` : `${sleepMin} min`;
+      logger.log(`Paused (${resumeReason}). Resuming in ${sleepLabel} at ${earliestResumeAt.toISOString().slice(0, 16)}.`);
       const SCHEDULE_RECHECK_MS = 5 * 60 * 1000;
       const chunkMs = resumeReason === 'outside_schedule' ? Math.min(sleepMs, SCHEDULE_RECHECK_MS) : sleepMs;
       await delay(chunkMs);

@@ -1029,6 +1029,27 @@ async function getClientNoWorkResumeAt(clientId) {
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
   }
+  // Queue-aware wakeup: if all pending/retry jobs are deferred to the future (e.g. outside schedule),
+  // do not spin on "pending_ready" every few seconds.
+  const nowMs = Date.now();
+  const { data: earliestQueuedJob } = await sb
+    .from('cold_dm_send_jobs')
+    .select('available_at, status')
+    .eq('client_id', clientId)
+    .in('status', ['pending', 'retry'])
+    .order('available_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  const earliestQueuedAtRaw = earliestQueuedJob?.available_at || null;
+  const earliestQueuedAtMs = earliestQueuedAtRaw ? Date.parse(earliestQueuedAtRaw) : NaN;
+  if (Number.isFinite(earliestQueuedAtMs) && earliestQueuedAtMs > nowMs + 1000) {
+    const resumeAt = new Date(earliestQueuedAtMs);
+    return {
+      message: `Queued send jobs are deferred until ${resumeAt.toISOString().slice(0, 16)} UTC.`,
+      reason: 'queue_wait',
+      resumeAt,
+    };
+  }
   const unsendableHint = await getMostSpecificNoWorkHint(clientId).catch(() => '');
   if (unsendableHint) {
     return { message: unsendableHint, reason: 'no_sendable_work', resumeAt: null };
