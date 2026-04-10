@@ -101,6 +101,17 @@ function applyPuppeteerSlowMo(launchOpts) {
   return launchOpts;
 }
 
+async function applyConnectFingerprint(page) {
+  const acceptLanguage = (process.env.CONNECT_ACCEPT_LANGUAGE || 'de-DE,de;q=0.9,en;q=0.8').trim();
+  const timezoneId = (process.env.CONNECT_TIMEZONE_ID || 'Europe/Berlin').trim();
+  try {
+    await page.setExtraHTTPHeaders({ 'Accept-Language': acceptLanguage });
+  } catch {}
+  try {
+    if (timezoneId) await page.emulateTimezone(timezoneId);
+  } catch {}
+}
+
 const VOICE_NOTE_SOURCE_NAME = (process.env.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVoice').trim();
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
@@ -3788,6 +3799,7 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--autoplay-policy=no-user-gesture-required',
+      `--lang=${(process.env.CONNECT_CHROME_LANG || 'de-DE').trim()}`,
     ],
   };
   appendChromeFakeMicArgs(connectLaunch.args);
@@ -3795,11 +3807,18 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
   applyProxyToLaunchOptions(connectLaunch, proxyUrl);
   const browser = await puppeteer.launch(connectLaunch);
   let keepBrowserOpen = false;
+  let connectContext = null;
   try {
-    const page = await browser.newPage();
+    if (typeof browser.createIncognitoBrowserContext === 'function') {
+      connectContext = await browser.createIncognitoBrowserContext();
+    } else if (typeof browser.createBrowserContext === 'function') {
+      connectContext = await browser.createBrowserContext();
+    }
+    const page = connectContext ? await connectContext.newPage() : await browser.newPage();
     await authenticatePageForProxy(page, proxyUrl);
     if (useMobile && !VOICE_NOTE_FILE) await applyMobileEmulation(page);
     else await applyDesktopEmulation(page);
+    await applyConnectFingerprint(page);
     await login(page, {
       username: instagramUsername,
       password: instagramPassword,
@@ -3824,6 +3843,9 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
     }
     throw e;
   } finally {
+    if (!keepBrowserOpen && connectContext) {
+      await connectContext.close().catch(() => {});
+    }
     if (!keepBrowserOpen) await browser.close().catch(() => {});
   }
 }

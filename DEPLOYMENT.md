@@ -247,7 +247,7 @@ pm2 status
 pm2 logs ig-dm-bot --lines 80
 ```
 
-You should see logs like: `Loaded X leads`, then `First send in X seconds`, then `Logged in to Instagram.`, then `Sent to @user…`. If you see `Setup failed` or a timeout, check `pm2 logs ig-dm-dashboard` for no errors, then `~/ColdDMs/logs/error.log` on the server for the bot. Common fixes: Chromium deps (step 4 in this doc), correct `.env`, and a working Instagram login (no 2FA that blocks automation, or use an app password).
+You should see logs like: `Loaded X leads`, then `First send in X seconds`, then `Logged in to Instagram.`, then `Sent to @user…`. If you see `Setup failed` or a timeout, check `pm2 logs ig-dm-dashboard` for no errors, then `~/ColdDMs/logs/error.log` on the server for the bot. Common fixes: Chromium deps (step 4 in this doc), correct `.env`, and a working Instagram login with 2FA enabled for connect.
 
 ---
 

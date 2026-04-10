@@ -710,7 +710,9 @@ function cleanupExpiredScraper2FA() {
 }
 
 // --- API: Instagram connect (one-time; password never stored) ---
-// If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
+// Policy: 2FA is required for connect. If the account reaches 2FA challenge, returns
+// { ok: false, code: 'two_factor_required', pending2FAId } for POST /api/instagram/connect/2fa.
+// If it does not reach 2FA (e.g. straight login or email-code checkpoint), connect is rejected.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   const { username, password, clientId, platformScraperPool, platformScraperBackup } = req.body || {};
   const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
@@ -761,43 +763,20 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     if (result.emailVerificationRequired) {
-      cleanupExpiredEmailVerify();
-      const pendingId = require('crypto').randomBytes(16).toString('hex');
-      pendingEmailVerifyMap.set(pendingId, {
-        page: result.page,
-        browser: result.browser,
-        username: result.username,
-        clientId,
-        createdAt: Date.now(),
-        proxyUrl: proxyMeta.proxyUrl,
-        proxyAssignmentId: proxyMeta.proxyAssignmentId,
-        platformScraperPool: isPlatformPool,
-        platformScraperBackup: isPlatformBackup,
-      });
-      return res.status(200).json({
+      if (result.browser) result.browser.close().catch(() => {});
+      return res.status(400).json({
         ok: false,
-        code: 'email_verification_required',
-        message: result.maskedEmail
-          ? `Enter the code sent to ${result.maskedEmail}.`
-          : 'Enter the verification code sent to your email.',
-        maskedEmail: result.maskedEmail || null,
-        pendingEmailId: pendingId,
+        code: 'two_factor_required_for_connect',
+        error:
+          'Two-factor authentication is required for connect. This account prompted email verification instead of app/WhatsApp 2FA. Enable 2FA in Instagram Security settings, then reconnect.',
       });
     }
-    await saveSession(clientId, { cookies: result.cookies }, result.username, {
-      proxyUrl: proxyMeta.proxyUrl,
-      proxyAssignmentId: proxyMeta.proxyAssignmentId,
+    return res.status(400).json({
+      ok: false,
+      code: 'two_factor_required_for_connect',
+      error:
+        'Two-factor authentication is required for connect. Enable 2FA on Instagram, then reconnect and complete the 6-digit code step.',
     });
-    if (isPlatformPool) {
-      await savePlatformScraperSession(
-        { cookies: result.cookies },
-        result.username,
-        req.body?.daily_actions_limit || 500,
-        { forceInsert: isPlatformBackup }
-      ).catch(() => {});
-    }
-    await updateSettingsInstagramUsername(clientId, result.username);
-    res.json({ ok: true });
   } catch (e) {
     console.error('[API] Instagram connect failed', e);
     if (e.code === 'TWO_FACTOR_REQUIRED') {

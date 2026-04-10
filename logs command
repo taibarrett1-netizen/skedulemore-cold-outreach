@@ -24,3 +24,10 @@ proxy = "http://user-uf1e06a04faa7821ea05616d8f5d6fc6-session-e7c94e6e9081-sessi
 r = requests.get("https://ip.decodo.com/json", proxies={"http": proxy, "https": proxy}, timeout=20)
 print(r.text)
 PY
+
+python3 - <<'PY'
+import requests
+proxy = "http://user-uf1e06a04faa7821ea05616d8f5d6fc6:~6asul3Q8ghfG8kWJr@gate.decodo.com:10001"
+r = requests.get("https://ip.decodo.com/json", proxies={"http": proxy, "https": proxy}, timeout=20)
+print(r.text)
+PY

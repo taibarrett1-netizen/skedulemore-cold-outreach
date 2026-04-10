@@ -16,3 +16,4 @@ COMMENT ON COLUMN public.cold_dm_campaigns.voice_note_storage_path IS 'Path/URL 
 COMMENT ON COLUMN public.cold_dm_campaigns.voice_note_mode IS 'after_text or voice_only.';
 COMMENT ON COLUMN public.cold_dm_message_group_messages.send_voice_note IS 'When true, selected message row sends a voice note.';
 COMMENT ON COLUMN public.cold_dm_message_group_messages.voice_note_storage_path IS 'Path/URL to audio file used for voice note.';
+
