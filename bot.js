@@ -105,7 +105,8 @@ function applyPuppeteerSlowMo(launchOpts) {
 }
 
 async function applyConnectFingerprint(page) {
-  const acceptLanguage = (process.env.CONNECT_ACCEPT_LANGUAGE || 'de-DE,de;q=0.9,en;q=0.8').trim();
+  // Force English on connect/login flows for stable selectors and diagnostics.
+  const acceptLanguage = 'en-US,en;q=0.9';
   const timezoneId = (process.env.CONNECT_TIMEZONE_ID || 'Europe/Berlin').trim();
   try {
     await page.setExtraHTTPHeaders({ 'Accept-Language': acceptLanguage });
@@ -835,7 +836,7 @@ async function login(page, credentials) {
   }
 
   logger.log('Loading Instagram login page...');
-  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+  await page.goto('https://www.instagram.com/accounts/login/?hl=en', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
   const afterGotoUrl = page.url();
   const afterGotoTitle = await page.title().catch(() => '');
   logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
@@ -1033,7 +1034,9 @@ async function login(page, credentials) {
         "//span[normalize-space(.)='Log in']/parent::button",
         "//span[normalize-space(.)='Log in']/parent::div[@role='button']",
         "//button[contains(., 'Log in') and not(contains(., 'Log into'))]",
-        "//div[@role='button'][contains(., 'Log in') and not(contains(., 'Log into'))]"
+        "//div[@role='button'][contains(., 'Log in') and not(contains(., 'Log into'))]",
+        "//button[normalize-space(.)='Anmelden']",
+        "//div[@role='button'][normalize-space(.)='Anmelden']"
       ];
       for (var i = 0; i < xpaths.length; i++) {
         var r = document.evaluate(xpaths[i], document, null, 9, null);
@@ -1043,6 +1046,11 @@ async function login(page, credentials) {
       return false;
     });
     if (clicked) submitMethod = submitStyle === 'enterthenclick' ? 'enterKeyThenClick' : 'click';
+    else {
+      // Fallback: submit via Enter if button text/layout prevents click matching.
+      await page.keyboard.press('Enter').catch(() => {});
+      submitMethod = submitStyle === 'enterthenclick' ? 'enterKeyThenClickFallback' : 'enterKeyFallback';
+    }
   }
 
   if (LOGIN_DEBUG) logger.log('Login submitMethod=' + submitMethod);
@@ -3819,7 +3827,7 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--autoplay-policy=no-user-gesture-required',
-      `--lang=${(process.env.CONNECT_CHROME_LANG || 'de-DE').trim()}`,
+      '--lang=en-US',
     ],
   };
   appendChromeFakeMicArgs(connectLaunch.args);
