@@ -2186,26 +2186,86 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   if (leadsErr) throw leadsErr;
   const usernameByLeadId = new Map((leads || []).map((r) => [r.id, r.username]));
 
-  const { data: existingJobs, error: existingErr } = await sb
+  let existingJobs = [];
+  const { data: existingWithLease, error: existingErr } = await sb
     .from('cold_dm_send_jobs')
-    .select('id, campaign_lead_id, status, last_error_class')
+    .select('id, campaign_lead_id, status, last_error_class, leased_until, lease_heartbeat_at')
     .eq('client_id', clientId)
     .eq('campaign_id', campaignId);
-  if (existingErr) throw existingErr;
+  if (!existingErr) {
+    existingJobs = existingWithLease || [];
+  } else if (String(existingErr.code || '') === '42703') {
+    // Backward compatibility if lease columns are missing in this DB.
+    const { data: existingLegacy, error: legacyErr } = await sb
+      .from('cold_dm_send_jobs')
+      .select('id, campaign_lead_id, status, last_error_class')
+      .eq('client_id', clientId)
+      .eq('campaign_id', campaignId);
+    if (legacyErr) throw legacyErr;
+    existingJobs = existingLegacy || [];
+  } else {
+    throw existingErr;
+  }
 
   const activeLeadIds = new Set();
   const staleJobIds = [];
+  const staleRunningJobIds = [];
+  const nowMs = Date.now();
+  const staleRunningHeartbeatMs =
+    Math.max(45, parseInt(process.env.SEND_JOB_RUNNING_STALE_SEC || '180', 10) || 180) * 1000;
   const scheduleTz = campaign.timezone ?? null;
   const nextAvailableAt = isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, scheduleTz)
     ? new Date().toISOString()
     : (getNextScheduleStartInTimezone(campaign.schedule_start_time, scheduleTz)?.toISOString() ?? new Date(Date.now() + 15 * 60 * 1000).toISOString());
   for (const j of existingJobs || []) {
     if (!j.campaign_lead_id) continue;
+    if (j.status === 'running') {
+      const leaseUntilMs = j.leased_until ? Date.parse(j.leased_until) : NaN;
+      const hbMs = j.lease_heartbeat_at ? Date.parse(j.lease_heartbeat_at) : NaN;
+      const leaseExpired = Number.isFinite(leaseUntilMs) ? leaseUntilMs <= nowMs : true;
+      const heartbeatStale = Number.isFinite(hbMs) ? hbMs < nowMs - staleRunningHeartbeatMs : true;
+      if (leaseExpired || heartbeatStale) {
+        staleRunningJobIds.push(j.id);
+        continue;
+      }
+    }
     if (['pending', 'running', 'retry'].includes(j.status)) {
       activeLeadIds.add(j.campaign_lead_id);
     } else {
       staleJobIds.push(j.id);
     }
+  }
+
+  if (staleRunningJobIds.length > 0) {
+    const nowIso = new Date().toISOString();
+    const fullReset = await sb
+      .from('cold_dm_send_jobs')
+      .update({
+        status: 'retry',
+        available_at: nowIso,
+        leased_until: null,
+        leased_by_worker: null,
+        lease_heartbeat_at: nowIso,
+        last_error_class: 'stale_running_requeued',
+        last_error_message: 'stale_running_requeued',
+        updated_at: nowIso,
+      })
+      .in('id', staleRunningJobIds);
+    if (fullReset?.error && String(fullReset.error.code || '') === '42703') {
+      await sb
+        .from('cold_dm_send_jobs')
+        .update({
+          status: 'retry',
+          available_at: nowIso,
+          last_error_class: 'stale_running_requeued',
+          last_error_message: 'stale_running_requeued',
+          updated_at: nowIso,
+        })
+        .in('id', staleRunningJobIds);
+    }
+    console.log(
+      `[syncSendJobsForCampaign] requeued ${staleRunningJobIds.length} stale running send job(s) for campaign ${campaignId}`
+    );
   }
 
   if (staleJobIds.length > 0) {
