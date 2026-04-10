@@ -2178,12 +2178,25 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
 
   const leadIds = leadRows.map((r) => r.lead_id).filter(Boolean);
   if (leadIds.length === 0) return 0;
-  const { data: leads, error: leadsErr } = await sb
-    .from('cold_dm_leads')
-    .select('id, username')
-    .eq('client_id', clientId)
-    .in('id', leadIds);
-  if (leadsErr) throw leadsErr;
+  // Chunk large IN filters to avoid PostgREST "Bad Request" on long query strings.
+  const leads = [];
+  const leadChunkSize = 500;
+  for (let i = 0; i < leadIds.length; i += leadChunkSize) {
+    const chunk = leadIds.slice(i, i + leadChunkSize);
+    const { data: part, error: leadsErr } = await sb
+      .from('cold_dm_leads')
+      .select('id, username')
+      .eq('client_id', clientId)
+      .in('id', chunk);
+    if (leadsErr) {
+      const wrapped = new Error(`[syncSendJobsForCampaign:load_leads_chunk] ${leadsErr.message || leadsErr}`);
+      wrapped.code = leadsErr.code || null;
+      wrapped.details = leadsErr.details || null;
+      wrapped.hint = leadsErr.hint || null;
+      throw wrapped;
+    }
+    if (part?.length) leads.push(...part);
+  }
   const usernameByLeadId = new Map((leads || []).map((r) => [r.id, r.username]));
 
   let existingJobs = [];
@@ -2194,7 +2207,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     .eq('campaign_id', campaignId);
   if (!existingErr) {
     existingJobs = existingWithLease || [];
-  } else if (isMissingLeaseColumnsError(existingErr)) {
+  } else if (isMissingLeaseColumnsError(existingErr) || String(existingErr.message || '').toLowerCase() === 'bad request') {
     // Backward compatibility if lease columns are missing in this DB.
     const { data: existingLegacy, error: legacyErr } = await sb
       .from('cold_dm_send_jobs')
@@ -2311,26 +2324,67 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     });
   }
   if (rows.length === 0) return 0;
-  let insertError = null;
-  try {
-    const { error } = await sb.from('cold_dm_send_jobs').upsert(rows, {
-      onConflict: 'client_id,idempotency_key',
-      ignoreDuplicates: false,
-    });
-    if (error) throw error;
-  } catch (e) {
-    insertError = e;
-  }
-  if (insertError?.code === '42P10') {
-    console.error('[syncSendJobsForCampaign] ON CONFLICT index issue; falling back to individual inserts');
-    for (const row of rows) {
-      await sb.from('cold_dm_send_jobs').insert(row).catch(() => {});
+  let inserted = 0;
+  // 1) Preferred path: idempotent upsert on unique index.
+  const upsertRes = await sb.from('cold_dm_send_jobs').upsert(rows, {
+    onConflict: 'client_id,idempotency_key',
+    ignoreDuplicates: false,
+  });
+  if (!upsertRes.error) {
+    inserted = rows.length;
+  } else {
+    const upMsg = String(upsertRes.error?.message || '').toLowerCase();
+    const canFallbackInsert =
+      upsertRes.error?.code === '42P10' || // conflict index mismatch
+      upsertRes.error?.code === '42703' || // missing column
+      upMsg === 'bad request' ||
+      upMsg.includes('does not exist');
+    if (!canFallbackInsert) {
+      throw upsertRes.error;
     }
-  } else if (insertError) {
-    throw insertError;
+    console.error(
+      '[syncSendJobsForCampaign] upsert failed; falling back to insert strategies',
+      JSON.stringify({
+        code: upsertRes.error?.code || null,
+        message: upsertRes.error?.message || String(upsertRes.error),
+        details: upsertRes.error?.details || null,
+      })
+    );
+
+    // 2) Insert with idempotency_key (ignore duplicates manually).
+    let insertedViaIdempotency = 0;
+    for (const row of rows) {
+      const r = await sb.from('cold_dm_send_jobs').insert(row);
+      if (!r.error) {
+        insertedViaIdempotency += 1;
+        continue;
+      }
+      const msg = String(r.error?.message || '').toLowerCase();
+      const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
+      if (duplicate) continue;
+      // 3) Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
+      const minimal = {
+        client_id: row.client_id,
+        campaign_id: row.campaign_id,
+        campaign_lead_id: row.campaign_lead_id,
+        username: row.username,
+        status: 'pending',
+        available_at: row.available_at,
+      };
+      const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
+      if (!r2.error) {
+        insertedViaIdempotency += 1;
+        continue;
+      }
+      const msg2 = String(r2.error?.message || '').toLowerCase();
+      const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
+      if (duplicate2) continue;
+      throw r2.error;
+    }
+    inserted = insertedViaIdempotency;
   }
-  console.log(`[syncSendJobsForCampaign] created ${rows.length} send job(s) for campaign ${campaignId}`);
-  return rows.length;
+  console.log(`[syncSendJobsForCampaign] created ${inserted} send job(s) for campaign ${campaignId}`);
+  return inserted;
 }
 
 async function syncSendJobsForClient(clientId, campaignId = null) {
@@ -2340,7 +2394,20 @@ async function syncSendJobsForClient(clientId, campaignId = null) {
   const campaigns = await getActiveCampaigns(clientId);
   let total = 0;
   for (const campaign of campaigns) {
-    total += await syncSendJobsForCampaign(clientId, campaign.id).catch(() => 0);
+    total += await syncSendJobsForCampaign(clientId, campaign.id).catch((e) => {
+      console.error(
+        '[syncSendJobsForClient] campaign sync failed',
+        JSON.stringify({
+          clientId,
+          campaignId: campaign.id,
+          code: e?.code || null,
+          message: e?.message || String(e),
+          details: e?.details || null,
+          hint: e?.hint || null,
+        })
+      );
+      return 0;
+    });
   }
   return total;
 }
