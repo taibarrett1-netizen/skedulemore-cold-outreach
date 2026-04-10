@@ -258,6 +258,32 @@ async function saveComposeTypingDebugScreenshot(page, username) {
   }
 }
 
+function wantsComposePostSendScreenshot() {
+  return (
+    process.env.DM_COMPOSE_POST_SEND_SCREENSHOT === '1' ||
+    process.env.DM_COMPOSE_POST_SEND_SCREENSHOT === 'true'
+  );
+}
+
+/**
+ * One screenshot right after Enter send to capture thread/render state for debugging
+ * "message sent but UI looked wrong" cases.
+ */
+async function saveComposePostSendDebugScreenshot(page, username) {
+  if (!wantsComposePostSendScreenshot() || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const u = String(username || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_compose_after_send_${u}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[compose] post-send screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[compose] post-send screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   const u = String(username || '').trim().replace(/^@/, '');
   let url = '';
@@ -2454,6 +2480,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await tinyHumanMouseMove(page);
     await page.keyboard.press('Enter');
     await delay(1500);
+    await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
     } else if (compose) {
       await compose.dispose();
@@ -2493,6 +2520,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await tinyHumanMouseMove(page);
     await page.keyboard.press('Enter');
     await delay(1500);
+    await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
     await attemptVoiceSend();
     return {
