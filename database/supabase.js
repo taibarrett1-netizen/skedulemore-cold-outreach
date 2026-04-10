@@ -2652,18 +2652,7 @@ async function buildSendWorkFromJob(jobId) {
     return { job, disposition: 'cancelled', reason: 'campaign_not_found' };
   }
   if (campaign.status !== 'active') {
-    const { count: stillPending } = await sb
-      .from('cold_dm_campaign_leads')
-      .select('*', { count: 'exact', head: true })
-      .eq('campaign_id', campaign.id)
-      .eq('status', 'pending');
-    if ((stillPending ?? 0) > 0) {
-      await sb.from('cold_dm_campaigns').update({ status: 'active', updated_at: new Date().toISOString() }).eq('id', campaign.id);
-      console.log(`[buildSendWorkFromJob] reactivated campaign ${campaign.id} (was ${campaign.status}, ${stillPending} pending leads)`);
-      campaign.status = 'active';
-    } else {
-      return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
-    }
+    return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
   }
   const { data: leadLink } = await sb
     .from('cold_dm_campaign_leads')
