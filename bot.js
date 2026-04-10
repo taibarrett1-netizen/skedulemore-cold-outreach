@@ -3123,10 +3123,6 @@ async function runBotMultiTenant() {
   let currentSessionId = null;
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
-  const NO_WORK_LOG_EVERY_ROUNDS = Math.max(
-    4,
-    parseInt(process.env.SEND_WORKER_NO_WORK_LOG_EVERY_ROUNDS || '20', 10) || 20
-  );
 
   function proxyKeyForSession(session) {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
@@ -3232,7 +3228,7 @@ async function runBotMultiTenant() {
       const clientIds = await sb.getClientIdsWithPauseZero();
       if (clientIds.length === 0) {
         noPauseZeroEmptyRounds += 1;
-        if (noPauseZeroEmptyRounds === 1 || noPauseZeroEmptyRounds % NO_WORK_LOG_EVERY_ROUNDS === 0) {
+        if (noPauseZeroEmptyRounds === 1) {
           logger.warn(
             `[send-worker] No cold_dm_control rows with pause=0 (attempt ${noPauseZeroEmptyRounds}). Retrying in 15s (common right after clicking Start).`
           );
