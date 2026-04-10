@@ -2194,7 +2194,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     .eq('campaign_id', campaignId);
   if (!existingErr) {
     existingJobs = existingWithLease || [];
-  } else if (String(existingErr.code || '') === '42703') {
+  } else if (isMissingLeaseColumnsError(existingErr)) {
     // Backward compatibility if lease columns are missing in this DB.
     const { data: existingLegacy, error: legacyErr } = await sb
       .from('cold_dm_send_jobs')
@@ -2251,7 +2251,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
         updated_at: nowIso,
       })
       .in('id', staleRunningJobIds);
-    if (fullReset?.error && String(fullReset.error.code || '') === '42703') {
+    if (fullReset?.error && isMissingLeaseColumnsError(fullReset.error)) {
       await sb
         .from('cold_dm_send_jobs')
         .update({

@@ -1042,7 +1042,15 @@ app.post('/api/control/start', async (req, res) => {
     }
     await setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
     await syncSendJobsForClient(clientId, campaignId || null).catch((e) => {
-      console.error('[API] syncSendJobsForClient', e);
+      console.error(
+        '[API] syncSendJobsForClient',
+        JSON.stringify({
+          code: e?.code || null,
+          message: e?.message || String(e),
+          details: e?.details || null,
+          hint: e?.hint || null,
+        })
+      );
     });
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
