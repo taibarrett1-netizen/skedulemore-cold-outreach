@@ -11,6 +11,8 @@ const decodoProvision = require('../proxy/decodoProvision');
 const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 
 let _client = null;
+let _coldDmCampaignsSupportsVoiceNoteColumns = null;
+let _loggedMissingColdDmCampaignVoiceColumns = false;
 
 function noWorkDebugEnabled() {
   return process.env.NO_WORK_DEBUG === '1' || process.env.NO_WORK_DEBUG === 'true';
@@ -258,6 +260,16 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
+}
+
+function isMissingColumnError(error, expectedColumnName = '') {
+  if (!error) return false;
+  const code = error?.code ? String(error.code) : '';
+  const msg = error?.message ? String(error.message).toLowerCase() : '';
+  const col = String(expectedColumnName || '').toLowerCase();
+  if (code !== '42703') return false;
+  if (!col) return true;
+  return msg.includes(col);
 }
 
 async function getSettings(clientId) {
@@ -1871,16 +1883,17 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
   const rows = Array.isArray(data) ? data : data != null ? [data] : [];
   if (rows.length > 0) return rows[0];
 
+  const nowIso = new Date().toISOString();
   const { data: pendingCheck } = await sb
     .from('cold_dm_send_jobs')
     .select('id, status, available_at')
     .in('status', ['pending', 'retry'])
+    .lte('available_at', nowIso)
     .order('created_at', { ascending: true })
     .limit(5);
   if (pendingCheck?.length) {
-    const nowIso = new Date().toISOString();
     console.error(
-      `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} pending/retry jobs exist. ` +
+      `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} ready pending/retry jobs exist. ` +
       `First: id=${pendingCheck[0].id} status=${pendingCheck[0].status} available_at=${pendingCheck[0].available_at} now=${nowIso}`
     );
     return claimColdDmSendJobFallback(workerId, leaseSeconds);
@@ -2070,37 +2083,61 @@ async function buildSendWorkFromJob(jobId) {
   if (!sb || !jobId) return null;
   const job = await getSendJob(jobId);
   if (!job || !job.client_id || !job.campaign_id || !job.campaign_lead_id) return null;
+  const campaignSelectWithVoice =
+    'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode';
+  const campaignSelectLegacy =
+    'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec';
+  const prefersVoiceColumns = _coldDmCampaignsSupportsVoiceNoteColumns !== false;
+  const selectColumns = prefersVoiceColumns ? campaignSelectWithVoice : campaignSelectLegacy;
   let campaign = null;
   let campaignLookupError = null;
   try {
     const { data, error } = await sb
       .from('cold_dm_campaigns')
-      .select(
-        'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
-      )
+      .select(selectColumns)
       .eq('id', job.campaign_id)
       .eq('client_id', job.client_id)
       .maybeSingle();
     if (error) throw error;
+    if (_coldDmCampaignsSupportsVoiceNoteColumns == null && prefersVoiceColumns) {
+      _coldDmCampaignsSupportsVoiceNoteColumns = true;
+    }
     campaign = data || null;
   } catch (e) {
     campaignLookupError = e;
-    console.error(
-      '[buildSendWorkFromJob] campaign lookup with voice-note columns failed',
-      JSON.stringify({
-        jobId: job.id,
-        campaignId: job.campaign_id,
-        clientId: job.client_id,
-        errorCode: e?.code || null,
-        errorMessage: e?.message || String(e),
-        errorDetails: e?.details || null,
-      })
-    );
+    const missingVoiceColumn = prefersVoiceColumns && isMissingColumnError(e, 'cold_dm_campaigns.send_voice_note');
+    if (missingVoiceColumn) {
+      _coldDmCampaignsSupportsVoiceNoteColumns = false;
+      if (!_loggedMissingColdDmCampaignVoiceColumns) {
+        _loggedMissingColdDmCampaignVoiceColumns = true;
+        console.error(
+          '[buildSendWorkFromJob] cold_dm_campaigns voice-note columns missing; using legacy campaign select until restart. ' +
+            'Apply migration 010_voice_notes.sql to add send_voice_note/voice_note_storage_path/voice_note_mode.',
+          JSON.stringify({
+            jobId: job.id,
+            campaignId: job.campaign_id,
+            clientId: job.client_id,
+            errorCode: e?.code || null,
+            errorMessage: e?.message || String(e),
+          })
+        );
+      }
+    } else {
+      console.error(
+        '[buildSendWorkFromJob] campaign lookup failed',
+        JSON.stringify({
+          jobId: job.id,
+          campaignId: job.campaign_id,
+          clientId: job.client_id,
+          errorCode: e?.code || null,
+          errorMessage: e?.message || String(e),
+          errorDetails: e?.details || null,
+        })
+      );
+    }
     const { data: fallbackCampaign, error: fallbackError } = await sb
       .from('cold_dm_campaigns')
-      .select(
-        'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
-      )
+      .select(campaignSelectLegacy)
       .eq('id', job.campaign_id)
       .eq('client_id', job.client_id)
       .maybeSingle();
@@ -2124,10 +2161,11 @@ async function buildSendWorkFromJob(jobId) {
         voice_note_mode: 'after_text',
       };
       campaignLookupError = null;
-      console.warn(
-        `[buildSendWorkFromJob] campaign fallback lookup succeeded for campaign=${job.campaign_id} client=${job.client_id}. ` +
-          'Apply migration 010_voice_notes.sql to add voice-note columns to cold_dm_campaigns.'
-      );
+      if (!missingVoiceColumn) {
+        console.warn(
+          `[buildSendWorkFromJob] campaign fallback lookup succeeded for campaign=${job.campaign_id} client=${job.client_id}.`
+        );
+      }
     }
   }
   if (!campaign) {
