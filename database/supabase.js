@@ -2000,7 +2000,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
   const { data: campaign } = await sb
     .from('cold_dm_campaigns')
-    .select('id, status')
+    .select('id, status, timezone, schedule_start_time, schedule_end_time')
     .eq('client_id', clientId)
     .eq('id', campaignId)
     .maybeSingle();
@@ -2039,13 +2039,17 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
 
   const { data: existingJobs, error: existingErr } = await sb
     .from('cold_dm_send_jobs')
-    .select('id, campaign_lead_id, status')
+    .select('id, campaign_lead_id, status, last_error_class')
     .eq('client_id', clientId)
     .eq('campaign_id', campaignId);
   if (existingErr) throw existingErr;
 
   const activeLeadIds = new Set();
   const staleJobIds = [];
+  const scheduleTz = campaign.timezone ?? null;
+  const nextAvailableAt = isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, scheduleTz)
+    ? new Date().toISOString()
+    : (getNextScheduleStartInTimezone(campaign.schedule_start_time, scheduleTz)?.toISOString() ?? new Date(Date.now() + 15 * 60 * 1000).toISOString());
   for (const j of existingJobs || []) {
     if (!j.campaign_lead_id) continue;
     if (['pending', 'running', 'retry'].includes(j.status)) {
@@ -2061,6 +2065,23 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
       await sb.from('cold_dm_send_jobs').delete().in('id', batch);
     }
     console.log(`[syncSendJobsForCampaign] cleaned ${staleJobIds.length} stale send job(s) for campaign ${campaignId}`);
+  }
+
+  const requeueableJobIds = (existingJobs || [])
+    .filter((j) => j.status === 'retry' && j.last_error_class === 'outside_schedule')
+    .map((j) => j.id)
+    .filter(Boolean);
+  if (requeueableJobIds.length > 0) {
+    await sb
+      .from('cold_dm_send_jobs')
+      .update({
+        available_at: nextAvailableAt,
+        updated_at: new Date().toISOString(),
+      })
+      .in('id', requeueableJobIds);
+    console.log(
+      `[syncSendJobsForCampaign] rescheduled ${requeueableJobIds.length} outside_schedule job(s) for campaign ${campaignId} to ${nextAvailableAt}`
+    );
   }
 
   const rows = [];
