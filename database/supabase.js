@@ -77,6 +77,19 @@ function logColdDmConcurrencyDebug(message, details = null) {
   }
 }
 
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+  const ms = Math.max(1000, Number(timeoutMs) || 1000);
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(timeoutMessage || `Timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
 /** Logs why a compare-and-swap reserve did not return a row (always) or verbose success (when PLATFORM_SCRAPER_RESERVE_DEBUG=1). */
 function logPlatformScraperReserve(message, details = null, opts = {}) {
   const { always = false } = opts;
@@ -2268,11 +2281,32 @@ async function getSendJob(jobId) {
 async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const rpcTimeoutMs = Math.max(3000, parseInt(process.env.CLAIM_SEND_JOB_RPC_TIMEOUT_MS || '12000', 10) || 12000);
   for (let attempt = 0; attempt < 8; attempt++) {
-    const { data, error } = await sb.rpc('claim_cold_dm_send_job', {
-      p_worker_id: workerId,
-      p_lease_seconds: leaseSeconds,
-    });
+    let data;
+    let error;
+    try {
+      const rpcResult = await withTimeout(
+        sb.rpc('claim_cold_dm_send_job', {
+          p_worker_id: workerId,
+          p_lease_seconds: leaseSeconds,
+        }),
+        rpcTimeoutMs,
+        `claim_cold_dm_send_job timed out after ${rpcTimeoutMs}ms`
+      );
+      data = rpcResult?.data;
+      error = rpcResult?.error;
+    } catch (rpcTimeoutErr) {
+      console.error('[claimColdDmSendJob] RPC timeout, using fallback:', rpcTimeoutErr.message || rpcTimeoutErr);
+      logColdDmConcurrencyDebug('rpc_claim_timeout_fallback', {
+        workerId,
+        leaseSeconds,
+        attempt,
+        timeoutMs: rpcTimeoutMs,
+        error: String(rpcTimeoutErr?.message || rpcTimeoutErr || 'timeout'),
+      });
+      return claimColdDmSendJobFallback(workerId, leaseSeconds);
+    }
     if (error) {
       console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
       return claimColdDmSendJobFallback(workerId, leaseSeconds);
@@ -3636,12 +3670,37 @@ async function addCampaignLeadsFromGroups(clientId, campaignId) {
   const toAdd = leadIds.filter((id) => !existing.has(id));
   if (toAdd.length === 0) return 0;
 
+  const sentSet = await getSentUsernames(clientId).catch(() => new Set());
+  const usernameByLeadId = new Map();
+  const lookupChunk = 500;
+  for (let i = 0; i < toAdd.length; i += lookupChunk) {
+    const batch = toAdd.slice(i, i + lookupChunk);
+    const { data: leadRows, error: leadErr } = await sb
+      .from('cold_dm_leads')
+      .select('id, username')
+      .eq('client_id', clientId)
+      .in('id', batch);
+    if (leadErr) throw leadErr;
+    for (const row of leadRows || []) {
+      usernameByLeadId.set(row.id, normalizeUsername(row.username || '').toLowerCase());
+    }
+  }
+
   const insertChunk = 500;
   let added = 0;
   for (let i = 0; i < toAdd.length; i += insertChunk) {
     const batch = toAdd.slice(i, i + insertChunk);
     const { error } = await sb.from('cold_dm_campaign_leads').upsert(
-      batch.map((lead_id) => ({ campaign_id: campaignId, lead_id, status: 'pending' })),
+      batch.map((lead_id) => {
+        const u = usernameByLeadId.get(lead_id) || '';
+        const wasSent = !!u && sentSet.has(u);
+        return {
+          campaign_id: campaignId,
+          lead_id,
+          status: wasSent ? 'sent' : 'pending',
+          sent_at: wasSent ? new Date().toISOString() : null,
+        };
+      }),
       { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
     );
     if (error) throw error;
