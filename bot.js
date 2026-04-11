@@ -50,6 +50,24 @@ const SEND_WORKER_ID = process.env.SEND_WORKER_ID || `send-${process.pid}-${Math
 const SEND_WORKER_VERBOSE_LOGS =
   String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === '1' ||
   String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === 'true';
+const COLD_DM_CONCURRENCY_DEBUG =
+  String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === '1' ||
+  String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === 'true' ||
+  String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === 'yes';
+
+function logColdDmConcurrencyDebug(message, details = null) {
+  if (!COLD_DM_CONCURRENCY_DEBUG) return;
+  const prefix = '[cold-dm-concurrency-debug] ';
+  if (details == null) {
+    logger.log(prefix + message);
+    return;
+  }
+  try {
+    logger.log(prefix + message + ' ' + JSON.stringify(details));
+  } catch {
+    logger.log(prefix + message);
+  }
+}
 /** When set (e.g. 80), slows Puppeteer operations for debugging voice/UI (all launch paths that use applyPuppeteerSlowMo). */
 function getPuppeteerSlowMo() {
   const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
@@ -2236,6 +2254,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             return { extracted: txt, debug };
           }
           // 3b) IG often puts the display name in a sibling of the profile link (or sibling flex cell), not in the link/parent text.
+          // Keep this strictly shallow (header row area) to avoid conversation-body UI text.
           const step3bPeers = [];
           const tryPeerText = (raw, ctx) => {
             const t = normalizeCandidateName(raw, ctx);
@@ -2247,19 +2266,19 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             sEl = sEl.previousElementSibling;
           }
           let anc = profileLink.parentElement;
-          for (let depth = 0; depth < 8 && anc; depth++) {
+          for (let depth = 0; depth <= 2 && anc; depth++) {
             for (const k of Array.from(anc.children || [])) {
               if (k === profileLink || k.contains(profileLink)) continue;
               const raw = (k.innerText || k.textContent || '').trim();
               if (!raw || raw.length > 200) continue;
               tryPeerText(raw, `step3b:ancestorChild depth=${depth}`);
             }
+            if (step3bPeers.length) break;
             anc = anc.parentElement;
           }
           debug.step3Profile.step3bPeers = step3bPeers.slice(0, 16);
           if (step3bPeers.length) {
-            const uniq = [...new Set(step3bPeers)].sort((a, b) => b.length - a.length);
-            const chosen = uniq[0];
+            const chosen = [...new Set(step3bPeers)][0];
             debug.winningPath = 'step3b_profile_row_peer';
             debug.step3Profile.step3bChosen = chosen;
             return { extracted: chosen, debug };
@@ -3525,15 +3544,28 @@ async function runBotMultiTenant() {
 
   for (;;) {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
+    logColdDmConcurrencyDebug('claim_attempt', { workerId: SEND_WORKER_ID, leaseSeconds: SEND_LEASE_SECONDS });
     let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();
+      logColdDmConcurrencyDebug('claim_miss_syncing_clients', {
+        workerId: SEND_WORKER_ID,
+        activeClientCount: clientIds.length,
+        activeClientIds: clientIds,
+      });
       for (const cid of clientIds) {
         const synced = await sb.syncSendJobsForClient(cid).catch((e) => {
           logger.error(`[send-worker] syncSendJobsForClient failed for ${cid}: ${e?.message || e}`);
           return 0;
         });
         if (synced > 0) logger.log(`[send-worker] synced ${synced} send job(s) for client ${cid}`);
+        if (synced > 0) {
+          logColdDmConcurrencyDebug('sync_jobs_for_client', {
+            workerId: SEND_WORKER_ID,
+            clientId: cid,
+            syncedJobs: synced,
+          });
+        }
       }
       claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     }
@@ -3621,6 +3653,14 @@ async function runBotMultiTenant() {
           `for ${claimedJob.username || '?'}`
       );
     }
+    logColdDmConcurrencyDebug('claimed_job', {
+      workerId: SEND_WORKER_ID,
+      jobId: claimedJob.id || null,
+      clientId: claimedJob.client_id || null,
+      campaignId: claimedJob.campaign_id || null,
+      campaignLeadId: claimedJob.campaign_lead_id || null,
+      username: claimedJob.username || null,
+    });
     leasedCampaignIdForSignal = claimedJob.campaign_id || null;
     const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
       logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);

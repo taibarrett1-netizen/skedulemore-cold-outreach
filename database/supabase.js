@@ -58,6 +58,25 @@ function logColdDmMetricsDebug(message, details = null) {
   }
 }
 
+function coldDmConcurrencyDebugEnabled() {
+  const v = String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+function logColdDmConcurrencyDebug(message, details = null) {
+  if (!coldDmConcurrencyDebugEnabled()) return;
+  const prefix = '[cold-dm-concurrency-debug] ';
+  if (details == null) {
+    console.log(prefix + message);
+    return;
+  }
+  try {
+    console.log(prefix + message + ' ' + JSON.stringify(details));
+  } catch {
+    console.log(prefix + message);
+  }
+}
+
 /** Logs why a compare-and-swap reserve did not return a row (always) or verbose success (when PLATFORM_SCRAPER_RESERVE_DEBUG=1). */
 function logPlatformScraperReserve(message, details = null, opts = {}) {
   const { always = false } = opts;
@@ -680,11 +699,11 @@ async function releaseInstagramSessionLease(sessionId, workerId) {
  * Clear all IG session leases. Call when send workers are stopped (e.g. dashboard Stop) so rows are not
  * stuck until leased_until expires; PM2 often kills processes before bot.js finally runs.
  */
-async function releaseAllInstagramSessionLeases() {
+async function releaseAllInstagramSessionLeases(clientId = null) {
   const sb = getSupabase();
   if (!sb) return { released: 0 };
   const nowIso = new Date().toISOString();
-  const primary = await sb
+  let query = sb
     .from('cold_dm_instagram_sessions')
     .update({
       leased_until: null,
@@ -692,8 +711,9 @@ async function releaseAllInstagramSessionLeases() {
       lease_heartbeat_at: nowIso,
       updated_at: nowIso,
     })
-    .or('leased_by_worker.not.is.null,leased_until.not.is.null')
-    .select('id');
+    .or('leased_by_worker.not.is.null,leased_until.not.is.null');
+  if (clientId) query = query.eq('client_id', clientId);
+  const primary = await query.select('id');
   if (!primary.error) return { released: (primary.data || []).length };
   // Backward compatibility: older DBs may not have leased_* columns yet.
   const msg = String(primary.error?.message || '').toLowerCase();
@@ -775,7 +795,7 @@ async function releaseCampaignSendLease(campaignId, workerId) {
   if (isMissingCampaignSendLeaseColumnsError(error)) return;
 }
 
-async function releaseAllCampaignSendLeases(workerId = null) {
+async function releaseAllCampaignSendLeases(workerId = null, clientId = null) {
   const sb = getSupabase();
   if (!sb) return { released: 0 };
   const nowIso = new Date().toISOString();
@@ -789,6 +809,7 @@ async function releaseAllCampaignSendLeases(workerId = null) {
     })
     .or('send_leased_by_worker.not.is.null,send_leased_until.not.is.null');
   if (workerId) q = q.eq('send_leased_by_worker', workerId);
+  if (clientId) q = q.eq('client_id', clientId);
   const primary = await q.select('id');
   if (!primary.error) return { released: (primary.data || []).length };
   const msg = String(primary.error?.message || '').toLowerCase();
@@ -2272,10 +2293,28 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
           `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} ready pending/retry jobs exist. ` +
             `First: id=${pendingCheck[0].id} status=${pendingCheck[0].status} available_at=${pendingCheck[0].available_at} now=${nowIso}`
         );
+        logColdDmConcurrencyDebug('rpc_claim_empty_with_ready_jobs', {
+          workerId,
+          leaseSeconds,
+          readyJobs: pendingCheck.length,
+          firstJobId: pendingCheck[0]?.id || null,
+          firstJobStatus: pendingCheck[0]?.status || null,
+          firstJobAvailableAt: pendingCheck[0]?.available_at || null,
+          nowIso,
+        });
         return claimColdDmSendJobFallback(workerId, leaseSeconds);
       }
       return null;
     }
+    logColdDmConcurrencyDebug('rpc_claim_ok', {
+      workerId,
+      leaseSeconds,
+      jobId: claimed.id || null,
+      clientId: claimed.client_id || null,
+      campaignId: claimed.campaign_id || null,
+      campaignLeadId: claimed.campaign_lead_id || null,
+      status: claimed.status || null,
+    });
     if (!claimed.campaign_id) return claimed;
     const lockOk = await claimCampaignSendLease(claimed.campaign_id, workerId, leaseSeconds);
     if (lockOk) return claimed;
@@ -2300,7 +2339,7 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
   const nowIso = new Date().toISOString();
   const { data: pendingRows } = await sb
     .from('cold_dm_send_jobs')
-    .select('id, campaign_id, attempt_count')
+    .select('id, client_id, campaign_id, campaign_lead_id, username, attempt_count')
     .in('status', ['pending', 'retry'])
     .lte('available_at', nowIso)
     .order('available_at', { ascending: true })
@@ -2309,7 +2348,34 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
     .limit(20);
   const pending = Array.isArray(pendingRows) ? pendingRows : [];
   if (!pending.length) return null;
-  for (const candidate of pending) {
+  const buckets = new Map();
+  for (const row of pending) {
+    const key = row.client_id || '__null__';
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(row);
+  }
+  const interleaved = [];
+  while (true) {
+    let progressed = false;
+    for (const queue of buckets.values()) {
+      if (!queue.length) continue;
+      interleaved.push(queue.shift());
+      progressed = true;
+    }
+    if (!progressed) break;
+  }
+  logColdDmConcurrencyDebug('fallback_candidates_ordered', {
+    workerId,
+    leaseSeconds,
+    fetched: pending.length,
+    uniqueClients: [...new Set(pending.map((r) => r.client_id).filter(Boolean))].length,
+    firstCandidates: interleaved.slice(0, 10).map((r) => ({
+      id: r.id,
+      clientId: r.client_id || null,
+      campaignId: r.campaign_id || null,
+    })),
+  });
+  for (const candidate of interleaved) {
     const campaignId = candidate.campaign_id || null;
     if (campaignId) {
       const lockOk = await claimCampaignSendLease(campaignId, workerId, leaseSeconds);
@@ -2331,7 +2397,18 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
       .in('status', ['pending', 'retry'])
       .select('*')
       .maybeSingle();
-    if (!error && updated) return updated;
+    if (!error && updated) {
+      logColdDmConcurrencyDebug('fallback_claim_ok', {
+        workerId,
+        leaseSeconds,
+        jobId: updated.id || candidate.id,
+        clientId: updated.client_id || candidate.client_id || null,
+        campaignId: updated.campaign_id || candidate.campaign_id || null,
+        campaignLeadId: updated.campaign_lead_id || candidate.campaign_lead_id || null,
+        username: updated.username || candidate.username || null,
+      });
+      return updated;
+    }
     if (campaignId) await releaseCampaignSendLease(campaignId, workerId).catch(() => {});
   }
   return null;
@@ -3659,10 +3736,16 @@ async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = 
   payload.leased_by_worker = null;
   payload.leased_until = null;
   payload.lease_heartbeat_at = new Date().toISOString();
-  let q = sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
+  let q = sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId).select('id');
   if (workerId) q = q.eq('leased_by_worker', workerId);
-  const { error } = await q;
+  let { data: updatedRows, error } = await q;
   if (error) throw error;
+  if (workerId && (!updatedRows || updatedRows.length === 0)) {
+    const retry = await sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId).select('id');
+    if (retry.error) throw retry.error;
+    updatedRows = retry.data;
+  }
+  if (!updatedRows || updatedRows.length === 0) return;
 
   if (row && row.campaign_id && (status === 'sent' || status === 'failed')) {
     const { count } = await sb

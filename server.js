@@ -40,6 +40,7 @@ const {
   getOrResolveColdDmProxyUrl,
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
+  getClientIdsWithPauseZero,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -1317,20 +1318,31 @@ app.post('/api/control/stop', (req, res) => {
   }
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
-    setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
-    releaseAllInstagramSessionLeases()
-      .then((r) => {
-        if (r.released > 0) console.log(`[API] Cleared ${r.released} Instagram session lease(s) after stop`);
-      })
-      .catch((e) => console.error('[API] releaseAllInstagramSessionLeases', e));
-    releaseAllCampaignSendLeases()
-      .then((r) => {
-        if (r.released > 0) console.log(`[API] Cleared ${r.released} campaign send lease(s) after stop`);
-      })
-      .catch((e) => console.error('[API] releaseAllCampaignSendLeases', e));
-    console.log('[API] Stop (pause=1) for clientId=', clientId);
-    res.json({ ok: true, processRunning: false });
-    exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
+    (async () => {
+      await setControlSupabase(clientId, 1);
+      const [sessionRelease, campaignRelease] = await Promise.all([
+        releaseAllInstagramSessionLeases(clientId),
+        releaseAllCampaignSendLeases(null, clientId),
+      ]);
+      if (sessionRelease.released > 0) {
+        console.log(`[API] Cleared ${sessionRelease.released} Instagram session lease(s) after stop for client=${clientId}`);
+      }
+      if (campaignRelease.released > 0) {
+        console.log(`[API] Cleared ${campaignRelease.released} campaign send lease(s) after stop for client=${clientId}`);
+      }
+      const activeClientIds = await getClientIdsWithPauseZero();
+      const shouldStopSharedWorkers = activeClientIds.length === 0;
+      console.log(
+        `[API] Stop (pause=1) for clientId=${clientId}; active_clients_after_stop=${activeClientIds.length}; pm2_stop=${shouldStopSharedWorkers}`
+      );
+      res.json({ ok: true, processRunning: !shouldStopSharedWorkers });
+      if (shouldStopSharedWorkers) {
+        exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
+      }
+    })().catch((e) => {
+      console.error('[API] stop failed', e);
+      res.status(500).json({ ok: false, error: e.message || 'Failed to stop sending for client' });
+    });
     return;
   }
   setControl('pause', '1');
