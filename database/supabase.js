@@ -3202,6 +3202,10 @@ async function getMostSpecificNoWorkHint(clientId) {
   }
 
   if (anyWithPending) {
+    // Start API uses this hint instead of "Starting…"; previously we returned '' here even when every
+    // active campaign with pending leads was outside its send window (schedule is checked in the worker only).
+    const outsideMsg = await getClientOutsideScheduleStatus(clientId);
+    if (outsideMsg) return outsideMsg;
     return '';
   }
   return 'No campaigns with pending leads.';
