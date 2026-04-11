@@ -1906,10 +1906,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^visit\s+profile\b/.test(x)) return true;
           return false;
         };
-        const tooGeneric = (s) => {
+        const tooGeneric = (s, opts = {}) => {
           const t = clean(s).toLowerCase();
           if (!t) return true;
-          if (t === needle || t === `@${needle}`) return true;
+          if (!opts.allowEqualsUsername && (t === needle || t === `@${needle}`)) return true;
           if (t.length < 2 || t.length > 120) return true;
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
           // Inbox-only relative time token (not a person name).
@@ -1922,10 +1922,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^conversation information$/i.test(t)) return true;
           return false;
         };
-        const tooGenericReason = (s) => {
+        const tooGenericReason = (s, opts = {}) => {
           const t = clean(s).toLowerCase();
           if (!t) return 'empty';
-          if (t === needle || t === `@${needle}`) return 'equals_username';
+          if (!opts.allowEqualsUsername && (t === needle || t === `@${needle}`)) return 'equals_username';
           if (t.length < 2) return 'too_short';
           if (t.length > 120) return 'too_long';
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
@@ -1944,7 +1944,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         /** @type {{ ctx: string, rawPreview: string, splitPieces: string[], nonUserPieces: string[], usedFirstNonUserPiece: boolean, joinedBulletSegments?: boolean, afterSplit: string, afterStripUsername: string, rejected?: string, out: string }[]} */
         const normalizationTraces = [];
 
-        const normalizeCandidateName = (raw, ctx) => {
+        const normalizeCandidateName = (raw, ctx, opts = {}) => {
           const trace = {
             ctx: ctx || 'unnamed',
             rawPreview: String(raw || '').slice(0, 320),
@@ -1990,8 +1990,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             )
           );
           trace.afterStripUsername = t.slice(0, 200);
-          if (tooGeneric(t)) {
-            trace.rejected = tooGenericReason(t);
+          if (tooGeneric(t, opts)) {
+            trace.rejected = tooGenericReason(t, opts);
             trace.out = '';
             normalizationTraces.push(trace);
             return '';
@@ -2099,8 +2099,15 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
         const paneInfo = threadPaneRoot();
         const pane = paneInfo.el;
+        const hasTargetProfileLink = !!Array.from(
+          pane.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')
+        ).find((a) => {
+          const href = (a.getAttribute('href') || '').toLowerCase();
+          return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
+        });
         const debug = {
           needle,
+          hasTargetProfileLink,
           threadPane: {
             composeFound: paneInfo.composeFound,
             climbDepth: paneInfo.climbDepth ?? 0,
@@ -2123,6 +2130,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           winningPath: /** @type {string|null} */ (null),
           normalizationTraces,
         };
+        if (!debug.threadPane.paneIncludesUsername && !hasTargetProfileLink) {
+          debug.winningPath = 'thread_identity_mismatch';
+          return { extracted: null, debug };
+        }
 
         const extractNameFromHeaderRoot = (root, headerDebug) => {
           const rawLines = (root.innerText || '').split(/\n/);
@@ -2141,8 +2152,22 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
               lineBelow: i + 1 < lines.length ? lines[i + 1].slice(0, 200) : null,
             };
             headerDebug.handleLineDetail = lineDebug;
-            const prev = i > 0 ? normalizeCandidateName(lines[i - 1], `header[${headerDebug.headerIndex}]:lineAboveHandle`) : '';
-            const next = i + 1 < lines.length ? normalizeCandidateName(lines[i + 1], `header[${headerDebug.headerIndex}]:lineBelowHandle`) : '';
+            const prev =
+              i > 0
+                ? normalizeCandidateName(
+                    lines[i - 1],
+                    `header[${headerDebug.headerIndex}]:lineAboveHandle`,
+                    { allowEqualsUsername: true }
+                  )
+                : '';
+            const next =
+              i + 1 < lines.length
+                ? normalizeCandidateName(
+                    lines[i + 1],
+                    `header[${headerDebug.headerIndex}]:lineBelowHandle`,
+                    { allowEqualsUsername: true }
+                  )
+                : '';
             lineDebug.normalizedAbove = prev || null;
             lineDebug.normalizedBelow = next || null;
             if (prev) {
@@ -2172,7 +2197,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           );
           if (!m || !m[1]) return '';
           const candidate = clean(m[1]).replace(/[·•|:\\-\\s]+$/g, '');
-          return normalizeCandidateName(candidate, `${ctx}:display_before_username_instagram_profile`);
+          return normalizeCandidateName(candidate, `${ctx}:display_before_username_instagram_profile`, {
+            allowEqualsUsername: true,
+          });
         };
 
         // 1) DM thread header: prefer header/banner whose text includes the handle (smallest area first), then others.
@@ -2495,6 +2522,27 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       const extracted = extractionResult && extractionResult.extracted;
       const nameDebug = extractionResult && extractionResult.debug;
       if (nameDebug) nameExtractionDebugSnapshot = nameDebug;
+      if (nameDebug && nameDebug.winningPath === 'thread_identity_mismatch') {
+        const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
+        logger.warn(`Thread identity mismatch for @${u}; aborting to avoid wrong-thread extraction/send.`);
+        logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+        if (diag.paneScopedSnippet) {
+          logger.log(
+            'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+          );
+        }
+        return {
+          ok: false,
+          reason: 'thread_mismatch',
+          pageSnippet: `Active thread does not appear to be @${u}; aborting to avoid wrong-thread send.`,
+          previewNamesOnly: !!sendOpts.dryRunNames,
+          username: u,
+          url: page.url(),
+          pane_scoped_snippet: diag.paneScopedSnippet || null,
+          body_snippet: diag.bodySnippet || null,
+          name_extraction_debug: nameDebug,
+        };
+      }
 
       if (nameExtractionDebugLog && nameDebug) {
         try {
