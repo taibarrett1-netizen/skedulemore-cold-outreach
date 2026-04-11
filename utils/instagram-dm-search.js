@@ -104,7 +104,10 @@ async function clickInstagramDmSearchResult(page, username) {
     function rowLooksLikeSearchHit(el) {
       const c = combinedMatchText(el);
       if (c.includes('more accounts')) return false;
-      if (!c.includes(needle)) return false;
+      // Require a bounded username token; do not allow loose substring matches
+      // from message previews/URLs (e.g. utm_source containing the needle).
+      const tokenRe = new RegExp(`(^|[^a-z0-9._])@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9._]|$)`, 'i');
+      if (!tokenRe.test(c)) return false;
       if (isChromeOnlyRow(el, c)) return false;
       return true;
     }
@@ -118,8 +121,6 @@ async function clickInstagramDmSearchResult(page, username) {
         'div[role="dialog"] [role="option"]',
         'div[role="dialog"] a[href*="instagram.com/"]',
         'div[role="dialog"] div[role="button"]',
-        'div[role="button"]',
-        'button',
       ];
       const seen = new Set();
       const out = [];
