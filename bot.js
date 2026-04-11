@@ -4127,7 +4127,23 @@ async function runBotMultiTenant() {
         }
       }
       await sb.updateSendJob(claimedJob.id, { status: sendJobStatus, ...sendJobUpdates }, SEND_WORKER_ID).catch(() => {});
-      await delay(delayMs);
+
+      // ── Cooldown: stamp available_at on remaining campaign jobs instead of blocking sleep ──
+      // This lets this worker immediately claim work from OTHER clients while the campaign
+      // cooldown ticks down. The job claiming query already filters `available_at <= now`,
+      // so campaign B's jobs are picked up right away while campaign A waits.
+      // Only apply the stamp for genuine send cooldowns (not hourly/daily limit retries,
+      // which already set available_at directly on the job via sendJobUpdates).
+      const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
+      if (isSendCooldown && delayMs > 1000 && work && work.campaignId) {
+        const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
+        await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
+        // Brief yield so the DB write propagates before the next claim attempt.
+        await delay(500);
+      } else {
+        // For non-send-cooldown cases (already_sent, short delays) keep a short sleep.
+        await delay(Math.min(delayMs, 1500));
+      }
     } catch (e) {
       logger.error(`Unexpected send loop error for client ${clientId} campaign ${work.campaignId}: ${e.message}`, e);
       await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});

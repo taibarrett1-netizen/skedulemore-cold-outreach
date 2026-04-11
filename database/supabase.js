@@ -2270,6 +2270,30 @@ async function updateSendJob(jobId, updates, workerId = null) {
   if (error) throw error;
 }
 
+/**
+ * Stamp available_at = cooldownUntilIso on all pending/retry jobs for a campaign
+ * (excluding the just-completed job). This lets workers immediately claim work
+ * from other clients rather than sleeping — the per-campaign cooldown is enforced
+ * via the DB field rather than a blocking sleep in the worker process.
+ */
+async function deferCampaignPendingJobs(campaignId, excludeJobId, cooldownUntilIso) {
+  const sb = getSupabase();
+  if (!sb || !campaignId) return;
+  try {
+    let q = sb
+      .from('cold_dm_send_jobs')
+      .update({ available_at: cooldownUntilIso, updated_at: new Date().toISOString() })
+      .eq('campaign_id', campaignId)
+      .in('status', ['pending', 'retry'])
+      .lt('available_at', cooldownUntilIso); // only push forward, never pull back
+    if (excludeJobId) q = q.neq('id', excludeJobId);
+    const { error } = await q;
+    if (error) console.warn('[deferCampaignPendingJobs] update error:', error.message || error);
+  } catch (e) {
+    console.warn('[deferCampaignPendingJobs] exception:', e.message || e);
+  }
+}
+
 async function getSendJob(jobId) {
   const sb = getSupabase();
   if (!sb || !jobId) return null;
@@ -3898,6 +3922,7 @@ module.exports = {
   heartbeatScrapeJobLease,
   createSendJob,
   updateSendJob,
+  deferCampaignPendingJobs,
   getSendJob,
   claimColdDmSendJob,
   heartbeatSendJobLease,
