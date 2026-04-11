@@ -1696,12 +1696,24 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await searchEl.dispose();
   await searchHandle.dispose();
   await delay(2800);
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+  await delay(300);
 
-  const searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
+  let searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
     ok: false,
     reason: 'search_result_select_failed',
     logLine: `evaluate_threw: ${e && e.message ? e.message : String(e)}`,
   }));
+  if (!searchPick.ok && searchPick.reason === 'search_result_select_failed') {
+    // "Turn on Notifications" or similar overlays can appear after typing and block row clicks.
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
+    await delay(500);
+    searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
+      ok: false,
+      reason: 'search_result_select_failed',
+      logLine: `retry_evaluate_threw: ${e && e.message ? e.message : String(e)}`,
+    }));
+  }
   if (!searchPick.ok) {
     await logDmSearchFailureDiagnostics(page, u, searchPick).catch(() => {});
     return {
