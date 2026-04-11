@@ -192,8 +192,6 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
-/** After the worker exits (--no-autorestart), PM2 keeps a stopped app with this name. `pm2 start script --name` then fails as duplicate; `pm2 restart name` starts the stopped process. Fallback creates the app if missing. */
-const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} --update-env || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 
 /** Hands-free PM2 scaling: on by default when Supabase is configured. Set SCALE_SEND_WORKERS_AUTO=0 to disable (e.g. laptop without PM2). */
@@ -278,6 +276,67 @@ function getBotProcessRunning(cb) {
       cb(false);
     }
   });
+}
+
+function execPm2(command) {
+  return new Promise((resolve) => {
+    exec(command, { cwd: projectRoot }, (err, stdout, stderr) => {
+      resolve({
+        ok: !err,
+        err,
+        stdout: (stdout || '').toString(),
+        stderr: (stderr || '').toString(),
+        out: (((stdout || '') + (stderr || '')).toString() || '').trim(),
+      });
+    });
+  });
+}
+
+async function getPm2AppStatusByName(appName) {
+  const res = await execPm2('pm2 jlist');
+  if (!res.ok) return { exists: false, online: false, status: null, error: res.err || new Error(res.stderr || 'pm2 jlist failed') };
+  try {
+    const list = JSON.parse(res.stdout || '[]');
+    const proc = Array.isArray(list) ? list.find((p) => p?.name === appName) : null;
+    const status = proc?.pm2_env?.status || null;
+    return {
+      exists: !!proc,
+      online: status === 'online',
+      status,
+      error: null,
+    };
+  } catch (e) {
+    return { exists: false, online: false, status: null, error: e };
+  }
+}
+
+/**
+ * Ensure send worker is running without bouncing an already-online process.
+ * - online: no-op
+ * - exists but stopped: start by name
+ * - missing: start by script+name
+ */
+async function ensureSendWorkerProcess() {
+  const status = await getPm2AppStatusByName(BOT_PM2_NAME);
+  if (!status.error && status.online) {
+    return { ok: true, action: 'noop_online', out: `already online (${BOT_PM2_NAME})` };
+  }
+  if (!status.error && status.exists) {
+    const startByName = await execPm2(`pm2 start ${BOT_PM2_NAME} --update-env`);
+    if (startByName.ok || /online|already\s+running|successfully/i.test(startByName.out)) {
+      return { ok: true, action: 'start_existing', out: startByName.out };
+    }
+    const restartByName = await execPm2(`pm2 restart ${BOT_PM2_NAME} --update-env`);
+    if (restartByName.ok || /online|already\s+running|successfully/i.test(restartByName.out)) {
+      return { ok: true, action: 'restart_existing', out: restartByName.out };
+    }
+    return { ok: false, action: 'start_existing_failed', out: `${startByName.out}\n${restartByName.out}`.trim(), err: restartByName.err || startByName.err };
+  }
+  const create = await execPm2(`pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`);
+  if (create.ok || /online|already\s+running|successfully/i.test(create.out)) {
+    return { ok: true, action: 'create_missing', out: create.out };
+  }
+  return { ok: false, action: 'create_missing_failed', out: create.out, err: create.err };
 }
 
 const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
@@ -1056,36 +1115,39 @@ app.post('/api/control/start', async (req, res) => {
     });
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
-    exec(
-      PM2_ENSURE_SEND_WORKER_CMD,
-      { cwd: projectRoot },
-      (err, stdout, stderr) => {
-        const out = ((stdout || '') + (stderr || '')).trim();
-        const alreadyRunning = /already (running|launched)|online|restart|Process successfully started/i.test(out);
-        if (err && !alreadyRunning) {
-          console.error('[API] pm2 ensure send worker failed', err, stderr);
-          const detail = (stderr || err.message || 'pm2 error').toString().slice(0, 220);
+    ensureSendWorkerProcess()
+      .then((r) => {
+        if (!r.ok) {
+          const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
+          console.error('[API] pm2 ensure send worker failed', r.err || detail);
           setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
           return;
         }
-        if (out) console.log('[API] pm2 ensure send worker:', out.slice(0, 800));
-        else if (!err) console.log('[API] pm2 ensure send worker finished (no stdout).');
-        if (!err || alreadyRunning) scheduleAutoScaleSendWorkers('after_start');
-      }
-    );
+        if (r.out) console.log(`[API] pm2 ensure send worker (${r.action}):`, r.out.slice(0, 800));
+        else console.log(`[API] pm2 ensure send worker (${r.action}) done.`);
+        scheduleAutoScaleSendWorkers('after_start');
+      })
+      .catch((err) => {
+        console.error('[API] pm2 ensure send worker failed', err);
+        const detail = String(err?.message || 'pm2 ensure failed').slice(0, 220);
+        setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+      });
     return;
   }
   setControl('pause', '0');
   console.log('[API] Start bot requested (legacy)');
   res.json({ ok: true, processRunning: true });
-  exec(PM2_ENSURE_SEND_WORKER_CMD, { cwd: projectRoot }, (err, stdout, stderr) => {
-    const out = ((stdout || '') + (stderr || '')).trim();
-    const alreadyRunning = /already (running|launched)|online|restart|Process successfully started/i.test(out);
-    if (err) console.error('[API] pm2 ensure send worker failed (legacy)', err, stderr);
-    else if (out) console.log('[API] pm2 ensure send worker (legacy):', out.slice(0, 800));
-    else console.log('[API] Bot start command finished (legacy).');
-    if (!err || alreadyRunning) scheduleAutoScaleSendWorkers('after_start');
-  });
+  ensureSendWorkerProcess()
+    .then((r) => {
+      if (!r.ok) {
+        console.error('[API] pm2 ensure send worker failed (legacy)', r.err || r.out);
+        return;
+      }
+      if (r.out) console.log(`[API] pm2 ensure send worker (legacy:${r.action}):`, r.out.slice(0, 800));
+      else console.log('[API] Bot start command finished (legacy).');
+      scheduleAutoScaleSendWorkers('after_start');
+    })
+    .catch((err) => console.error('[API] pm2 ensure send worker failed (legacy)', err));
 });
 
 app.post('/api/reset-failed', async (req, res) => {
