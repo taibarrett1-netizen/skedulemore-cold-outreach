@@ -185,78 +185,49 @@ async function clickInstagramDmSearchResult(page, username) {
       return best;
     }
 
-    /** Prefer profile links, then listbox options with exact handle token */
-    const candidates = collectCandidates();
     const moreAccountsY = nearestMoreAccountsHeadingY();
 
-    const sortedCandidates = [...candidates].sort((a, b) => {
-      const ay = rowCenterY(a);
-      const by = rowCenterY(b);
-      if (moreAccountsY != null) {
-        const aInMore = ay > moreAccountsY + 8 ? 1 : 0;
-        const bInMore = by > moreAccountsY + 8 ? 1 : 0;
-        if (aInMore !== bInMore) return bInMore - aInMore;
-      }
-      return ay - by;
-    });
+    // Sort helper: prioritise rows visually below "More accounts" heading, then by Y.
+    function sortByMoreAccounts(arr) {
+      return [...arr].sort((a, b) => {
+        const ay = rowCenterY(a);
+        const by = rowCenterY(b);
+        if (moreAccountsY != null) {
+          const aInMore = ay > moreAccountsY + 8 ? 1 : 0;
+          const bInMore = by > moreAccountsY + 8 ? 1 : 0;
+          if (aInMore !== bInMore) return bInMore - aInMore;
+        }
+        return ay - by;
+      });
+    }
 
-    const byHref = sortedCandidates.find((el) => {
+    // ── Step 1: href match across EVERY visible clickable (safest — no text false positives) ──
+    // This covers Instagram layouts that skip listbox/dialog roles entirely.
+    const allClickables = sortByMoreAccounts(
+      Array.from(document.querySelectorAll('div[role="button"], button, a')).filter(visible)
+    );
+
+    const byAnyHref = allClickables.find((el) => {
       const h = resolveInstagramHref(el);
       return h && hrefMatches(h);
     });
-    if (byHref) {
-      let clickTarget = byHref;
-      if (byHref.tagName !== 'A') {
-        const inner = byHref.querySelector && byHref.querySelector('a[href*="instagram.com"]');
-        const outer = byHref.closest && byHref.closest('a[href*="instagram.com"]');
-        clickTarget = inner || outer || byHref;
+    if (byAnyHref) {
+      // Prefer clicking the inner <a> if the hit is a wrapper element.
+      let clickTarget = byAnyHref;
+      if (byAnyHref.tagName !== 'A') {
+        const inner = byAnyHref.querySelector && byAnyHref.querySelector('a[href*="instagram.com"]');
+        const outer = byAnyHref.closest && byAnyHref.closest('a[href*="instagram.com"]');
+        clickTarget = inner || outer || byAnyHref;
       }
       clickTarget.click();
-      return { ok: true, detail: 'href_profile_match' };
+      return { ok: true, detail: 'href_any_match' };
     }
 
-    const byText = sortedCandidates.find((el) => rowLooksLikeSearchHit(el));
-    if (byText) {
-      byText.click();
-      return { ok: true, detail: 'text_or_aria_match' };
-    }
-
-    // Fallback for Instagram layouts that do not expose listbox/dialog roles on /direct/new.
-    // Scan visible clickable rows, but keep strict token matching + chrome filtering.
-    const genericClickables = Array.from(document.querySelectorAll('div[role="button"], button, a')).filter(visible);
-    const genericSorted = genericClickables.sort((a, b) => {
-      const ay = rowCenterY(a);
-      const by = rowCenterY(b);
-      if (moreAccountsY != null) {
-        const aInMore = ay > moreAccountsY + 8 ? 1 : 0;
-        const bInMore = by > moreAccountsY + 8 ? 1 : 0;
-        if (aInMore !== bInMore) return bInMore - aInMore;
-      }
-      return ay - by;
-    });
-    const genericRowHit = genericSorted.find((el) => rowLooksLikeSearchHit(el));
-    if (genericRowHit) {
-      genericRowHit.click();
-      return { ok: true, detail: 'generic_clickable_row_match' };
-    }
-
-    /** Secondary: profile links under dialog/listbox only (avoid sidebar / global nav) */
-    const linkRoots = Array.from(
-      document.querySelectorAll('[role="listbox"], div[role="dialog"], [role="presentation"]')
-    );
-    const linkSeen = new Set();
-    const links = [];
-    for (let r = 0; r < linkRoots.length; r++) {
-      linkRoots[r].querySelectorAll('a[href*="instagram.com/"]').forEach((a) => {
-        if (!visible(a) || linkSeen.has(a)) return;
-        linkSeen.add(a);
-        links.push(a);
-      });
-    }
-    const linkHit = links.find((a) => hrefMatches(a.href));
-    if (linkHit) {
-      linkHit.click();
-      return { ok: true, detail: 'scan_links' };
+    // ── Step 2: exact text-line match across every visible clickable ──
+    const byAnyText = allClickables.find((el) => rowLooksLikeSearchHit(el));
+    if (byAnyText) {
+      byAnyText.click();
+      return { ok: true, detail: 'text_exact_line_match' };
     }
 
     const listbox = document.querySelector('[role="listbox"]');
