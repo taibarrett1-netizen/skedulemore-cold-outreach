@@ -1892,7 +1892,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         const tooGeneric = (s) => {
           const t = clean(s).toLowerCase();
           if (!t) return true;
-          if (t === needle || t === `@${needle}` || containsUsernameToken(t)) return true;
+          if (t === needle || t === `@${needle}`) return true;
           if (t.length < 2 || t.length > 120) return true;
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
           // Inbox-only relative time token (not a person name).
@@ -1909,7 +1909,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           const t = clean(s).toLowerCase();
           if (!t) return 'empty';
           if (t === needle || t === `@${needle}`) return 'equals_username';
-          if (containsUsernameToken(t)) return 'contains_username_token';
           if (t.length < 2) return 'too_short';
           if (t.length > 120) return 'too_long';
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
@@ -1919,19 +1918,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^(follow|following|requested|message|share|more|options|report)$/i.test(t)) return 'ig_action_chrome';
           if (/^conversation information$/i.test(t)) return 'ig_conversation_info';
           return 'unknown';
-        };
-
-        /** Remove handle when glued to display text (e.g. "…AIaquareach.aiAudio…") where token regex misses. */
-        const stripNeedleLiteralAll = (s) => {
-          let out = s;
-          const n = needle.length;
-          if (!n) return out;
-          for (;;) {
-            const idx = out.toLowerCase().indexOf(needle);
-            if (idx === -1) break;
-            out = clean(out.slice(0, idx) + out.slice(idx + n));
-          }
-          return out;
         };
 
         /** IG often concatenates header actions onto the title without spaces. */
@@ -1966,14 +1952,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             .filter(Boolean);
           trace.splitPieces = splitPieces.slice(0, 12);
           if (splitPieces.length > 1) {
-            const nonUserPieces = splitPieces.filter((p) => !containsUsernameToken(p) && !/^instagram$/i.test(p));
+            const nonUserPieces = splitPieces.filter((p) => !/^instagram$/i.test(p));
             trace.nonUserPieces = nonUserPieces.slice(0, 12);
             if (nonUserPieces.length) {
               trace.usedFirstNonUserPiece = true;
               trace.joinedBulletSegments = true;
               t = clean(
                 nonUserPieces
-                  .map((p) => stripHeaderUiTail(stripNeedleLiteralAll(p)))
+                  .map((p) => stripHeaderUiTail(p))
                   .filter(Boolean)
                   .join(' • ')
               );
@@ -1984,7 +1970,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             stripHeaderUiTail(
               t
                 .replace(/\binstagram\b/gi, '')
-                .replace(new RegExp(`@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ' ')
             )
           );
           trace.afterStripUsername = t.slice(0, 200);
@@ -2156,6 +2141,23 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return null;
         };
 
+        // Deterministic header parser for:
+        // "DisplayName Username · Instagram View profile"
+        const extractDisplayNameByProfilePattern = (raw, ctx) => {
+          const line = clean(raw);
+          if (!line) return '';
+          const escapedNeedle = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const m = line.match(
+            new RegExp(
+              `^(.*?)\\s+@?${escapedNeedle}\\s*(?:[·•|]\\s*)?instagram\\b[\\s\\S]*?\\bview\\s*profile\\b`,
+              'i'
+            )
+          );
+          if (!m || !m[1]) return '';
+          const candidate = clean(m[1]).replace(/[·•|:\\-\\s]+$/g, '');
+          return normalizeCandidateName(candidate, `${ctx}:display_before_username_instagram_profile`);
+        };
+
         // 1) DM thread header: prefer header/banner whose text includes the handle (smallest area first), then others.
         const allHeaderRoots = Array.from(pane.querySelectorAll('header, [role="banner"]'));
         const headerMatchesNeedle = (root) => containsUsernameToken(root.innerText || '');
@@ -2240,6 +2242,27 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
         });
         if (profileLink) {
+          const headerPatternScopes = [];
+          const headerLike = profileLink.closest('header');
+          if (headerLike) headerPatternScopes.push({ raw: headerLike.innerText || headerLike.textContent || '', ctx: 'step3p:header' });
+          let pAnc = profileLink.parentElement;
+          for (let d = 0; d < 3 && pAnc; d++) {
+            headerPatternScopes.push({ raw: pAnc.innerText || pAnc.textContent || '', ctx: `step3p:ancestor depth=${d}` });
+            pAnc = pAnc.parentElement;
+          }
+          for (const scope of headerPatternScopes) {
+            const parsed = extractDisplayNameByProfilePattern(scope.raw, scope.ctx);
+            if (parsed) {
+              debug.step3Profile = {
+                href: (profileLink.getAttribute('href') || '').slice(0, 200),
+                parsedByProfilePattern: parsed,
+                parsedContext: scope.ctx,
+              };
+              debug.winningPath = 'step3_profile_pattern_display_username_instagram_view_profile';
+              return { extracted: parsed, debug };
+            }
+          }
+
           const parent = profileLink.closest('header') || profileLink.parentElement || profileLink;
           const rawParent = parent.textContent || '';
           const txt = normalizeCandidateName(rawParent, 'step3:profile_parent');
@@ -2283,6 +2306,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             debug.step3Profile.step3bChosen = chosen;
             return { extracted: chosen, debug };
           }
+          // If we already found the profile link but no reliable display-name candidate, do not widen
+          // to global column scans (they can pick inbox chrome like "Request (1)").
+          debug.winningPath = 'step3_profile_link_found_no_reliable_name';
+          return { extracted: '', debug };
         } else {
           debug.step3Profile = { found: false };
         }
