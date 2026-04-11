@@ -3202,7 +3202,7 @@ async function sendDM(page, username, adapter, options = {}) {
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
-    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', null, sendWorkerId).catch(() => {});
+    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
     return { ok: false, reason: 'already_sent' };
   }
 
@@ -3900,6 +3900,14 @@ async function runBotMultiTenant() {
           available_at: new Date(Date.now() + delayMs).toISOString(),
           last_error_class: 'missing_delay_config',
           last_error_message: msg,
+        };
+      } else if (!sendResult.ok && sendResult.reason === 'already_sent') {
+        // Duplicate lead for this client was already messaged earlier; do not consume campaign cooldown.
+        delayMs = randomDelay(200, 900);
+        sendJobStatus = 'completed';
+        sendJobUpdates = {
+          last_error_class: 'already_sent',
+          last_error_message: 'already_sent',
         };
       } else {
         delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
