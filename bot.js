@@ -2791,10 +2791,12 @@ async function previewDmLeadNamesFromSession(body) {
     const page = await browser.newPage();
     await authenticatePageForProxy(page, session.proxy_url);
     await grantMicrophoneForInstagram(page, logger);
-    await applyDesktopEmulation(page);
+    // Mirror live sender behavior so admin name-test reflects production extraction context.
+    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+    else await applyMobileEmulation(page);
     await page.setCookie(...cookies);
-    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
-    await delay(2000);
+    await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await delay(3000);
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
     if (page.url().includes('/accounts/login')) {
