@@ -50,6 +50,10 @@ const SEND_WORKER_ID = process.env.SEND_WORKER_ID || `send-${process.pid}-${Math
 const SEND_WORKER_VERBOSE_LOGS =
   String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === '1' ||
   String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === 'true';
+const SEND_STAGE_TIMEOUT_MS = Math.max(
+  15000,
+  parseInt(process.env.SEND_STAGE_TIMEOUT_MS || '90000', 10) || 90000
+);
 const COLD_DM_CONCURRENCY_DEBUG =
   String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === '1' ||
   String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === 'true' ||
@@ -66,6 +70,19 @@ function logColdDmConcurrencyDebug(message, details = null) {
     logger.log(prefix + message + ' ' + JSON.stringify(details));
   } catch {
     logger.log(prefix + message);
+  }
+}
+
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+  const ms = Math.max(1000, Number(timeoutMs) || 1000);
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(timeoutMessage || `Timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
   }
 }
 /** When set (e.g. 80), slows Puppeteer operations for debugging voice/UI (all launch paths that use applyPuppeteerSlowMo). */
@@ -3695,8 +3712,12 @@ async function runBotMultiTenant() {
       lastClaimedClientIdForDebug = claimedClientId;
     }
     leasedCampaignIdForSignal = claimedJob.campaign_id || null;
-    const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
-      logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);
+    const resolved = await withTimeout(
+      sb.buildSendWorkFromJob(claimedJob.id),
+      SEND_STAGE_TIMEOUT_MS,
+      `buildSendWorkFromJob timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
+    ).catch((e) => {
+      logger.error(`[send-worker] buildSendWorkFromJob failed: ${e?.message || e}`);
       return null;
     });
     if (!resolved) {
@@ -3748,6 +3769,7 @@ async function runBotMultiTenant() {
 
     const work = resolved.work;
     const clientId = work.clientId;
+    sb.setClientStatusMessage(clientId, 'Preparing send…').catch(() => {});
     noPauseZeroEmptyRounds = 0;
     const pause = await sb.getControl(clientId);
     if (pause === '1' || pause === 1) {
@@ -3774,7 +3796,14 @@ async function runBotMultiTenant() {
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
 
-    const session = await sb.claimInstagramSessionForCampaign(clientId, work.campaignId, SEND_WORKER_ID, SEND_LEASE_SECONDS);
+    const session = await withTimeout(
+      sb.claimInstagramSessionForCampaign(clientId, work.campaignId, SEND_WORKER_ID, SEND_LEASE_SECONDS),
+      SEND_STAGE_TIMEOUT_MS,
+      `claimInstagramSessionForCampaign timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
+    ).catch((e) => {
+      logger.error(`[send-worker] claimInstagramSessionForCampaign failed: ${e?.message || e}`);
+      return null;
+    });
     if (!session) {
       logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
       await sb.setClientStatusMessage(clientId, 'Waiting for an available Instagram session…').catch(() => {});
@@ -3832,7 +3861,14 @@ async function runBotMultiTenant() {
       startLeaseHeartbeat();
       startSendJobHeartbeat();
       startCampaignLeaseHeartbeat();
-      const ok = await ensurePageSession(session);
+      const ok = await withTimeout(
+        ensurePageSession(session),
+        SEND_STAGE_TIMEOUT_MS,
+        `ensurePageSession timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
+      ).catch((e) => {
+        logger.error(`[send-worker] ensurePageSession failed: ${e?.message || e}`);
+        return false;
+      });
       if (!ok) {
         logger.warn('Could not load session for campaign, failing lead.');
         await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
