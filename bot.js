@@ -3413,6 +3413,8 @@ async function runBotMultiTenant() {
   let leasedSessionIdForSignal = null;
   /** Campaign currently leased by this worker (one at a time). */
   let leasedCampaignIdForSignal = null;
+  /** Concurrency debug signal: only log claim when client changes. */
+  let lastClaimedClientIdForDebug = null;
   process.once('SIGTERM', () => {
     void (async () => {
       const sid = leasedSessionIdForSignal;
@@ -3544,7 +3546,6 @@ async function runBotMultiTenant() {
 
   for (;;) {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
-    logColdDmConcurrencyDebug('claim_attempt', { workerId: SEND_WORKER_ID, leaseSeconds: SEND_LEASE_SECONDS });
     let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();
@@ -3653,14 +3654,19 @@ async function runBotMultiTenant() {
           `for ${claimedJob.username || '?'}`
       );
     }
-    logColdDmConcurrencyDebug('claimed_job', {
-      workerId: SEND_WORKER_ID,
-      jobId: claimedJob.id || null,
-      clientId: claimedJob.client_id || null,
-      campaignId: claimedJob.campaign_id || null,
-      campaignLeadId: claimedJob.campaign_lead_id || null,
-      username: claimedJob.username || null,
-    });
+    const claimedClientId = claimedJob.client_id || null;
+    if (lastClaimedClientIdForDebug !== claimedClientId) {
+      logColdDmConcurrencyDebug('claimed_job_client_switch', {
+        workerId: SEND_WORKER_ID,
+        fromClientId: lastClaimedClientIdForDebug,
+        toClientId: claimedClientId,
+        jobId: claimedJob.id || null,
+        campaignId: claimedJob.campaign_id || null,
+        campaignLeadId: claimedJob.campaign_lead_id || null,
+        username: claimedJob.username || null,
+      });
+      lastClaimedClientIdForDebug = claimedClientId;
+    }
     leasedCampaignIdForSignal = claimedJob.campaign_id || null;
     const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
       logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);

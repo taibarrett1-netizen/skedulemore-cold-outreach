@@ -2306,15 +2306,6 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
       }
       return null;
     }
-    logColdDmConcurrencyDebug('rpc_claim_ok', {
-      workerId,
-      leaseSeconds,
-      jobId: claimed.id || null,
-      clientId: claimed.client_id || null,
-      campaignId: claimed.campaign_id || null,
-      campaignLeadId: claimed.campaign_lead_id || null,
-      status: claimed.status || null,
-    });
     if (!claimed.campaign_id) return claimed;
     const lockOk = await claimCampaignSendLease(claimed.campaign_id, workerId, leaseSeconds);
     if (lockOk) return claimed;
