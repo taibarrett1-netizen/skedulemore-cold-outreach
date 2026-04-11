@@ -52,7 +52,7 @@ const SEND_WORKER_VERBOSE_LOGS =
   String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === 'true';
 const SEND_STAGE_TIMEOUT_MS = Math.max(
   15000,
-  parseInt(process.env.SEND_STAGE_TIMEOUT_MS || '90000', 10) || 90000
+  parseInt(process.env.SEND_STAGE_TIMEOUT_MS || '30000', 10) || 30000
 );
 const COLD_DM_CONCURRENCY_DEBUG =
   String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === '1' ||
@@ -3727,6 +3727,10 @@ async function runBotMultiTenant() {
       await delay(randomDelay(1000, 3000));
       continue;
     }
+    logger.log(
+      `[send-worker] job ${claimedJob.id} resolved disposition=${resolved.disposition} reason=${resolved.reason || 'none'} ` +
+        `client=${claimedJob.client_id || 'null'} campaign=${claimedJob.campaign_id || 'null'}`
+    );
     if (SEND_WORKER_VERBOSE_LOGS) {
       logger.log(`[send-worker] job ${claimedJob.id} disposition=${resolved.disposition} reason=${resolved.reason || 'none'}`);
     }
