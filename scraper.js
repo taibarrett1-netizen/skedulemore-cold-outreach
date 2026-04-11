@@ -32,6 +32,7 @@ const {
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
+const { dismissInstagramPopups } = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
 async function failScrapeJob(jobId, errorMessage) {
@@ -198,6 +199,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
       return;
     }
+
+    // Dismiss any blocking popups that appear on home page load.
+    await dismissInstagramPopups(page, logger).catch(() => {});
+
     logger.log('[Scraper] Warming session before scrape...');
     await delay(3000 + Math.floor(Math.random() * 5000));
     for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
@@ -228,61 +233,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     });
     await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
-    // Handle "Review and Agree" / terms/privacy dialogs that can block the page.
-    async function dismissReviewDialogs(page) {
-      return page.evaluate(() => {
-        const bodyText = (document.body && document.body.innerText) || '';
-        if (
-          !/review and agree/i.test(bodyText) &&
-          !/changes to how we manage data/i.test(bodyText) &&
-          !/updates to our terms/i.test(bodyText)
-        ) {
-          return false;
-        }
-        const labels = ['Agree to Terms', 'Agree', 'Next', 'OK', 'Accept', 'Continue'];
-        const buttons = Array.from(
-          document.querySelectorAll('button, div[role="button"], [role="button"]')
-        );
-        for (const label of labels) {
-          const btn = buttons.find(
-            (el) => (el.textContent || '').trim().toLowerCase() === label.toLowerCase()
-          );
-          if (btn && btn.offsetParent) {
-            btn.click();
-            return true;
-          }
-        }
-        // Fallback: click the primary button in any dialog.
-        const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
-        for (const d of dialogs) {
-          const primary = Array.from(
-            d.querySelectorAll('button, div[role="button"], [role="button"]')
-          ).find((el) => {
-            const style = window.getComputedStyle(el);
-            const bg = style.backgroundColor || '';
-            // Heuristic: bright/blue or main CTA.
-            return /rgb\(0,\s*149,\s*246\)/.test(bg) || /rgb\(0,\s*55,\s*107\)/.test(bg);
-          });
-          if (primary && primary.offsetParent) {
-            primary.click();
-            return true;
-          }
-        }
-        return false;
-      });
-    }
-
-    try {
-      // Some accounts see multiple stacked dialogs; loop a few times.
-      for (let i = 0; i < 3; i++) {
-        const handled = await dismissReviewDialogs(page);
-        if (!handled) break;
-        logger.log('[Scraper] Dismissed Review/Terms dialog (%d)', i + 1);
-        await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
-      }
-    } catch (e) {
-      logger.warn('[Scraper] Failed to handle Review/Terms dialog: ' + e.message);
-    }
+    // Dismiss cookies, account-switcher "Continue", notifications, and terms dialogs.
+    await dismissInstagramPopups(page, logger).catch(() => {});
 
     const jobCheck = await getScrapeJob(jobId);
     if (jobCheck?.status === 'cancelled') return;
@@ -1114,6 +1066,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       return;
     }
 
+    // Dismiss any blocking popups on home page load.
+    await dismissInstagramPopups(page, logger).catch(() => {});
+
     logger.log('[Scraper] Warming session before comment scrape...');
     await delay(3000 + Math.floor(Math.random() * 5000));
     await page.evaluate(() => window.scrollTo(0, 200 + Math.random() * 500));
@@ -1141,6 +1096,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+      await dismissInstagramPopups(page, logger).catch(() => {});
 
       const candidateAuthors = await page.evaluate(function () {
         const blacklist = ['explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags'];
