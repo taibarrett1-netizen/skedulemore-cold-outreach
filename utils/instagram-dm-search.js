@@ -9,6 +9,7 @@
  *   reason?: string,
  *   detail?: string,
  *   logLine?: string,
+ *   displayName?: string | null,
  * }>}
  */
 async function clickInstagramDmSearchResult(page, username) {
@@ -19,6 +20,7 @@ async function clickInstagramDmSearchResult(page, username) {
   return page.evaluate((needleRaw) => {
     const needle = needleRaw.toLowerCase();
     const needleEsc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Word-boundary token match — checks visible text only (NOT hrefs).
     const needleTokenRe = new RegExp(`(^|[^a-z0-9._])@?${needleEsc}([^a-z0-9._]|$)`, 'i');
     const body = document.body && document.body.innerText ? document.body.innerText : '';
     const lowerBody = body.toLowerCase();
@@ -41,34 +43,21 @@ async function clickInstagramDmSearchResult(page, username) {
       }
     }
 
+    // Text-only combined match — deliberately excludes href to avoid false positives from
+    // URL query params like utm_source=<username> appearing in thread items.
     function combinedMatchText(el) {
       const bits = [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
-      let a = el.closest && el.closest('a[href*="instagram.com"]');
-      if (!a && el.tagName === 'A') a = el;
-      if (a && a.href) bits.push(a.href);
       return bits.join(' ').toLowerCase();
     }
 
     function isReservedPathSegment(seg) {
-      const bad = new Set([
-        'direct',
-        'p',
-        'reel',
-        'reels',
-        'stories',
-        'explore',
-        'accounts',
-        'legal',
-        'api',
-        'tv',
-      ]);
+      const bad = new Set(['direct', 'p', 'reel', 'reels', 'stories', 'explore', 'accounts', 'legal', 'api', 'tv']);
       return !seg || bad.has(seg.toLowerCase());
     }
 
     function hrefProfileUsername(href) {
       if (!href || typeof href !== 'string') return null;
-      const h = href.toLowerCase();
-      if (!h.includes('instagram.com')) return null;
+      if (!href.toLowerCase().includes('instagram.com')) return null;
       try {
         const path = new URL(href, 'https://www.instagram.com').pathname.replace(/^\/+|\/+$/g, '');
         const first = path.split('/')[0] || '';
@@ -80,11 +69,9 @@ async function clickInstagramDmSearchResult(page, username) {
     }
 
     function hrefMatches(href) {
-      const seg = hrefProfileUsername(href);
-      return seg === needle;
+      return hrefProfileUsername(href) === needle;
     }
 
-    /** Short nav / header controls — not search result rows */
     function resolveInstagramHref(el) {
       if (!el) return '';
       if (el.href && String(el.href).includes('instagram.com')) return el.href;
@@ -94,42 +81,67 @@ async function clickInstagramDmSearchResult(page, username) {
       return a && a.href ? a.href : '';
     }
 
-    function isChromeOnlyRow(el, combined) {
+    function isChromeOnlyRow(el) {
       const raw = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const shortNav = /^(back|next|close|cancel|done|ok|chat|not now|compose|skip|new message|new)$/i;
+      const shortNav = /^(back|next|close|cancel|done|ok|chat|not now|compose|skip|new message|new|clear search)$/i;
       if (raw.length <= 2) return true;
       if (raw.length <= 48 && shortNav.test(raw)) return true;
-      if (combined.length < 80 && shortNav.test(combined.replace(/\s+/g, ' ').trim())) return true;
       return false;
     }
 
+    /**
+     * Returns true if the element's visible text contains the target username as a word-boundary token.
+     * Deliberately does NOT check the href — that was the root cause of false positives against
+     * existing thread rows that had utm_source=<username> in their URL.
+     */
     function rowLooksLikeSearchHit(el) {
+      if (isChromeOnlyRow(el)) return false;
       const c = combinedMatchText(el);
       if (c.includes('more accounts')) return false;
-      // Require an exact username line/token from the visible row (left results list),
-      // not just a token found somewhere in combined text (e.g. URL query preview).
-      const rawText = (el.innerText || el.textContent || '').replace(/\r/g, '');
-      const lines = rawText
-        .split(/\n+/)
-        .map((x) => x.replace(/\s+/g, ' ').trim().toLowerCase())
-        .filter(Boolean);
-      const exactLineMatch = lines.some((ln) => ln.replace(/^@/, '') === needle);
-      if (!exactLineMatch) {
-        // Some IG layouts flatten text into one line; allow exact token among short text chunks only.
-        const shortChunks = rawText
-          .split(/[·•|,:;()\-\/\\]+|\s{2,}/g)
-          .map((x) => x.replace(/\s+/g, ' ').trim().toLowerCase())
-          .filter(Boolean)
-          .filter((x) => x.length <= 40);
-        const exactChunkMatch = shortChunks.some((ch) => ch.replace(/^@/, '') === needle);
-        if (!exactChunkMatch) return false;
-      }
-      // Keep token requirement as a secondary guard.
-      if (!needleTokenRe.test(c)) return false;
-      if (isChromeOnlyRow(el, c)) return false;
-      return true;
+      // Must contain the username as a standalone token in visible text.
+      return needleTokenRe.test(c);
     }
 
+    /**
+     * Extract the display name from a search result row.
+     * The sidebar row text structure is typically:
+     *   Line 1: Display Name  (e.g. "Tai - SkeduleMore")
+     *   Line 2: username      (e.g. "skedulemore")
+     *   Line 3: bio/tagline   (e.g. "Scale Without Setters")
+     *
+     * We find the line that equals the username and take the line immediately above it.
+     * Returns null if display name equals the username or cannot be determined.
+     */
+    function extractDisplayNameFromRow(el) {
+      const rawText = (el.innerText || el.textContent || '').replace(/\r/g, '').trim();
+      const lines = rawText
+        .split(/\n+/)
+        .map((s) => s.replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
+
+      const userIdx = lines.findIndex((l) => l.toLowerCase().replace(/^@/, '') === needle);
+      if (userIdx > 0) {
+        const candidate = lines[userIdx - 1];
+        // Sanity: not a chrome label, not too long
+        if (
+          candidate &&
+          candidate.toLowerCase() !== 'more accounts' &&
+          candidate.length >= 1 &&
+          candidate.length <= 120
+        ) {
+          return candidate; // e.g. "Tai - SkeduleMore"
+        }
+      }
+      // Username might be first line — display name may differ by capitalisation or be the same.
+      // In this case return null; the caller can fall back to the username.
+      return null;
+    }
+
+    /**
+     * Broad candidate collection.
+     * Includes bare div[role="button"] so that "More accounts" result rows (which Instagram
+     * renders without a listbox wrapper on /direct/new) are also considered.
+     */
     function collectCandidates() {
       const selectors = [
         '[role="listbox"] [role="option"]',
@@ -139,6 +151,9 @@ async function clickInstagramDmSearchResult(page, username) {
         'div[role="dialog"] [role="option"]',
         'div[role="dialog"] a[href*="instagram.com/"]',
         'div[role="dialog"] div[role="button"]',
+        // Broad fallback — catches IG layouts where search results sit outside listbox/dialog.
+        'div[role="button"]',
+        'button',
       ];
       const seen = new Set();
       const out = [];
@@ -187,7 +202,8 @@ async function clickInstagramDmSearchResult(page, username) {
 
     const moreAccountsY = nearestMoreAccountsHeadingY();
 
-    // Sort helper: prioritise rows visually below "More accounts" heading, then by Y.
+    // Sort helper: prioritise rows visually below "More accounts" heading (those are the
+    // search-result accounts, not existing thread rows), then by vertical position.
     function sortByMoreAccounts(arr) {
       return [...arr].sort((a, b) => {
         const ay = rowCenterY(a);
@@ -201,35 +217,35 @@ async function clickInstagramDmSearchResult(page, username) {
       });
     }
 
-    // ── Step 1: href match across EVERY visible clickable (safest — no text false positives) ──
-    // This covers Instagram layouts that skip listbox/dialog roles entirely.
-    const allClickables = sortByMoreAccounts(
-      Array.from(document.querySelectorAll('div[role="button"], button, a')).filter(visible)
-    );
+    const candidates = collectCandidates();
+    const sorted = sortByMoreAccounts(candidates);
 
-    const byAnyHref = allClickables.find((el) => {
+    // ── Pass 1: exact href match (safest — no text ambiguity) ──
+    const byHref = sorted.find((el) => {
       const h = resolveInstagramHref(el);
       return h && hrefMatches(h);
     });
-    if (byAnyHref) {
-      // Prefer clicking the inner <a> if the hit is a wrapper element.
-      let clickTarget = byAnyHref;
-      if (byAnyHref.tagName !== 'A') {
-        const inner = byAnyHref.querySelector && byAnyHref.querySelector('a[href*="instagram.com"]');
-        const outer = byAnyHref.closest && byAnyHref.closest('a[href*="instagram.com"]');
-        clickTarget = inner || outer || byAnyHref;
+    if (byHref) {
+      const displayName = extractDisplayNameFromRow(byHref);
+      let clickTarget = byHref;
+      if (byHref.tagName !== 'A') {
+        const inner = byHref.querySelector && byHref.querySelector('a[href*="instagram.com"]');
+        const outer = byHref.closest && byHref.closest('a[href*="instagram.com"]');
+        clickTarget = inner || outer || byHref;
       }
       clickTarget.click();
-      return { ok: true, detail: 'href_any_match' };
+      return { ok: true, detail: 'href_match', displayName: displayName || null };
     }
 
-    // ── Step 2: exact text-line match across every visible clickable ──
-    const byAnyText = allClickables.find((el) => rowLooksLikeSearchHit(el));
-    if (byAnyText) {
-      byAnyText.click();
-      return { ok: true, detail: 'text_exact_line_match' };
+    // ── Pass 2: username token in visible text (word-boundary, no href, "More accounts" first) ──
+    const byText = sorted.find((el) => rowLooksLikeSearchHit(el));
+    if (byText) {
+      const displayName = extractDisplayNameFromRow(byText);
+      byText.click();
+      return { ok: true, detail: 'text_token_match', displayName: displayName || null };
     }
 
+    // ── Diagnostics ──
     const listbox = document.querySelector('[role="listbox"]');
     const optionSample = listbox
       ? Array.from(listbox.querySelectorAll('[role="option"], a, div[role="button"]'))
@@ -246,20 +262,10 @@ async function clickInstagramDmSearchResult(page, username) {
       .filter(Boolean);
 
     if (lowerBody.includes('this account is private') || lowerBody.includes('account is private') || lowerBody.includes('private account')) {
-      return {
-        ok: false,
-        reason: 'account_private',
-        detail: 'page_text_during_search',
-        logLine: `handle=${needleRaw}; private_hint_in_body=true`,
-      };
+      return { ok: false, reason: 'account_private', detail: 'page_text_during_search', logLine: `handle=${needleRaw}; private_hint_in_body=true` };
     }
     if (lowerBody.includes('try again later') || lowerBody.includes('too many')) {
-      return {
-        ok: false,
-        reason: 'rate_limited',
-        detail: 'page_text_during_search',
-        logLine: `handle=${needleRaw}; rate_limit_hint_in_body=true`,
-      };
+      return { ok: false, reason: 'rate_limited', detail: 'page_text_during_search', logLine: `handle=${needleRaw}; rate_limit_hint_in_body=true` };
     }
 
     const needleInBody = lowerBody.includes(needle);
@@ -283,12 +289,7 @@ async function clickInstagramDmSearchResult(page, username) {
       listbox ? `listboxSample=${optionSample.join(' | ') || '(none)'}` : 'listbox=absent',
       `divRoleButtonSample=${btnSample.join(' | ') || '(none)'}`,
     ];
-    return {
-      ok: false,
-      reason,
-      detail,
-      logLine: parts.join('; '),
-    };
+    return { ok: false, reason, detail, logLine: parts.join('; ') };
   }, u);
 }
 

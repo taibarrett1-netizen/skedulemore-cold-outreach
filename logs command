@@ -16,7 +16,7 @@ screenshot=/root/ColdDMs/logs/login-debug/1775764011860_before_submit.png
 cd /root/ColdDMs
 python3 -m http.server 8080
 
-scp root@178.62.52.200:/root/ColdDMs/logs/login-debug//1775881515629_dm_search_fail_bryght_social.png ~/Downloads/
+scp root@178.62.52.200:/root/ColdDMs/logs/login-debug/1775881811510_dm_search_fail_bryght_social.png ~/Downloads/
 
 python3 - <<'PY'
 import requests

@@ -1722,6 +1722,12 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       pageSnippet: formatSearchFailurePageSnippet(u, searchPick),
     };
   }
+  // Display name extracted from the search result sidebar row (most reliable source —
+  // IG always shows "Display Name / username / bio" in the left panel before you click).
+  const sidebarDisplayName = (searchPick.displayName && String(searchPick.displayName).trim()) || null;
+  if (sidebarDisplayName) {
+    logger.log(`[name-extraction] sidebar display name for @${u}: "${sidebarDisplayName}"`);
+  }
   await delay(1500);
 
   const openedThread = await page.evaluate(() => {
@@ -1886,11 +1892,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   // When lead has no display_name/first_name in DB but template uses {{first_name}}/{{full_name}}, get name from thread page (e.g. "AI Setter Test 8 aisettertest8")
   const templateUsesName = /\{\{\s*(first_name|full_name)\s*\}\}/i.test(messageTemplate);
   const preferThreadName = sendOpts.preferThreadName === true || sendOpts.dryRunNames === true;
-  let displayNameForSubst = preferThreadName ? null : nameFallback.display_name ?? nameFallback.first_name ?? null;
+  // Priority: DB name → sidebar (search result row, most reliable live source) → thread-header extraction.
+  // preferThreadName skips DB names but sidebar is still reliable (it's live IG data, not a stale lead record).
+  let displayNameForSubst = preferThreadName
+    ? (sidebarDisplayName || null)
+    : (nameFallback.display_name ?? nameFallback.first_name ?? sidebarDisplayName ?? null);
   let resolvedNameSource = displayNameForSubst
-    ? nameFallback.display_name
+    ? (nameFallback.display_name && !preferThreadName)
       ? 'fallback_display_name'
-      : 'fallback_first_name'
+      : (nameFallback.first_name && !preferThreadName)
+      ? 'fallback_first_name'
+      : 'sidebar'
     : null;
   let nameExtractionDebugSnapshot = null;
   const nameExtractionDebugLog =
@@ -1899,7 +1911,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     process.env.NAME_EXTRACTION_DEBUG === '1' ||
     process.env.NAME_EXTRACTION_DEBUG === 'true';
 
-  if (templateUsesName && (preferThreadName || !displayNameForSubst) && (!nameFallback.display_name || !nameFallback.first_name || preferThreadName)) {
+  if (templateUsesName && !displayNameForSubst && (!nameFallback.display_name || !nameFallback.first_name || preferThreadName)) {
     try {
       const settleMs = Math.max(0, parseInt(process.env.NAME_EXTRACTION_SETTLE_MS || '0', 10) || 0);
       if (settleMs) await delay(settleMs);
