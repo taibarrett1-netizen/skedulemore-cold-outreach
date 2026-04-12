@@ -920,11 +920,23 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
           'Two-factor authentication is required for connect. This account prompted email verification instead of app/WhatsApp 2FA. Enable 2FA in Instagram Security settings, then reconnect.',
       });
     }
-    return res.status(400).json({
-      ok: false,
-      code: 'two_factor_required_for_connect',
-      error:
-        'Two-factor authentication is required for connect. Enable 2FA on Instagram, then reconnect and complete the 6-digit code step.',
+    // Connect succeeded without requiring a challenge (e.g. valid existing browser session/cookies).
+    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+      proxyUrl: proxyMeta.proxyUrl,
+      proxyAssignmentId: proxyMeta.proxyAssignmentId,
+    });
+    if (isPlatformPool) {
+      await savePlatformScraperSession(
+        { cookies: result.cookies },
+        result.username,
+        req.body?.daily_actions_limit != null ? req.body.daily_actions_limit : 500,
+        { forceInsert: isPlatformBackup }
+      );
+    }
+    return res.status(200).json({
+      ok: true,
+      username: result.username,
+      message: 'Connected. Existing Instagram session was restored.',
     });
   } catch (e) {
     console.error('[API] Instagram connect failed', e);
