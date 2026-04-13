@@ -150,6 +150,51 @@ function randomDelay(minMs, maxMs) {
 }
 
 /**
+ * Instagram sometimes paints an almost-empty profile (only the Messages pill / chrome) while the URL
+ * still looks like a profile — common when the tab is starved next to another Chromium instance.
+ */
+async function instagramListProfilePageLooksBroken(page) {
+  try {
+    return await page.evaluate(() => {
+      const links = document.querySelectorAll('a[href*="/followers"], a[href*="/following"]');
+      if (links.length > 0) return false;
+      const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+      if (t.length > 120) return false;
+      return true;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+async function recoverBlankInstagramProfilePage(page, cleanTarget, logger, reasonLabel) {
+  if (logger) {
+    logger.log(
+      `[Scraper] ${reasonLabel}: page has no follower/following links and little text — ` +
+        'Escape + hard profile reload'
+    );
+  }
+  for (let i = 0; i < 4; i++) {
+    await page.keyboard.press('Escape').catch(() => {});
+    await delay(150);
+  }
+  await delay(randomDelay(400, 1000));
+  const profileUrl = `https://www.instagram.com/${encodeURIComponent(cleanTarget)}/`;
+  const nav = {
+    waitUntil: LIST_SCRAPE_NAV_WAIT_UNTIL,
+    timeout: SCRAPER_NAV_TIMEOUT_MS,
+  };
+  try {
+    await page.goto(profileUrl, nav);
+  } catch (e) {
+    if (logger) logger.warn('[Scraper] Profile recovery goto failed: ' + (e.message || e));
+    await page.reload(nav).catch(() => {});
+  }
+  await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+  await dismissInstagramPopups(page, logger).catch(() => {});
+}
+
+/**
  * Log in to Instagram with credentials, return session (cookies only).
  * Password is never stored.
  */
@@ -287,6 +332,15 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     // Dismiss cookies, account-switcher "Continue", notifications, and terms dialogs.
     await dismissInstagramPopups(page, logger).catch(() => {});
 
+    if (await instagramListProfilePageLooksBroken(page)) {
+      await recoverBlankInstagramProfilePage(
+        page,
+        cleanTarget,
+        logger,
+        'After profile navigation'
+      );
+    }
+
     const jobCheck = await getScrapeJob(jobId);
     if (jobCheck?.status === 'cancelled') return;
 
@@ -403,12 +457,32 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     let profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
     if (!profileListOpened) {
+      if (await instagramListProfilePageLooksBroken(page)) {
+        await recoverBlankInstagramProfilePage(
+          page,
+          cleanTarget,
+          logger,
+          'Before follower/following link retry'
+        );
+        profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
+      }
+    }
+    if (!profileListOpened) {
       try {
         await dismissInstagramPopups(page, logger);
         await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       } catch (e) {
         logger.warn('[Scraper] Failed to dismiss popups before retry: ' + e.message);
       }
+      profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
+    }
+    if (!profileListOpened) {
+      await recoverBlankInstagramProfilePage(
+        page,
+        cleanTarget,
+        logger,
+        'Final attempt before modal failure'
+      );
       profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
     }
 
@@ -430,9 +504,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         const tag = listKind === 'following' ? 'following' : 'followers';
         const screenshotPath = path.join(debugDir, `${tag}_modal_fail_${String(jobId)}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.error('[Scraper] Screenshot saved: %s', screenshotPath);
+        logger.error(`[Scraper] Screenshot saved: ${screenshotPath}`);
       } catch (screenshotErr) {
-        logger.error('[Scraper] Failed to capture screenshot: %s', screenshotErr.message);
+        logger.error(`[Scraper] Failed to capture screenshot: ${screenshotErr.message}`);
       }
 
       // Detect rate limiting (429) specifically.
