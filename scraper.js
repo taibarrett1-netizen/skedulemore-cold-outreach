@@ -30,15 +30,42 @@ const {
   describePlatformScraperPoolForLogs,
   normalizePlatformSessionRowForPuppeteer,
   recordScraperActions,
+  markPlatformScraperWebNeedsRefresh,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
-const { dismissInstagramPopups, ensurePoolScraperInstagramWebSession } = require('./utils/instagram-modals');
+const {
+  dismissInstagramPopups,
+  ensurePoolScraperInstagramWebSession,
+  detectInstagramPasswordReauthScreen,
+} = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
 async function failScrapeJob(jobId, errorMessage) {
   logger.error(`[Scraper] Job ${jobId} failed: ${errorMessage}`);
   await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
+}
+
+async function poolScraperPageLooksLoggedOut(page) {
+  if (!page) return false;
+  const u = page.url() || '';
+  if (u.includes('/accounts/login')) return true;
+  return detectInstagramPasswordReauthScreen(page);
+}
+
+/** Clear pinned pool session so the next claim can use another scraper; flag row for admin toast. */
+async function requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, logPrefix) {
+  const msg =
+    'Pool scraper Instagram web session logged out. Job re-queued for another scraper — reconnect this account in Platform scrapers.';
+  logger.warn(`[Scraper] ${logPrefix} ${msg}`);
+  if (platformSessionId) await markPlatformScraperWebNeedsRefresh(platformSessionId).catch(() => {});
+  await updateScrapeJob(jobId, {
+    status: 'retry',
+    available_at: new Date().toISOString(),
+    error_message: msg,
+    last_error_class: 'session_logged_out',
+    platform_scraper_session_id: null,
+  });
 }
 
 async function completeScrapeJobForQuota(jobId, clientId, scrapedCount) {
@@ -207,8 +234,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
 
-    if (page.url().includes('/accounts/login')) {
-      await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
+    if (await poolScraperPageLooksLoggedOut(page)) {
+      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'follower scrape home');
       return;
     }
 
@@ -1244,8 +1271,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
     await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
 
-    if (page.url().includes('/accounts/login')) {
-      await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
+    if (await poolScraperPageLooksLoggedOut(page)) {
+      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape home');
       return;
     }
 
@@ -1287,13 +1314,18 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
         await delay(1500 + Math.floor(Math.random() * 900));
         await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
-        if (page.url().includes('/accounts/login')) {
-          await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
+        if (await poolScraperPageLooksLoggedOut(page)) {
+          await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape after guest retry');
           return;
         }
         await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
         await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
         await dismissInstagramPopups(page, logger).catch(() => {});
+      }
+
+      if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) {
+        await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape post still guest');
+        return;
       }
 
       if (scraperDebug) await logCommentScrapeDomDebug(page, logger, 'post-loaded', { shortcode: shortcode || null });

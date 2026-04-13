@@ -1969,6 +1969,26 @@ async function releasePlatformScraperSessionLease(sessionId, workerId, { cooldow
   await q;
 }
 
+async function markInstagramSessionWebNeedsRefresh(sessionId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) return;
+  const nowIso = new Date().toISOString();
+  await sb
+    .from('cold_dm_instagram_sessions')
+    .update({ web_session_needs_refresh: true, updated_at: nowIso })
+    .eq('id', sessionId);
+}
+
+async function markPlatformScraperWebNeedsRefresh(sessionId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) return;
+  const nowIso = new Date().toISOString();
+  await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .update({ web_session_needs_refresh: true, updated_at: nowIso })
+    .eq('id', sessionId);
+}
+
 /**
  * Prefer Postgres lease_platform_scraper_session (primary-before-backup, SKIP LOCKED).
  * Validates Puppeteer cookies + daily usage in JS (RPC does not enforce those).
@@ -4156,6 +4176,8 @@ module.exports = {
   reservePlatformScraperSessionForWorker,
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
+  markInstagramSessionWebNeedsRefresh,
+  markPlatformScraperWebNeedsRefresh,
   reportPlatformScraperScrapeFailure,
   recordScraperActions,
   savePlatformScraperSession,

@@ -818,6 +818,25 @@ async function closeDmComposerOverlays(page) {
   }
 }
 
+/**
+ * True when mobile web shows the password re-auth screen (saved username + password field + Log in),
+ * i.e. cookies no longer keep the session — user must reconnect in the dashboard.
+ */
+async function detectInstagramPasswordReauthScreen(page) {
+  try {
+    const u = page.url() || '';
+    if (!/\/accounts\/login/i.test(u)) return false;
+    return await page.evaluate(() => {
+      const pw = document.querySelector('input[type="password"], input[name="pass"], input[name="password"]');
+      if (!pw || !pw.offsetParent) return false;
+      const body = ((document.body && document.body.innerText) || '').toLowerCase();
+      return /log in|anmelden|accedi|iniciar sesión/.test(body);
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
 module.exports = {
   dismissInstagramCookieConsent,
   resolveContinueButtonDiagnostics,
@@ -830,5 +849,6 @@ module.exports = {
   ensurePoolScraperInstagramWebSession,
   dismissInstagramPopups,
   closeDmComposerOverlays,
+  detectInstagramPasswordReauthScreen,
   delay,
 };

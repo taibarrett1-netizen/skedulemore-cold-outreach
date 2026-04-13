@@ -32,6 +32,7 @@ const {
   dismissInstagramCookieConsent,
   dismissInstagramHomeModals,
   dismissInstagramPopups,
+  detectInstagramPasswordReauthScreen,
 } = require('./utils/instagram-modals');
 const {
   navigateToDmThread,
@@ -3320,7 +3321,16 @@ async function sendFollowUp(body) {
 }
 
 async function sendDM(page, username, adapter, options = {}) {
-  const { messageOverride, campaignId, campaignLeadId, messageGroupId, messageGroupMessageId, dailySendLimit, hourlySendLimit } = options;
+  const {
+    messageOverride,
+    campaignId,
+    campaignLeadId,
+    messageGroupId,
+    messageGroupMessageId,
+    dailySendLimit,
+    hourlySendLimit,
+    instagramSessionId,
+  } = options;
   const sendWorkerId = options.sendWorkerId || null;
   const u = normalizeUsername(username);
   const sent = await Promise.resolve(adapter.alreadySent(u));
@@ -3387,6 +3397,19 @@ async function sendDM(page, username, adapter, options = {}) {
   );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
+      if (page && instagramSessionId) {
+        try {
+          const pu = page.url() || '';
+          if (pu.includes('/accounts/login') || (await detectInstagramPasswordReauthScreen(page))) {
+            await sb.markInstagramSessionWebNeedsRefresh(instagramSessionId).catch(() => {});
+            return {
+              ok: false,
+              reason: 'session_logged_out',
+              statusMessage: 'Instagram logged out — reconnect this sender in Cold Outreach.',
+            };
+          }
+        } catch (_) {}
+      }
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
         firstNameBlocklist,
         senderName: senderAccountName,
@@ -3423,6 +3446,22 @@ async function sendDM(page, username, adapter, options = {}) {
         }
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true, cooldownMs: sendCooldownMs };
+      }
+      if (!result.ok && page && instagramSessionId) {
+        try {
+          const pu = page.url() || '';
+          if (pu.includes('/accounts/login') || (await detectInstagramPasswordReauthScreen(page))) {
+            await sb.markInstagramSessionWebNeedsRefresh(instagramSessionId).catch(() => {});
+            return {
+              ok: false,
+              reason: 'session_logged_out',
+              statusMessage: 'Instagram logged out — reconnect this sender in Cold Outreach.',
+            };
+          }
+        } catch (_) {}
+      }
+      if (result.reason === 'session_logged_out') {
+        return result;
       }
       const terminalReasons = [
         'user_not_found',
@@ -3651,6 +3690,7 @@ async function runBotMultiTenant() {
       await delay(3000);
       if (pg.url().includes('/accounts/login')) {
         logger.error('Instagram session expired for account ' + sessionLabel);
+        if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         return false;
       }
       currentSessionId = session.id;
@@ -3664,6 +3704,7 @@ async function runBotMultiTenant() {
             currentSessionId = session.id;
             return true;
           }
+          if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         } catch {}
       }
       logger.error('Failed to switch session: ' + e.message);
@@ -3976,6 +4017,7 @@ async function runBotMultiTenant() {
       startLeaseHeartbeat();
       startSendJobHeartbeat();
       startCampaignLeaseHeartbeat();
+      let skipSendAfterVoiceRestart = false;
       logger.log(`[send-worker] restoring Instagram session for @${work.username}`);
       const ok = await withTimeout(
         ensurePageSession(session),
@@ -3986,13 +4028,18 @@ async function runBotMultiTenant() {
         return false;
       });
       if (!ok) {
-        logger.warn('Could not load session for campaign, failing lead.');
-        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
-        await sb.updateSendJob(claimedJob.id, {
-          status: 'failed',
-          last_error_class: 'session_load_failed',
-          last_error_message: 'session_load_failed',
-        }, SEND_WORKER_ID).catch(() => {});
+        logger.warn('Could not load Instagram session; re-queueing send job (lead not failed).');
+        if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
+        await sb.updateSendJob(
+          claimedJob.id,
+          {
+            status: 'retry',
+            available_at: new Date(Date.now() + randomDelay(30, 90) * 1000).toISOString(),
+            last_error_class: 'session_load_failed',
+            last_error_message: 'Instagram session expired. Reconnect this sender in Cold Outreach.',
+          },
+          SEND_WORKER_ID
+        ).catch(() => {});
         await delay(randomDelay(2000, 5000));
         continue;
       }
@@ -4014,6 +4061,7 @@ async function runBotMultiTenant() {
         display_name: work.display_name,
         voice_note_path: work.voiceNotePath || VOICE_NOTE_FILE || null,
         voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
+        instagramSessionId: session.id,
       };
       logger.log(`[send-worker] sending DM to @${work.username}`);
       sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
@@ -4034,6 +4082,8 @@ async function runBotMultiTenant() {
             const okVoice = await ensurePageSession(session);
             if (!okVoice) {
               logger.warn('Could not restore session after voice browser restart.');
+              if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
+              skipSendAfterVoiceRestart = true;
             }
           }
         } catch (e) {
@@ -4043,7 +4093,13 @@ async function runBotMultiTenant() {
         }
       }
 
-      const sendResult = await sendDM(page, work.username, adapter, options);
+      const sendResult = skipSendAfterVoiceRestart
+        ? {
+            ok: false,
+            reason: 'session_logged_out',
+            statusMessage: 'Instagram session lost after voice prep — reconnect sender in Cold Outreach.',
+          }
+        : await sendDM(page, work.username, adapter, options);
 
       let delayMs;
       let sendJobStatus = 'completed';
@@ -4089,6 +4145,18 @@ async function runBotMultiTenant() {
           last_error_class: 'already_sent',
           last_error_message: 'already_sent',
         };
+      } else if (!sendResult.ok && sendResult.reason === 'session_logged_out') {
+        delayMs = randomDelay(30, 90) * 1000;
+        sendJobStatus = 'retry';
+        sendJobUpdates = {
+          available_at: new Date(Date.now() + delayMs).toISOString(),
+          last_error_class: 'session_logged_out',
+          last_error_message: sendResult.statusMessage || 'session_logged_out',
+        };
+        sb.setClientStatusMessage(
+          clientId,
+          'Instagram logged out — reconnect your sender in Cold Outreach, then sending resumes.'
+        ).catch(() => {});
       } else {
         delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
@@ -4244,6 +4312,7 @@ async function runBot() {
       await delay(3000);
       if (page.url().includes('/accounts/login')) {
         logger.error('Instagram session expired for account ' + sessionLabel);
+        if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         return false;
       }
       currentSessionId = session.id;
@@ -4257,6 +4326,7 @@ async function runBot() {
             currentSessionId = session.id;
             return true;
           }
+          if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         } catch {}
       }
       logger.error('Failed to switch session: ' + e.message);
