@@ -25,6 +25,8 @@
  *                                    (after-home-session-check, warm-scroll-start / -end per post)
  *   SCRAPER_SESSION_DEBUG=1        — like SCRAPER_DEBUG but only extra session-ensure logs/PNGs
  *                                    if you want session diagnostics without full comment DOM debug
+ *   SCRAPER_SESSION_FULL_SCREENSHOTS=1 — with session debug: capture every session_ensure PNG (default: round 0+4 only)
+ *   SCRAPER_COMMENT_HOME_SCREENSHOT=1 — with SCRAPER_DEBUG: also save home after-home-session-check PNG
  */
 require('dotenv').config();
 const os = require('os');

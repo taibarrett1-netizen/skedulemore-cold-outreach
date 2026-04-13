@@ -1073,6 +1073,25 @@ function getShortcodeFromPostUrl(url) {
   return m ? m[1] : null;
 }
 
+/** Stable /p/{code}/comments/ URL for comment-thread scraping (hl=en when missing). */
+function buildInstagramPostCommentsUrl(postUrl) {
+  const raw = String(postUrl || '').trim();
+  if (!raw) return 'https://www.instagram.com/';
+  try {
+    const u = new URL(raw.includes('://') ? raw : 'https://www.instagram.com' + (raw.startsWith('/') ? raw : '/' + raw));
+    let path = u.pathname.replace(/\/+$/, '');
+    path = path.replace(/\/comments\/?$/i, '');
+    const m = path.match(/^(.*\/p\/[^/]+)$/i);
+    if (!m) return raw;
+    u.pathname = m[1] + '/comments/';
+    if (!u.searchParams.get('hl')) u.searchParams.set('hl', 'en');
+    return u.toString();
+  } catch (_) {
+    const m = raw.match(/\/p\/([A-Za-z0-9_-]+)/);
+    return m ? `https://www.instagram.com/p/${m[1]}/comments/?hl=en` : raw;
+  }
+}
+
 function scraperDebugEnabled() {
   const v = String(process.env.SCRAPER_DEBUG || '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';
@@ -1279,7 +1298,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
     const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
 
-    await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
+    await commentScrapeDebugScreenshot(
+      page,
+      logger,
+      scraperDebug && String(process.env.SCRAPER_COMMENT_HOME_SCREENSHOT || '').trim() === '1',
+      jobId,
+      'home',
+      'after-home-session-check'
+    );
 
     if (!poolEstablishedHome || (await poolScraperWebSessionBlocksWork(page, preferredIgUser))) {
       await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape home');
@@ -1292,7 +1318,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await delay(2000 + Math.floor(Math.random() * 3000));
 
     logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
-    let totalScraped = 0;
+    let leadsInsertedTotal = 0;
     const seenUsernames = new Set();
     const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
       getConversationParticipantUsernames(clientId),
@@ -1303,6 +1329,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     if (scraperUsername) seenUsernames.add(scraperUsername);
 
     for (const postUrl of postUrls) {
+      if (maxLeads && leadsInsertedTotal >= maxLeads) break;
+
       const jobCheck = await getScrapeJob(jobId);
       if (jobCheck && jobCheck.status === 'cancelled') {
         logger.log('[Scraper] Job cancelled');
@@ -1311,6 +1339,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
       const shortcode = getShortcodeFromPostUrl(postUrl);
       const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
+      const commentsListUrl = buildInstagramPostCommentsUrl(normalizedUrl);
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       await dismissInstagramPopups(page, logger).catch(() => {});
@@ -1369,6 +1398,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await delay(randomDelay(1000, 2000));
 
+      let commentsThreadUrl = null;
       let commentsOpened = false;
       for (let attempt = 0; attempt < 5; attempt++) {
         commentsOpened = await page.evaluate(function () {
@@ -1387,6 +1417,16 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         });
         if (commentsOpened) {
           logger.log('[Scraper] Clicked View all comments');
+          await delay(randomDelay(2000, 4000));
+          let u = page.url() || '';
+          if (!/\/p\/[^/]+\/comments\//i.test(u)) {
+            logger.warn('[Scraper] Did not land on /comments/ after click — opening comments URL');
+            await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await delay(randomDelay(1200, 2200));
+            await dismissInstagramPopups(page, logger).catch(() => {});
+            u = page.url() || '';
+          }
+          commentsThreadUrl = u || commentsListUrl;
           break;
         }
         await page.evaluate(() => window.scrollBy(0, 200));
@@ -1399,16 +1439,18 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           attemptsUsed: commentsOpened ? 'ok' : 'none',
         });
       }
-      if (!commentsOpened) {
-        logger.warn('[Scraper] Comment scrape: never clicked "View all comments" — check viewAllLikeTexts in prior DOM debug line');
+      if (!commentsThreadUrl) {
+        logger.warn('[Scraper] Comment scrape: opening thread via /comments/ URL (no in-page "View all" or still on post view)');
+        await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await delay(randomDelay(1500, 2800));
+        await dismissInstagramPopups(page, logger).catch(() => {});
+        commentsThreadUrl = page.url() || commentsListUrl;
       }
 
-      await delay(randomDelay(3000, 5000));
+      await delay(randomDelay(2000, 4000));
 
       let anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
       if (scraperDebug) logger.log('[Scraper] After open: anchors=' + anchorCount);
-
-      await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, shortcode, 'warm-scroll-start');
 
       for (let s = 0; s < 8; s++) {
         await page.evaluate(function () {
@@ -1434,8 +1476,18 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
       let noNewCount = 0;
       let scrollCount = 0;
+      const maxScrollIters = maxLeads != null && maxLeads > 30 ? 48 : 24;
 
       while (true) {
+        if (commentsThreadUrl && !/\/p\/[^/]+\/comments\//i.test(page.url() || '')) {
+          const cur = page.url() || '';
+          logger.warn('[Scraper] Left comments thread (' + cur.slice(0, 96) + ') — restoring');
+          await page.goto(commentsThreadUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await delay(randomDelay(1200, 2200));
+          await dismissInstagramPopups(page, logger).catch(() => {});
+          noNewCount = Math.max(0, noNewCount - 2);
+        }
+
         const usernames = await page.evaluate(function () {
           const out = [];
           const anchors = document.querySelectorAll('a[href^="/"]');
@@ -1477,55 +1529,61 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         newUsernames = [...new Set(newUsernames)];
         const quotaStatus = await getScrapeQuotaStatus(clientId).catch(() => null);
         if (quotaStatus && quotaStatus.remaining <= 0) {
-          await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+          await completeScrapeJobForQuota(jobId, clientId, leadsInsertedTotal);
           return;
         }
         if (quotaStatus && newUsernames.length > quotaStatus.remaining) {
           newUsernames = newUsernames.slice(0, quotaStatus.remaining);
         }
-        if (maxLeads && totalScraped + newUsernames.length > maxLeads) {
-          newUsernames = newUsernames.slice(0, maxLeads - totalScraped);
+        if (maxLeads && leadsInsertedTotal + newUsernames.length > maxLeads) {
+          newUsernames = newUsernames.slice(0, maxLeads - leadsInsertedTotal);
         }
         for (const u of newUsernames) seenUsernames.add(u);
 
         if (newUsernames.length > 0) {
           await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
-          totalScraped = seenUsernames.size;
-          await updateScrapeJob(jobId, { scraped_count: totalScraped });
+          leadsInsertedTotal += newUsernames.length;
+          await updateScrapeJob(jobId, { scraped_count: leadsInsertedTotal });
           noNewCount = 0;
-          logger.log('[Scraper] Comments: +' + newUsernames.length + ' new, total ' + totalScraped);
+          logger.log('[Scraper] Comments: +' + newUsernames.length + ' new leads, job total ' + leadsInsertedTotal);
           const quotaAfterInsert = await getScrapeQuotaStatus(clientId).catch(() => null);
           if (quotaAfterInsert && quotaAfterInsert.remaining <= 0) {
-            await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+            await completeScrapeJobForQuota(jobId, clientId, leadsInsertedTotal);
             return;
           }
-          if (maxLeads && totalScraped >= maxLeads) break;
+          if (maxLeads && leadsInsertedTotal >= maxLeads) break;
         } else {
           noNewCount++;
           if (!scraperDebug && usernames.length > 0 && noNewCount === 1) {
             logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', new=0 (set SCRAPER_DEBUG=1 for details)');
           }
-          if (noNewCount >= 3) {
+          if (noNewCount >= 6) {
             if (scraperDebug && usernames.length === 0) {
-              await logCommentScrapeDomDebug(page, logger, 'giving-up-raw-0-after-3-empty-rounds', { scrollCount });
+              await logCommentScrapeDomDebug(page, logger, 'giving-up-raw-0-after-6-empty-rounds', { scrollCount });
             }
             break;
           }
         }
 
-        const commentsOpened = await page.evaluate(function () {
-          const btns = Array.from(document.querySelectorAll('span, a, [role="button"]'));
-          const commentBtn = btns.find(function (b) {
-            const t = (b.textContent || '').toLowerCase();
-            return t.includes('comment') || t === 'view all' || /^\d+\s*comment/.test(t);
+        const onCommentsPath = /\/p\/[^/]+\/comments\//i.test(page.url() || '');
+        let nudgedViewAll = false;
+        if (!onCommentsPath) {
+          nudgedViewAll = await page.evaluate(function () {
+            const candidates = Array.from(document.querySelectorAll('a, span, div[role="button"], [role="button"]'));
+            const viewAll = candidates.find(function (b) {
+              const t = (b.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              return /view all \d+ comments?/.test(t);
+            });
+            if (viewAll) {
+              const clickable = viewAll.tagName === 'A' ? viewAll : viewAll.closest('a') || viewAll;
+              clickable.scrollIntoView({ block: 'center' });
+              clickable.click();
+              return true;
+            }
+            return false;
           });
-          if (commentBtn) {
-            commentBtn.click();
-            return true;
-          }
-          return false;
-        });
-        if (commentsOpened) await delay(randomDelay(1500, 3500));
+        }
+        if (nudgedViewAll) await delay(randomDelay(1500, 3500));
 
         const scrollDebug = await page.evaluate(function () {
           const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
@@ -1560,7 +1618,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         if (!scrolled) break;
         await delay(randomDelay(2000, 4000));
         scrollCount++;
-        if (scrollCount > 20) break;
+        if (scrollCount > maxScrollIters) break;
       }
 
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
@@ -1576,12 +1634,12 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
     }
 
-    if (platformSessionId && totalScraped > 0) {
-      await recordScraperActions(platformSessionId, totalScraped).catch(() => {});
+    if (platformSessionId && leadsInsertedTotal > 0) {
+      await recordScraperActions(platformSessionId, leadsInsertedTotal).catch(() => {});
     }
 
-    await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
-    logger.log('[Scraper] Comment job ' + jobId + ' completed. Scraped ' + totalScraped + ' leads.');
+    await updateScrapeJob(jobId, { status: 'completed', scraped_count: leadsInsertedTotal });
+    logger.log('[Scraper] Comment job ' + jobId + ' completed. Scraped ' + leadsInsertedTotal + ' leads.');
   } catch (err) {
     logger.error('[Scraper] Comment scrape failed', err);
     try {

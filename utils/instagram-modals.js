@@ -15,6 +15,7 @@
  *
  * Session establishment diagnostics: set SCRAPER_DEBUG=1 or SCRAPER_SESSION_DEBUG=1 for
  * button samples, body snippets, and PNGs under logs/comment-scrape-debug/ (session_ensure_*).
+ * Fewer session PNGs by default; set SCRAPER_SESSION_FULL_SCREENSHOTS=1 for every loop/before-continue frame.
  */
 
 const path = require('path');
@@ -33,6 +34,14 @@ function sessionEstablishmentDebugEnabled() {
 
 async function sessionEnsureDebugScreenshot(page, logger, jobId, suffix) {
   if (!sessionEstablishmentDebugEnabled()) return;
+  if (String(process.env.SCRAPER_SESSION_FULL_SCREENSHOTS || '').trim() !== '1') {
+    const s = String(suffix || '');
+    if (s.includes('before-continue')) return;
+    if (s.includes('loop-start')) {
+      const m = s.match(/round(\d+)-loop-start/);
+      if (!m || (m[1] !== '0' && m[1] !== '4')) return;
+    }
+  }
   try {
     const dir = path.join(__dirname, '..', 'logs', 'comment-scrape-debug');
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -239,8 +248,6 @@ async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint
     const snip = diag.bodySnippet.length > 700 ? diag.bodySnippet.slice(0, 700) + '…' : diag.bodySnippet;
     logger.log('[instagram-modals] Continue bodySnippet=' + JSON.stringify(snip));
   }
-
-  await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + strategyIndex + '-before-continue');
 
   if (!diag.hasContinueContext || !diag.found) {
     return false;
@@ -533,32 +540,63 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
 async function dismissInstagramHomeModals(page, logger) {
   for (let attempt = 0; attempt < 6; attempt++) {
     const clicked = await page.evaluate(() => {
-      const isNotNow = (el) => /^not now$/i.test((el.textContent || '').replace(/\s+/g, ' ').trim());
+      function norm(el) {
+        return (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      }
+      const isNotNow = (el) => /^not now$/i.test(norm(el));
 
       const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
       for (let d = 0; d < dialogs.length; d++) {
         const root = dialogs[d];
         const txt = (root.textContent || '').toLowerCase();
-        const relevant =
-          txt.includes('turn on notifications') ||
+        const saveLogin =
           txt.includes('save your login') ||
+          txt.includes('save the login info') ||
+          txt.includes('save your login info') ||
+          (txt.includes('login info') && txt.includes('next time') && txt.includes('save'));
+        const notifications =
+          txt.includes('turn on notifications') ||
           (txt.includes('notification') && txt.includes('know right away'));
-        if (!relevant) continue;
-        const clickables = Array.from(
-          root.querySelectorAll('button, div[role="button"], span[role="button"], span, a')
-        );
-        const notNow = clickables.find((el) => {
-          if (!el.offsetParent) return false;
-          return isNotNow(el);
-        });
-        if (notNow) {
-          const btn =
-            notNow.closest('[role="button"]') ||
-            notNow.closest('button') ||
-            notNow.closest('a') ||
-            notNow;
-          btn.click();
-          return 'not_now_dialog';
+
+        if (saveLogin) {
+          const clickables = Array.from(
+            root.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"], a')
+          );
+          const saveHit = clickables.find((el) => {
+            if (!el.offsetParent) return false;
+            const t = norm(el);
+            return t === 'save info' || /^save\s*info$/i.test(t);
+          });
+          if (saveHit) {
+            const btn = saveHit.closest('button, [role="button"], a') || saveHit;
+            btn.click();
+            return 'save_login_info';
+          }
+          const notNow = clickables.find((el) => el.offsetParent && isNotNow(el));
+          if (notNow) {
+            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow.closest('a') || notNow;
+            btn.click();
+            return 'save_login_modal_not_now_fallback';
+          }
+        }
+
+        if (!saveLogin && notifications) {
+          const clickables = Array.from(
+            root.querySelectorAll('button, div[role="button"], span[role="button"], span, a')
+          );
+          const notNow = clickables.find((el) => {
+            if (!el.offsetParent) return false;
+            return isNotNow(el);
+          });
+          if (notNow) {
+            const btn =
+              notNow.closest('[role="button"]') ||
+              notNow.closest('button') ||
+              notNow.closest('a') ||
+              notNow;
+            btn.click();
+            return 'not_now_dialog';
+          }
         }
       }
 
@@ -578,7 +616,13 @@ async function dismissInstagramHomeModals(page, logger) {
       return false;
     });
     if (clicked) {
-      if (logger) logger.log('[instagram-modals] Dismissed notification/login modal: ' + clicked);
+      if (logger) {
+        logger.log(
+          '[instagram-modals] Handled home modal: ' +
+            clicked +
+            (clicked === 'save_login_info' ? ' (preferred for pool scrapers)' : '')
+        );
+      }
       await delay(800);
       continue;
     }
