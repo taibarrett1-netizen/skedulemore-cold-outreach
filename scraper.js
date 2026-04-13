@@ -581,7 +581,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           if (path.indexOf('http') === 0) {
             try { path = new URL(path).pathname; } catch (e) { return null; }
           }
-          var m = path.match(/^\/([^/?#]+)\/?$/);
+          // IG often uses /user/?hl=en — require first segment only, allow ?/# after it.
+          var m = path.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
           if (!m) return null;
           var u = m[1].toLowerCase();
           if (u.length < 2 || u.length > 30 || !/^[a-z0-9._]+$/.test(u)) return null;
@@ -1095,7 +1096,7 @@ async function logCommentScrapeDomDebug(page, logger, label, extra = null) {
     const usernameFromRel = [];
     document.querySelectorAll('a[href^="/"]').forEach(function (a) {
       const href = (a.getAttribute('href') || '').trim();
-      const m = href.match(/^\/([^/?#]+)\/?$/);
+      const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
       if (!m) return;
       const u = m[1].toLowerCase();
       if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u)) usernameFromRel.push(u);
@@ -1238,7 +1239,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         const anchors = document.querySelectorAll('a[href^="/"]');
         for (let i = 0; i < Math.min(anchors.length, 20); i++) {
           const href = (anchors[i].getAttribute('href') || '').trim();
-          const m = href.match(/^\/([^/?#]+)\/?$/);
+          const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
           if (!m) continue;
           const u = m[1].toLowerCase();
           if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u) && blacklist.indexOf(u) === -1) {
@@ -1329,7 +1330,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           const anchors = document.querySelectorAll('a[href^="/"]');
           for (let i = 0; i < anchors.length; i++) {
             const href = (anchors[i].getAttribute('href') || '').trim();
-            const m = href.match(/^\/([^/?#]+)\/?$/);
+            const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
             if (!m) continue;
             const u = m[1].toLowerCase();
             if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u)) out.push(u);
