@@ -867,7 +867,9 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   }
   try {
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    if (!isAdmin) {
+    // Platform pool uses a shared client_id with many cold_dm_instagram_sessions + platform rows (primary + backup).
+    // isAdminUser(clientId) is keyed by user id, not client id — do not block pool connects after the first session.
+    if (!isAdmin && !isPlatformPool) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         return res.status(400).json({
@@ -981,7 +983,8 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   try {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    if (!isAdmin) {
+    const poolConnect = isPlatformPool || pending.platformScraperPool === true;
+    if (!isAdmin && !poolConnect) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         if (pending.browser) pending.browser.close().catch(() => {});
@@ -1043,7 +1046,8 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   try {
     const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    if (!isAdmin) {
+    const poolConnectEmail = isPlatformPool || pending.platformScraperPool === true;
+    if (!isAdmin && !poolConnectEmail) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         if (pending.browser) pending.browser.close().catch(() => {});

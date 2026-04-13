@@ -27,6 +27,9 @@
  *                                    if you want session diagnostics without full comment DOM debug
  *   SCRAPER_SESSION_FULL_SCREENSHOTS=1 — with session debug: capture every session_ensure PNG (default: round 0+4 only)
  *   SCRAPER_COMMENT_HOME_SCREENSHOT=1 — with SCRAPER_DEBUG: also save home after-home-session-check PNG
+ *   SCRAPER_COMMENT_WARM_SCROLLS       — comment thread warm-up scroll rounds (default 3, max 8)
+ *   SCRAPER_COMMENT_NO_NEW_GIVEUP      — stop after this many extract rounds with zero new leads (default 3, max 8)
+ *   SCRAPER_COMMENT_MAX_SCROLL_ITERS   — cap on main comment scroll loop iterations (default 12 or 20 if max_leads>30)
  */
 require('dotenv').config();
 const os = require('os');

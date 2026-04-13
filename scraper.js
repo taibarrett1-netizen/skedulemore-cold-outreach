@@ -1098,6 +1098,111 @@ function scraperDebugEnabled() {
 }
 
 /**
+ * IG mobile comments often live in divs without inline overflow:* styles — detect scrollHeight > clientHeight.
+ * Incremental scroll so lazy-loaded nodes can attach (jumping to scrollHeight often loads nothing new).
+ */
+async function scrollInstagramCommentsViewport(page) {
+  try {
+    return await page.evaluate(() => {
+      const step = 420;
+      let moved = false;
+      const candidates = [];
+      document.querySelectorAll('div, section, main, article, ul, ol, [role="main"], [role="dialog"]').forEach((el) => {
+        if (!el || !el.offsetParent) return;
+        const sh = el.scrollHeight;
+        const ch = el.clientHeight;
+        if (sh > ch + 24) candidates.push({ el, gap: sh - ch });
+      });
+      candidates.sort((a, b) => b.gap - a.gap);
+      for (let i = 0; i < Math.min(6, candidates.length); i++) {
+        const { el } = candidates[i];
+        const sh = el.scrollHeight;
+        const ch = el.clientHeight;
+        const prev = el.scrollTop;
+        el.scrollTop = Math.min(Math.max(0, el.scrollTop + step), Math.max(0, sh - ch));
+        if (Math.abs(el.scrollTop - prev) > 2) moved = true;
+      }
+      const se = document.scrollingElement || document.documentElement;
+      if (se) {
+        const prev = se.scrollTop;
+        const maxScroll = Math.max(0, se.scrollHeight - se.clientHeight);
+        se.scrollTop = Math.min(se.scrollTop + step, maxScroll);
+        if (Math.abs(se.scrollTop - prev) > 2) moved = true;
+      }
+      const prevY = window.scrollY;
+      window.scrollBy(0, step);
+      if (Math.abs(window.scrollY - prevY) > 2) moved = true;
+      return moved;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+async function expandInstagramCommentRepliesBatch(page, maxClicks) {
+  const limit = Math.max(0, Math.min(12, maxClicks));
+  if (!limit) return 0;
+  try {
+    return await page.evaluate((lim) => {
+      const hits = [];
+      document.querySelectorAll('span, button, div[role="button"], a, [role="button"]').forEach((el) => {
+        if (!el.offsetParent) return;
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (/^view all \d+ repl/.test(t)) hits.push(el);
+      });
+      let c = 0;
+      for (const el of hits.slice(0, lim)) {
+        const clickEl =
+          el.tagName === 'A' ? el : el.closest('a') || el.closest('[role="button"]') || el.closest('button') || el;
+        try {
+          clickEl.scrollIntoView({ block: 'center', inline: 'nearest' });
+          clickEl.click();
+          c++;
+        } catch (_) {}
+      }
+      return c;
+    }, limit);
+  } catch (_) {
+    return 0;
+  }
+}
+
+async function getInstagramCommentsScrollDebug(page) {
+  try {
+    return await page.evaluate(() => {
+      let overflowish = 0;
+      let best = { gap: 0, sh: 0, ch: 0, top: 0 };
+      document.querySelectorAll('div, section, main, article, ul, [role="main"]').forEach((el) => {
+        if (!el.offsetParent) return;
+        const sh = el.scrollHeight;
+        const ch = el.clientHeight;
+        if (sh > ch + 24) {
+          overflowish++;
+          const gap = sh - ch;
+          if (gap > best.gap) best = { gap, sh, ch, top: el.scrollTop };
+        }
+      });
+      const se = document.scrollingElement || document.documentElement;
+      const docGap =
+        se && se.scrollHeight > se.clientHeight + 10 ? se.scrollHeight - se.clientHeight : 0;
+      const bestSample =
+        best.gap > 0
+          ? 'el:' + best.sh + '/' + best.ch + ' top=' + Math.round(best.top)
+          : docGap > 0
+            ? 'doc:' + se.scrollHeight + '/' + se.clientHeight + ' top=' + Math.round(se.scrollTop)
+            : 'none';
+      return {
+        overflowish,
+        bestSample,
+        anchors: document.querySelectorAll('a[href^="/"]').length,
+      };
+    });
+  } catch (_) {
+    return { overflowish: 0, bestSample: 'err', anchors: 0 };
+  }
+}
+
+/**
  * In-browser snapshot for comment-scrape debugging (href shapes, dialogs, "view all" text).
  * Helps when extract uses a[href^="/"] but IG serves full URLs or a different shell.
  */
@@ -1452,21 +1557,16 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       let anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
       if (scraperDebug) logger.log('[Scraper] After open: anchors=' + anchorCount);
 
-      for (let s = 0; s < 8; s++) {
-        await page.evaluate(function () {
-          const all = document.querySelectorAll('div, section, main, [role="main"]');
-          for (let i = 0; i < all.length; i++) {
-            const el = all[i];
-            if (el.scrollHeight > el.clientHeight && el.offsetParent) {
-              el.scrollTop = Math.min(el.scrollTop + 400, el.scrollHeight);
-            }
-          }
-          window.scrollBy(0, 300);
-        });
-        await delay(randomDelay(1500, 3000));
+      const warmScrollRounds = Math.min(
+        8,
+        Math.max(2, parseInt(process.env.SCRAPER_COMMENT_WARM_SCROLLS || '3', 10) || 3)
+      );
+      for (let s = 0; s < warmScrollRounds; s++) {
+        await scrollInstagramCommentsViewport(page);
+        await delay(randomDelay(1200, 2200));
         const prev = anchorCount;
         anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
-        if (scraperDebug) logger.log('[Scraper] Scroll ' + s + ': anchors=' + anchorCount);
+        if (scraperDebug) logger.log('[Scraper] Warm scroll ' + s + ': anchors=' + anchorCount);
         if (anchorCount > 15 && anchorCount === prev) break;
       }
 
@@ -1476,7 +1576,21 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
       let noNewCount = 0;
       let scrollCount = 0;
-      const maxScrollIters = maxLeads != null && maxLeads > 30 ? 48 : 24;
+      const noNewGiveUp = Math.min(
+        8,
+        Math.max(2, parseInt(process.env.SCRAPER_COMMENT_NO_NEW_GIVEUP || '3', 10) || 3)
+      );
+      const maxScrollIters = Math.min(
+        40,
+        Math.max(
+          6,
+          parseInt(
+            process.env.SCRAPER_COMMENT_MAX_SCROLL_ITERS ||
+              String(maxLeads != null && maxLeads > 30 ? 20 : 12),
+            10
+          ) || 12
+        )
+      );
 
       while (true) {
         if (commentsThreadUrl && !/\/p\/[^/]+\/comments\//i.test(page.url() || '')) {
@@ -1557,9 +1671,12 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           if (!scraperDebug && usernames.length > 0 && noNewCount === 1) {
             logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', new=0 (set SCRAPER_DEBUG=1 for details)');
           }
-          if (noNewCount >= 6) {
+          if (noNewCount >= noNewGiveUp) {
             if (scraperDebug && usernames.length === 0) {
-              await logCommentScrapeDomDebug(page, logger, 'giving-up-raw-0-after-6-empty-rounds', { scrollCount });
+              await logCommentScrapeDomDebug(page, logger, 'giving-up-raw-0-after-empty-rounds', {
+                scrollCount,
+                noNewGiveUp,
+              });
             }
             break;
           }
@@ -1585,37 +1702,27 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         }
         if (nudgedViewAll) await delay(randomDelay(1500, 3500));
 
-        const scrollDebug = await page.evaluate(function () {
-          const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
-          const scrollables = Array.from(document.querySelectorAll(sel));
-          const info = scrollables.slice(0, 8).map(function (s, i) {
-            return '#' + i + ':' + s.scrollHeight + '/' + s.clientHeight + ' top=' + s.scrollTop;
-          });
-          return { count: scrollables.length, items: info, anchors: document.querySelectorAll('a[href^="/"]').length };
-        });
-        if (scraperDebug) {
-          logger.log('[Scraper] Scroll: containers=' + scrollDebug.count + ' anchors=' + scrollDebug.anchors + ' ' + scrollDebug.items.join(' '));
+        if (onCommentsPath) {
+          const expanded = await expandInstagramCommentRepliesBatch(page, 5);
+          if (expanded > 0) await delay(randomDelay(900, 1800));
         }
 
-        const scrolled = await page.evaluate(function () {
-          const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
-          const scrollables = Array.from(document.querySelectorAll(sel));
-          let didScroll = false;
-          for (let i = 0; i < scrollables.length; i++) {
-            const s = scrollables[i];
-            if (!s.offsetParent) continue;
-            const sh = s.scrollHeight;
-            const ch = s.clientHeight;
-            if (sh > ch) {
-              const prev = s.scrollTop;
-              s.scrollTop = s.scrollHeight;
-              if (s.scrollTop !== prev) didScroll = true;
-            }
-          }
-          window.scrollBy(0, 400);
-          return true;
-        });
-        if (!scrolled) break;
+        const scrollDebug = await getInstagramCommentsScrollDebug(page);
+        if (scraperDebug) {
+          logger.log(
+            '[Scraper] Scroll: overflowish=' +
+              scrollDebug.overflowish +
+              ' best=' +
+              scrollDebug.bestSample +
+              ' anchors=' +
+              scrollDebug.anchors
+          );
+        }
+
+        const scrolled = await scrollInstagramCommentsViewport(page);
+        if (!scrolled && scraperDebug) {
+          logger.log('[Scraper] Comment scroll: no scrollable overflow moved (try replies expanded or UI change)');
+        }
         await delay(randomDelay(2000, 4000));
         scrollCount++;
         if (scrollCount > maxScrollIters) break;
