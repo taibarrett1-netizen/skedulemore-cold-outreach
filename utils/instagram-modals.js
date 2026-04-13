@@ -535,7 +535,7 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
 
 /**
  * After landing on instagram.com — dismiss "Turn on Notifications", "Save your
- * login", and similar home-page blocking modals.
+ * login", "Add Instagram to your Home screen" (PWA), and similar blocking modals.
  */
 async function dismissInstagramHomeModals(page, logger) {
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -545,10 +545,31 @@ async function dismissInstagramHomeModals(page, logger) {
       }
       const isNotNow = (el) => /^not now$/i.test(norm(el));
 
-      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
-      for (let d = 0; d < dialogs.length; d++) {
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+      // Top sheet is usually last in document order — dismiss it before save-login underneath.
+      for (let d = dialogs.length - 1; d >= 0; d--) {
         const root = dialogs[d];
         const txt = (root.textContent || '').toLowerCase();
+        const addToHomeSheet =
+          txt.includes('add instagram to your home screen') ||
+          (txt.includes('home screen') &&
+            txt.includes('instagram') &&
+            (txt.includes('get to instagram') || txt.includes('adding it to your home')));
+        if (addToHomeSheet) {
+          const clickables = Array.from(
+            root.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"], a')
+          );
+          const cancelHit = clickables.find((el) => {
+            if (!el.offsetParent) return false;
+            const t = norm(el);
+            return t === 'cancel' || t === 'close' || t === 'not now';
+          });
+          if (cancelHit) {
+            (cancelHit.closest('button, [role="button"], a') || cancelHit).click();
+            return 'pwa_add_to_home_cancel';
+          }
+        }
+
         const saveLogin =
           txt.includes('save your login') ||
           txt.includes('save the login info') ||
@@ -597,6 +618,25 @@ async function dismissInstagramHomeModals(page, logger) {
             btn.click();
             return 'not_now_dialog';
           }
+        }
+      }
+
+      // PWA sheet sometimes has no dialog role (or nested oddly) — last-resort Cancel.
+      const bodyPwa = ((document.body && document.body.innerText) || '').toLowerCase();
+      if (
+        bodyPwa.includes('add instagram to your home screen') ||
+        (bodyPwa.includes('get to instagram quickly') && bodyPwa.includes('home screen'))
+      ) {
+        const candidates = Array.from(
+          document.querySelectorAll('button, div[role="button"], span[role="button"], [role="button"]')
+        ).reverse();
+        for (let i = 0; i < candidates.length; i++) {
+          const el = candidates[i];
+          if (!el.offsetParent) continue;
+          const t = norm(el);
+          if (t !== 'cancel' && t !== 'close') continue;
+          (el.closest('button, [role="button"]') || el).click();
+          return 'pwa_add_to_home_cancel_fallback';
         }
       }
 

@@ -1073,6 +1073,38 @@ function getShortcodeFromPostUrl(url) {
   return m ? m[1] : null;
 }
 
+/**
+ * Puppeteer requires a valid absolute URL. DB/API often store `www.instagram.com/...` without scheme
+ * or a bare shortcode — both throw Protocol error (Page.navigate): Cannot navigate to invalid URL.
+ */
+function normalizeInstagramPostUrlForNavigation(postUrl) {
+  let s = String(postUrl ?? '')
+    .trim()
+    .replace(/\u200b/g, '');
+  if (!s) return null;
+
+  if (!/^https?:\/\//i.test(s)) {
+    if (/instagram\.com/i.test(s)) {
+      s = s.replace(/^\/+/, '');
+      s = 'https://' + s.replace(/^https?:\/\//i, '');
+    } else {
+      const code = s.replace(/^\/+|\/+$/g, '');
+      if (!/^[A-Za-z0-9_-]+$/.test(code)) return null;
+      s = 'https://www.instagram.com/p/' + code + '/';
+    }
+  }
+
+  try {
+    const u = new URL(s);
+    const h = u.hostname.toLowerCase();
+    if (h !== 'instagram.com' && !h.endsWith('.instagram.com')) return null;
+    if (!/\/p\/[A-Za-z0-9_-]+/i.test(u.pathname)) return null;
+    return u.toString();
+  } catch (_) {
+    return null;
+  }
+}
+
 /** Stable /p/{code}/comments/ URL for comment-thread scraping (hl=en when missing). */
 function buildInstagramPostCommentsUrl(postUrl) {
   const raw = String(postUrl || '').trim();
@@ -1335,8 +1367,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   const leaseOptions = options.leaseOptions || null;
   const sbMod = require('./database/supabase');
   const sb = sbMod.getSupabase();
-  if (!sb || !clientId || !jobId || !postUrls || !Array.isArray(postUrls) || postUrls.length === 0) {
+  if (!sb || !clientId || !jobId || !postUrls || !Array.isArray(postUrls)) {
     logger.error('[Scraper] Comment scrape: missing clientId, jobId, or postUrls');
+    return;
+  }
+  postUrls = postUrls.map((u) => String(u ?? '').trim().replace(/\u200b/g, '')).filter(Boolean);
+  if (postUrls.length === 0) {
+    logger.error('[Scraper] Comment scrape: post_urls is empty after trimming');
+    await failScrapeJob(jobId, 'No valid post URLs on comment scrape job (empty or whitespace).').catch(() => {});
     return;
   }
 
@@ -1442,8 +1480,19 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         break;
       }
 
-      const shortcode = getShortcodeFromPostUrl(postUrl);
-      const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
+      const normalizedUrl = normalizeInstagramPostUrlForNavigation(postUrl);
+      if (!normalizedUrl) {
+        logger.error(
+          '[Scraper] Comment scrape: invalid post URL (need https://www.instagram.com/p/CODE/ or shortcode): ' +
+            JSON.stringify(postUrl)
+        );
+        await failScrapeJob(
+          jobId,
+          'Invalid post URL for comment scrape. Use a full https://www.instagram.com/p/… link or a post shortcode.'
+        );
+        return;
+      }
+      const shortcode = getShortcodeFromPostUrl(normalizedUrl);
       const commentsListUrl = buildInstagramPostCommentsUrl(normalizedUrl);
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
