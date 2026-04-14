@@ -312,10 +312,30 @@ async function getPm2AppStatusByName(appName) {
 }
 
 /**
+ * Matches ecosystem.config.cjs `ig-dm-send` instance count. Dashboard `pm2 start` must use `-i N`
+ * (cluster mode) so each process gets NODE_APP_INSTANCE and pins to distinct campaign queues.
+ */
+function sendWorkerPm2ClusterInstances() {
+  return Math.max(
+    1,
+    parseInt(
+      process.env.SEND_WORKER_INSTANCES ||
+        String(
+          Math.max(
+            1,
+            parseInt(process.env.COLD_DM_MAX_CONCURRENT_SENDERS || process.env.COLD_DM_ACTIVE_SESSION_COUNT || '1', 10) || 1,
+          ),
+        ),
+      10,
+    ) || 1,
+  );
+}
+
+/**
  * Ensure send worker is running without bouncing an already-online process.
  * - online: no-op
  * - exists but stopped: start by name
- * - missing: start by script+name
+ * - missing: start by script+name (cluster `-i N`, same as ecosystem.config.cjs)
  */
 async function ensureSendWorkerProcess() {
   const status = await getPm2AppStatusByName(BOT_PM2_NAME);
@@ -333,7 +353,10 @@ async function ensureSendWorkerProcess() {
     }
     return { ok: false, action: 'start_existing_failed', out: `${startByName.out}\n${restartByName.out}`.trim(), err: restartByName.err || startByName.err };
   }
-  const create = await execPm2(`pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`);
+  const instances = sendWorkerPm2ClusterInstances();
+  const create = await execPm2(
+    `pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart -i ${instances}`,
+  );
   if (create.ok || /online|already\s+running|successfully/i.test(create.out)) {
     return { ok: true, action: 'create_missing', out: create.out };
   }
