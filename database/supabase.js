@@ -2873,6 +2873,28 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     throw existingErr;
   }
 
+  const { data: campaignLeadIdRows, error: campaignLeadIdsErr } = await sb
+    .from('cold_dm_campaign_leads')
+    .select('id')
+    .eq('campaign_id', campaignId);
+  if (campaignLeadIdsErr) throw campaignLeadIdsErr;
+  const validCampaignLeadIds = new Set((campaignLeadIdRows || []).map((r) => r.id).filter(Boolean));
+  const deadJobIds = [];
+  for (const j of existingJobs || []) {
+    if (!['pending', 'retry', 'running'].includes(j.status)) continue;
+    if (!j.campaign_lead_id || !validCampaignLeadIds.has(j.campaign_lead_id)) deadJobIds.push(j.id);
+  }
+  if (deadJobIds.length > 0) {
+    for (let i = 0; i < deadJobIds.length; i += 200) {
+      const batch = deadJobIds.slice(i, i + 200);
+      await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+    }
+    console.log(
+      `[syncSendJobsForCampaign] removed ${deadJobIds.length} orphan/unresolvable send job(s) for campaign ${campaignId} (null campaign_lead_id or deleted campaign_lead)`
+    );
+    existingJobs = (existingJobs || []).filter((j) => !deadJobIds.includes(j.id));
+  }
+
   const activeLeadIds = new Set();
   const staleJobIds = [];
   const staleRunningJobIds = [];
@@ -3069,7 +3091,22 @@ async function buildSendWorkFromJob(jobId) {
   const sb = getSupabase();
   if (!sb || !jobId) return null;
   const job = await getSendJob(jobId);
-  if (!job || !job.client_id || !job.campaign_id || !job.campaign_lead_id) return null;
+  if (!job) {
+    console.warn(`[buildSendWorkFromJob] send job row missing jobId=${jobId}`);
+    return { job: { id: jobId }, disposition: 'cancelled', reason: 'send_job_not_found' };
+  }
+  if (!job.client_id || !job.campaign_id || !job.campaign_lead_id) {
+    console.warn(
+      '[buildSendWorkFromJob] invalid send job row (missing client_id, campaign_id, or campaign_lead_id)',
+      JSON.stringify({
+        jobId: job.id,
+        hasClientId: !!job.client_id,
+        hasCampaignId: !!job.campaign_id,
+        hasCampaignLeadId: !!job.campaign_lead_id,
+      })
+    );
+    return { job, disposition: 'cancelled', reason: 'invalid_send_job_row' };
+  }
   const campaignSelectWithVoice =
     'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode';
   const campaignSelectLegacy =
