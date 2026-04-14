@@ -43,6 +43,7 @@ const {
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
+const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -1449,20 +1450,20 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
   // Desktop layout for all sends: mobile thread header merges back-arrow + name in innerText ("BackTai"); desktop DMs behave better for automation.
   await applyDesktopEmulation(page);
-  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await gotoInstagramDirectNew(page);
   await humanDelay();
   for (let termsRound = 0; termsRound < 3; termsRound++) {
     if (!isInstagramTermsUnblockUrl(page.url())) break;
     const handled = await handleInstagramTermsUnblock(page).catch(() => false);
     if (handled && !isInstagramTermsUnblockUrl(page.url())) {
       if (!page.url().toLowerCase().includes('/direct/')) {
-        await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        await gotoInstagramDirectNew(page);
       }
       await delay(1200);
       break;
     }
     if (isInstagramTermsUnblockUrl(page.url())) {
-      await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await gotoInstagramDirectNew(page);
       await delay(2000);
     }
   }

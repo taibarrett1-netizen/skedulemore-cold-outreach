@@ -4,6 +4,7 @@
  */
 const logger = require('./logger');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./instagram-dm-search');
+const { gotoInstagramDirectNew } = require('./goto-instagram-direct-new');
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -46,7 +47,7 @@ async function typeInstagramDmPlainTextWithKeyboard(page, msg, delayOpts) {
 }
 
 async function navigateToDmThread(page, u) {
-  await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await gotoInstagramDirectNew(page);
   await humanDelay();
 
   for (let i = 0; i < 3; i++) {
