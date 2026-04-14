@@ -3309,77 +3309,82 @@ async function upsertLead(clientId, username, source) {
 }
 
 /**
+ * Scrape-only: insert truly new (client_id, username) rows; never overwrite source, group,
+ * names, or added_at on existing leads (avoids "replacing" template/bulk leads and bad counts).
+ * If leadGroupId is set, assigns that group only when the existing row has no lead_group_id.
+ *
  * @param {string} clientId
- * @param {string[]|{ username: string, display_name?: string }[]} leadsOrUsernames - Usernames only (e.g. comment scrape) or { username, display_name } from follower scrape.
+ * @param {string[]|{ username: string }[]} leadsOrUsernames - Usernames only; display names are not persisted from scrape.
+ * @returns {Promise<number>} Number of newly inserted lead rows.
  */
 async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
-  const rows = leadsOrUsernames.map((item) => {
-    const username = typeof item === 'string' ? item : item.username;
-    const displayName = typeof item === 'string' ? null : (item.display_name || null);
-    let first_name = null;
-    let last_name = null;
-    if (displayName && typeof displayName === 'string') {
-      const trimmed = displayName.trim();
-      const firstWord = trimmed.split(/\s+/)[0] || null;
-      const spaceIdx = trimmed.indexOf(' ');
-      if (spaceIdx > 0) {
-        first_name = firstWord;
-        last_name = trimmed.slice(spaceIdx + 1).trim();
-      } else {
-        first_name = firstWord;
-      }
-    }
-    const row = {
-      client_id: clientId,
-      username: normalizeUsername(username),
-      source: source || null,
-      added_at: new Date().toISOString(),
-    };
-    if (leadGroupId) row.lead_group_id = leadGroupId;
-    if (displayName && typeof displayName === 'string') row.display_name = displayName;
-    if (first_name != null) row.first_name = first_name;
-    if (last_name != null) row.last_name = last_name;
-    return row;
-  });
-  if (rows.length === 0) return 0;
-  if (!leadGroupId) {
-    const existingByUsername = new Map();
-    const usernames = [...new Set(rows.map((r) => r.username).filter(Boolean))];
-    const chunkSize = 150;
-    for (let i = 0; i < usernames.length; i += chunkSize) {
-      const chunk = usernames.slice(i, i + chunkSize);
-      const { data: existingRows, error: existingErr } = await sb
-        .from('cold_dm_leads')
-        .select('username, display_name, first_name, last_name')
-        .eq('client_id', clientId)
-        .in('username', chunk);
-      if (existingErr) throw existingErr;
-      for (const r of existingRows || []) {
-        existingByUsername.set(normalizeUsername(r.username), r);
-      }
-    }
-    for (const row of rows) {
-      const existing = existingByUsername.get(row.username);
-      if (!existing) continue;
-      const existingDisplay = (existing.display_name || '').trim();
-      const existingFirst = (existing.first_name || '').trim();
-      const existingLast = (existing.last_name || '').trim();
-      const incomingDisplay = (row.display_name || '').trim();
-      const incomingFirst = (row.first_name || '').trim();
-      const incomingLast = (row.last_name || '').trim();
-      if (!incomingDisplay && existingDisplay) row.display_name = existingDisplay;
-      if (!incomingFirst && existingFirst) row.first_name = existingFirst;
-      if (!incomingLast && existingLast) row.last_name = existingLast;
+  const normalized = [];
+  for (const item of leadsOrUsernames || []) {
+    const u = normalizeUsername(typeof item === 'string' ? item : item.username);
+    if (u) normalized.push(u);
+  }
+  const uniqueIncoming = [...new Set(normalized)];
+  if (uniqueIncoming.length === 0) return 0;
+
+  const existingByUsername = new Map();
+  const chunkSize = 150;
+  for (let i = 0; i < uniqueIncoming.length; i += chunkSize) {
+    const chunk = uniqueIncoming.slice(i, i + chunkSize);
+    const { data: existingRows, error: existingErr } = await sb
+      .from('cold_dm_leads')
+      .select('id, username, lead_group_id')
+      .eq('client_id', clientId)
+      .in('username', chunk);
+    if (existingErr) throw existingErr;
+    for (const r of existingRows || []) {
+      existingByUsername.set(normalizeUsername(r.username), r);
     }
   }
-  const { error } = await sb.from('cold_dm_leads').upsert(rows, {
-    onConflict: 'client_id,username',
-    ignoreDuplicates: false,
-  });
-  if (error) throw error;
-  return rows.length;
+
+  const isoNow = new Date().toISOString();
+  const inserts = [];
+  const idsToAssignGroup = [];
+  for (const username of uniqueIncoming) {
+    const ex = existingByUsername.get(username);
+    if (!ex) {
+      const row = {
+        client_id: clientId,
+        username,
+        source: source || null,
+        added_at: isoNow,
+      };
+      if (leadGroupId) row.lead_group_id = leadGroupId;
+      inserts.push(row);
+    } else if (leadGroupId && (ex.lead_group_id == null || ex.lead_group_id === '')) {
+      idsToAssignGroup.push(ex.id);
+    }
+  }
+
+  let inserted = 0;
+  const insChunk = 200;
+  for (let i = 0; i < inserts.length; i += insChunk) {
+    const slice = inserts.slice(i, i + insChunk);
+    const { data: insData, error: insErr } = await sb.from('cold_dm_leads').insert(slice).select('id');
+    if (insErr) throw insErr;
+    inserted += (insData || []).length;
+  }
+
+  const assignIds = [...new Set(idsToAssignGroup)];
+  if (assignIds.length && leadGroupId) {
+    for (let i = 0; i < assignIds.length; i += insChunk) {
+      const slice = assignIds.slice(i, i + insChunk);
+      const { error: upErr } = await sb
+        .from('cold_dm_leads')
+        .update({ lead_group_id: leadGroupId })
+        .eq('client_id', clientId)
+        .in('id', slice);
+      if (upErr) throw upErr;
+    }
+  }
+
+  return inserted;
 }
 
 /**

@@ -222,6 +222,8 @@ async function main() {
   // Auto-detect concurrency from pool size and re-check periodically.
   let effectiveConcurrent = 1;
   let lastPoolCheckAt = 0;
+  /** Avoid spamming logs every POOL_RECHECK_MS when pool size is unchanged. */
+  let lastLoggedPoolSignature = null;
 
   async function refreshPoolConcurrency() {
     try {
@@ -229,11 +231,15 @@ async function main() {
       const next = MAX_CONCURRENT_CAP > 0 ? Math.min(poolCount, MAX_CONCURRENT_CAP) : poolCount;
       effectiveConcurrent = Math.max(1, next);
       lastPoolCheckAt = Date.now();
-      logger.log(
-        `[scrape-worker] pool has ${poolCount} active session(s) → ` +
-        `concurrency=${effectiveConcurrent}` +
-        (MAX_CONCURRENT_CAP > 0 ? ` (cap=${MAX_CONCURRENT_CAP})` : '')
-      );
+      const signature = `${poolCount}:${effectiveConcurrent}:${MAX_CONCURRENT_CAP}`;
+      if (signature !== lastLoggedPoolSignature) {
+        lastLoggedPoolSignature = signature;
+        logger.log(
+          `[scrape-worker] pool has ${poolCount} active session(s) → ` +
+          `concurrency=${effectiveConcurrent}` +
+          (MAX_CONCURRENT_CAP > 0 ? ` (cap=${MAX_CONCURRENT_CAP})` : '')
+        );
+      }
     } catch (e) {
       logger.error('[scrape-worker] could not count scraper pool sessions', e);
     }

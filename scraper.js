@@ -609,7 +609,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await delay(randomDelay(1000, 2000));
     }
 
-    let totalScraped = 0;
+    /** Rows newly inserted into cold_dm_leads this job (not DOM usernames seen). */
+    let newInsertsTotal = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
     // To avoid hammering one account with huge follower scrapes, insert a long cooldown
@@ -702,20 +703,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           return u;
         }
 
-        function getDisplayNameFromAnchor(anchor, username) {
-          var spans = anchor.querySelectorAll('span[dir="auto"], span');
-          var withSpace = null;
-          var fallback = null;
-          for (var i = 0; i < spans.length; i++) {
-            var txt = (spans[i].textContent || '').trim();
-            if (!txt || txt.toLowerCase() === username) continue;
-            if (txt.length > 50) continue;
-            if (txt.indexOf(' ') !== -1) withSpace = txt;
-            else if (!fallback) fallback = txt;
-          }
-          return withSpace || fallback || null;
-        }
-
         var anchors = root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]');
 
         for (var i = 0; i < anchors.length; i++) {
@@ -725,8 +712,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
           if (isInSuggestedRow(a)) continue;
 
-          var displayName = getDisplayNameFromAnchor(a, u);
-          leads.push({ username: u, display_name: displayName });
+          leads.push({ username: u });
         }
 
         if (leads.length === 0) {
@@ -739,8 +725,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             var parentLink = sp.closest('a');
             if (!parentLink) continue;
             var u = txt.toLowerCase();
-            var displayName = parentLink ? getDisplayNameFromAnchor(parentLink, u) : null;
-            leads.push({ username: u, display_name: displayName });
+            leads.push({ username: u });
           }
         }
 
@@ -776,12 +761,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         seenBatch.add(u);
         return true;
       });
-      if (effectiveMax && totalScraped + newLeads.length > effectiveMax) {
-        newLeads = newLeads.slice(0, effectiveMax - totalScraped);
+      if (effectiveMax && newInsertsTotal + newLeads.length > effectiveMax) {
+        newLeads = newLeads.slice(0, effectiveMax - newInsertsTotal);
       }
       const quotaStatus = await getScrapeQuotaStatus(clientId).catch(() => null);
       if (quotaStatus && quotaStatus.remaining <= 0) {
-        await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+        await completeScrapeJobForQuota(jobId, clientId, newInsertsTotal);
         return;
       }
       if (quotaStatus && newLeads.length > quotaStatus.remaining) {
@@ -793,35 +778,37 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       if (newLeads.length > 0) {
-        await upsertLeadsBatch(clientId, newLeads, source, leadGroupId);
-        totalScraped = seenUsernames.size;
-        await updateScrapeJob(jobId, { scraped_count: totalScraped });
+        const batchInserted = await upsertLeadsBatch(clientId, newLeads, source, leadGroupId);
+        newInsertsTotal += batchInserted;
+        await updateScrapeJob(jobId, { scraped_count: newInsertsTotal });
         noNewCount = 0;
-        logger.log(`[Scraper] Batch: +${newLeads.length} new, total ${totalScraped}`);
-        scrapedSinceCooldown += newLeads.length;
+        logger.log(
+          `[Scraper] Batch: +${batchInserted} new row(s) (${newLeads.length} passed filters), job total ${newInsertsTotal}`
+        );
+        scrapedSinceCooldown += batchInserted;
         if (!effectiveMax && COOLDOWN_CHUNK > 0 && scrapedSinceCooldown >= COOLDOWN_CHUNK) {
           const pauseMs = randomDelay(COOLDOWN_MIN_MS, COOLDOWN_MAX_MS);
           logger.log(
-            `[Scraper] Long cooldown after ${scrapedSinceCooldown} new leads (total ${totalScraped}). Pausing for ${Math.round(
+            `[Scraper] Long cooldown after ${scrapedSinceCooldown} new leads (total ${newInsertsTotal}). Pausing for ${Math.round(
               pauseMs / 60000
             )} minutes before continuing.`
           );
           scrapedSinceCooldown = 0;
           await delay(pauseMs);
         }
-        if (effectiveMax && totalScraped >= effectiveMax) {
+        if (effectiveMax && newInsertsTotal >= effectiveMax) {
           logger.log(`[Scraper] Reached limit (${effectiveMax}). Stopping.`);
           break;
         }
         const quotaAfterInsert = await getScrapeQuotaStatus(clientId).catch(() => null);
         if (quotaAfterInsert && quotaAfterInsert.remaining <= 0) {
-          await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+          await completeScrapeJobForQuota(jobId, clientId, newInsertsTotal);
           return;
         }
       } else {
         if (noNewCount >= MAX_NO_NEW) {
           logger.log(
-            `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} totalScraped=${totalScraped}`
+            `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} newInsertsTotal=${newInsertsTotal}`
           );
           break;
         }
@@ -1103,7 +1090,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
       if (noNewCount >= MAX_NO_NEW) {
         logger.log(
-          `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} totalScraped=${totalScraped}`
+          `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} newInsertsTotal=${newInsertsTotal}`
         );
         break;
       }
@@ -1111,9 +1098,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
     }
 
-    await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
+    await updateScrapeJob(jobId, { status: 'completed', scraped_count: newInsertsTotal });
     logger.log(
-      `[Scraper] Job ${jobId} completed. Scraped ${totalScraped} ${listKind === 'following' ? 'following' : 'followers'} from @${cleanTarget}`
+      `[Scraper] Job ${jobId} completed. ${newInsertsTotal} new lead row(s) (${listKind === 'following' ? 'following' : 'followers'}) from @${cleanTarget}`
     );
 
     try {
@@ -1128,8 +1115,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     } catch (e) {
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
     }
-    if (platformSessionId && totalScraped > 0) {
-      await recordScraperActions(platformSessionId, totalScraped).catch(() => {});
+    if (platformSessionId && newInsertsTotal > 0) {
+      await recordScraperActions(platformSessionId, newInsertsTotal).catch(() => {});
     }
   } catch (err) {
     logger.error(`[Scraper] ${listKind === 'following' ? 'Following' : 'Follower'} scrape failed`, err);
@@ -1821,11 +1808,18 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         for (const u of newUsernames) seenUsernames.add(u);
 
         if (newUsernames.length > 0) {
-          await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
-          leadsInsertedTotal += newUsernames.length;
+          const batchInserted = await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
+          leadsInsertedTotal += batchInserted;
           await updateScrapeJob(jobId, { scraped_count: leadsInsertedTotal });
           noNewCount = 0;
-          logger.log('[Scraper] Comments: +' + newUsernames.length + ' new leads, job total ' + leadsInsertedTotal);
+          logger.log(
+            '[Scraper] Comments: +' +
+              batchInserted +
+              ' new row(s) (' +
+              newUsernames.length +
+              ' passed filters), job total ' +
+              leadsInsertedTotal
+          );
           const quotaAfterInsert = await getScrapeQuotaStatus(clientId).catch(() => null);
           if (quotaAfterInsert && quotaAfterInsert.remaining <= 0) {
             await completeScrapeJobForQuota(jobId, clientId, leadsInsertedTotal);
