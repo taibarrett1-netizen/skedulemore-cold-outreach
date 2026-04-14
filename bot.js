@@ -3354,6 +3354,23 @@ async function sendFollowUp(body) {
   }
 }
 
+/** Chrome/Puppeteer errors where retrying the next lead will burn the queue — pause sending instead. */
+function isProxyOrNetworkInfrastructureError(message) {
+  const m = String(message || '');
+  return (
+    m.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
+    m.includes('ERR_PROXY_CONNECTION_FAILED') ||
+    m.includes('ERR_PROXY_CERTIFICATE_INVALID') ||
+    m.includes('ERR_CONNECTION_CLOSED') ||
+    m.includes('ERR_CONNECTION_RESET') ||
+    m.includes('ERR_CONNECTION_REFUSED') ||
+    m.includes('ERR_NAME_NOT_RESOLVED') ||
+    m.includes('ERR_INTERNET_DISCONNECTED') ||
+    m.includes('ERR_ADDRESS_UNREACHABLE') ||
+    m.includes('ERR_SSL_PROTOCOL_ERROR')
+  );
+}
+
 async function sendDM(page, username, adapter, options = {}) {
   const {
     messageOverride,
@@ -3530,6 +3547,14 @@ async function sendDM(page, username, adapter, options = {}) {
     }
   }
   logger.error(`Error sending to @${u} after ${MAX_SEND_RETRIES} retries`, lastError);
+  if (isProxyOrNetworkInfrastructureError(lastError?.message)) {
+    return {
+      ok: false,
+      reason: 'proxy_tunnel_failed',
+      statusMessage:
+        'Instagram unreachable (proxy/VPN tunnel or network failure). Sending paused — fix proxy and click Start.',
+    };
+  }
   await Promise.resolve(logSent('failed', null));
   if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', null, sendWorkerId).catch(() => {});
   return { ok: false, reason: lastError.message };
@@ -3693,42 +3718,84 @@ async function runBotMultiTenant() {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
   }
 
+  function isDeadTargetOrCdpError(e) {
+    const msg = (e && e.message) || String(e);
+    return (
+      /session closed/i.test(msg) ||
+      /target closed/i.test(msg) ||
+      /connection closed/i.test(msg) ||
+      /execution context was destroyed/i.test(msg) ||
+      /protocol error.*closed/i.test(msg)
+    );
+  }
+
+  async function invalidateSendWorkerBrowser(reason) {
+    if (reason) logger.warn(`[send-worker] Resetting Chrome: ${reason}`);
+    await browser?.close?.().catch(() => {});
+    browser = null;
+    page = null;
+    currentSessionId = null;
+  }
+
   async function ensureBrowserForSession(session) {
     const key = proxyKeyForSession(session);
-    const needLaunch = !browser || currentProxyKey !== key;
-    if (!needLaunch) return;
-    if (browser) {
+
+    if (browser && typeof browser.isConnected === 'function' && !browser.isConnected()) {
+      await invalidateSendWorkerBrowser('browser disconnected (Chrome exited or crashed)');
+    }
+
+    if (browser && currentProxyKey !== key) {
       await browser.close().catch(() => {});
       browser = null;
       page = null;
       currentSessionId = null;
     }
-    currentProxyKey = key;
-    const launchOpts = {
-      headless: HEADLESS,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--autoplay-policy=no-user-gesture-required',
-      ],
-    };
-    appendChromeFakeMicArgs(launchOpts.args);
-    applyPuppeteerSlowMo(launchOpts);
-    applyHeadedChromeWindowToLaunchOpts(launchOpts);
-    applyProxyToLaunchOptions(launchOpts, session.proxy_url || null);
-    if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
-    try {
-      browser = await puppeteer.launch(launchOpts);
-    } catch (e) {
-      logger.error('Browser launch failed', e);
-      throw e;
+
+    if (!browser) {
+      currentProxyKey = key;
+      const launchOpts = {
+        headless: HEADLESS,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--autoplay-policy=no-user-gesture-required',
+        ],
+      };
+      appendChromeFakeMicArgs(launchOpts.args);
+      applyPuppeteerSlowMo(launchOpts);
+      applyHeadedChromeWindowToLaunchOpts(launchOpts);
+      applyProxyToLaunchOptions(launchOpts, session.proxy_url || null);
+      if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
+      try {
+        browser = await puppeteer.launch(launchOpts);
+      } catch (e) {
+        logger.error('Browser launch failed', e);
+        throw e;
+      }
+      page = await browser.newPage();
+      await authenticatePageForProxy(page, session.proxy_url);
+      await grantMicrophoneForInstagram(page, logger);
+      if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+      else await applyMobileEmulation(page);
+      return;
     }
-    page = await browser.newPage();
-    await authenticatePageForProxy(page, session.proxy_url);
-    await grantMicrophoneForInstagram(page, logger);
-    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
-    else await applyMobileEmulation(page);
+
+    currentProxyKey = key;
+
+    if (!page || (typeof page.isClosed === 'function' && page.isClosed())) {
+      logger.warn('[send-worker] Page was missing or closed; opening a new tab on existing browser.');
+      if (page && typeof page.isClosed === 'function' && !page.isClosed()) {
+        await page.close().catch(() => {});
+      }
+      page = null;
+      currentSessionId = null;
+      page = await browser.newPage();
+      await authenticatePageForProxy(page, session.proxy_url);
+      await grantMicrophoneForInstagram(page, logger);
+      if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+      else await applyMobileEmulation(page);
+    }
   }
 
   async function ensurePageSession(session) {
@@ -3773,6 +3840,9 @@ async function runBotMultiTenant() {
         } catch {}
       }
       logger.error('Failed to switch session: ' + e.message);
+      if (isDeadTargetOrCdpError(e)) {
+        await invalidateSendWorkerBrowser('CDP/target died during session switch');
+      }
       return false;
     }
   }
@@ -4328,6 +4398,23 @@ async function runBotMultiTenant() {
           clientId,
           'Instagram logged out — reconnect your sender in Cold Outreach, then sending resumes.'
         ).catch(() => {});
+      } else if (!sendResult.ok && sendResult.reason === 'proxy_tunnel_failed') {
+        delayMs = randomDelay(15 * 60 * 1000, 30 * 60 * 1000);
+        sendJobStatus = 'retry';
+        sendJobUpdates = {
+          available_at: new Date(Date.now() + delayMs).toISOString(),
+          last_error_class: 'proxy_tunnel_failed',
+          last_error_message: sendResult.statusMessage || 'proxy_tunnel_failed',
+        };
+        logger.error(
+          `[send-worker] Proxy/network failure — pausing client ${clientId} (lead @${work.username} not marked failed).`
+        );
+        await sb.setControl(clientId, 1).catch(() => {});
+        sb.setClientStatusMessage(
+          clientId,
+          sendResult.statusMessage ||
+            'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.'
+        ).catch(() => {});
       } else {
         delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
@@ -4352,7 +4439,8 @@ async function runBotMultiTenant() {
         work?.campaignId &&
         sendJobUpdates.available_at &&
         (sendJobUpdates.last_error_class === 'daily_limit' ||
-          sendJobUpdates.last_error_class === 'hourly_limit');
+          sendJobUpdates.last_error_class === 'hourly_limit' ||
+          sendJobUpdates.last_error_class === 'proxy_tunnel_failed');
       if (limitWholeCampaignDefer) {
         await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, sendJobUpdates.available_at).catch(() => {});
         await delay(500);

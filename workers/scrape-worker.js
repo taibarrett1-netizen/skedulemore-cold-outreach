@@ -17,6 +17,8 @@
  *                                    (default: 120000 = 2 min)
  *   SCRAPE_FAILURE_COOLDOWN_SEC    — seconds to cool a session after any job
  *                                    failure (default: 300 = 5 min)
+ *   SCRAPE_SUCCESS_COOLDOWN_MIN_SEC / SCRAPE_SUCCESS_COOLDOWN_MAX_SEC — after a successful job,
+ *                                    random cooldown before this session can be leased again (default 180–300 s)
  *   SCRAPER_WORKER_POLL_MS         — idle poll when no jobs queued (default: 2000 ms)
  *   SCRAPER_SLOT_POLL_MS           — when jobs are running but a slot is still free, how often to
  *                                    retry claim + race running jobs (default: 400 ms).  Use this
@@ -48,6 +50,16 @@ const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const FAILURE_COOLDOWN_SEC = Math.max(0, parseInt(process.env.SCRAPE_FAILURE_COOLDOWN_SEC || '300', 10) || 300);
+const SUCCESS_COOLDOWN_MIN_SEC = Math.max(60, parseInt(process.env.SCRAPE_SUCCESS_COOLDOWN_MIN_SEC || '180', 10) || 180);
+const SUCCESS_COOLDOWN_MAX_SEC = Math.max(
+  SUCCESS_COOLDOWN_MIN_SEC,
+  parseInt(process.env.SCRAPE_SUCCESS_COOLDOWN_MAX_SEC || '300', 10) || 300
+);
+function randomSuccessCooldownSec() {
+  const lo = SUCCESS_COOLDOWN_MIN_SEC;
+  const hi = SUCCESS_COOLDOWN_MAX_SEC;
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
 // Rate-limit (429) gets a much longer cooldown so the session can recover.
 const RATE_LIMIT_COOLDOWN_SEC = Math.max(0, parseInt(process.env.SCRAPE_RATE_LIMIT_COOLDOWN_SEC || '3600', 10) || 3600);
 // Optional hard cap. When unset (0), concurrency is auto-derived from the pool.
@@ -198,11 +210,13 @@ async function processOneJob(workerId, job) {
         if (jobFailed) {
           cooldownSec =
             finalErrorClass === 'rate_limited_429' ? RATE_LIMIT_COOLDOWN_SEC : FAILURE_COOLDOWN_SEC;
+        } else {
+          cooldownSec = randomSuccessCooldownSec();
         }
         if (cooldownSec > 0) {
           logger.log(
             `[scrape-worker] session ${reservedPlatformId} cooldown=${cooldownSec}s` +
-            (finalErrorClass ? ` (${finalErrorClass})` : '')
+            (jobFailed && finalErrorClass ? ` (${finalErrorClass})` : jobFailed ? '' : ' (after success)')
           );
         }
         await sb.releasePlatformScraperSessionLease(reservedPlatformId, workerId, { cooldownSec }).catch(() => {});
@@ -249,7 +263,7 @@ async function main() {
   logger.log(
     `[scrape-worker] started id=${workerId} idle_poll=${SCRAPER_POLL_MS}ms ` +
     `slot_poll=${SCRAPER_SLOT_POLL_MS}ms concurrency=${effectiveConcurrent} ` +
-    `failure_cooldown=${FAILURE_COOLDOWN_SEC}s`
+    `failure_cooldown=${FAILURE_COOLDOWN_SEC}s success_cooldown=${SUCCESS_COOLDOWN_MIN_SEC}-${SUCCESS_COOLDOWN_MAX_SEC}s`
   );
 
   // activeJobs: Map<jobId, Promise<boolean>>

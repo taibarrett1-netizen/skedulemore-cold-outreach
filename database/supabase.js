@@ -1855,19 +1855,18 @@ async function describePlatformScraperPoolForLogs() {
     const okState = state === 'active';
     const okCd = !s.cooldown_until || new Date(s.cooldown_until).getTime() <= now;
     const okLease = !s.leased_until || new Date(s.leased_until).getTime() <= now;
-    const okUsage = (usage[s.id] || 0) < (s.daily_actions_limit || 500);
-    if (okState && platformSessionHasPuppeteerCookies(s) && okCd && okLease && okUsage) eligible += 1;
+    if (okState && platformSessionHasPuppeteerCookies(s) && okCd && okLease) eligible += 1;
   }
   const uniqueAccounts = groups.size;
   const overflowRows = Math.max(0, sessions.length - uniqueAccounts);
   return (
     `pool: ${sessions.length} row(s) across ${uniqueAccounts} account key(s), ${overflowRows} overflow row(s), ` +
       `${withCookies} with session_data.cookies (Puppeteer login), ${eligible} eligible for scrape ` +
-      `(active + cookies + not leased + under daily limit). ` +
+      `(active + cookies + not leased). ` +
       (withCookies === 0
         ? 'Reconnect Instagram in admin Platform scrapers so Puppeteer saves cookies.'
         : eligible === 0
-          ? 'All accounts may be leased, on cooldown, over daily limit, or not active.'
+          ? 'All accounts may be leased, on cooldown, or not active.'
           : '')
   );
 }
@@ -1929,7 +1928,7 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
         if (!platformSessionHasPuppeteerCookies(s)) return false;
         if (s.cooldown_until && new Date(s.cooldown_until).getTime() > Date.now()) return false;
         if (s.leased_until && new Date(s.leased_until).getTime() > Date.now()) return false;
-        return (usage[s.id] || 0) < (s.daily_actions_limit || 500);
+        return true;
       })
     );
 
@@ -2111,8 +2110,8 @@ async function markPlatformScraperWebNeedsRefresh(sessionId) {
 }
 
 /**
- * Prefer Postgres lease_platform_scraper_session (primary-before-backup, SKIP LOCKED).
- * Validates Puppeteer cookies + daily usage in JS (RPC does not enforce those).
+ * Prefer Postgres lease_platform_scraper_session (lowest today's usage first, SKIP LOCKED).
+ * Validates Puppeteer cookies in JS (daily caps are not enforced).
  */
 async function tryLeasePlatformScraperSessionViaRpc(workerId, leaseSec = 180) {
   const sb = getSupabase();
@@ -2126,12 +2125,6 @@ async function tryLeasePlatformScraperSessionViaRpc(workerId, leaseSec = 180) {
   const row = rows[0];
   if (!row?.id) return null;
   if (!platformSessionHasPuppeteerCookies(row)) {
-    await releasePlatformScraperSessionLease(row.id, workerId, { cooldownSec: 0 });
-    return null;
-  }
-  const usage = await getPlatformScraperUsageToday([row.id]);
-  const lim = row.daily_actions_limit || 500;
-  if ((usage[row.id] || 0) >= lim) {
     await releasePlatformScraperSessionLease(row.id, workerId, { cooldownSec: 0 });
     return null;
   }
@@ -2166,10 +2159,7 @@ async function pickScraperSessionForJob(clientId) {
   if (sessions.length === 0) return null;
   const sessionIds = sessions.map((s) => s.id);
   const usage = await getPlatformScraperUsageToday(sessionIds);
-  const candidates = sessions.filter(
-    (s) =>
-      platformSessionHasPuppeteerCookies(s) && (usage[s.id] || 0) < (s.daily_actions_limit || 500)
-  );
+  const candidates = sessions.filter((s) => platformSessionHasPuppeteerCookies(s));
   if (candidates.length === 0) return null;
   candidates.sort((a, b) => (usage[a.id] || 0) - (usage[b.id] || 0));
   const picked = candidates[0];
