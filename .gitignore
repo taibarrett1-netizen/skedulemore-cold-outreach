@@ -12,6 +12,7 @@ database/*.db-journal
 
 # Persistent browser session (cookies; don't commit)
 .browser-profile/
+.browser-profiles/
 .cold_dm_client_id
 
 # Admin Cold Outreach Lab (session + CSV output)

@@ -34,6 +34,12 @@ const {
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
+const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
+const {
+  resolveHeadlessMode,
+  baseChromeArgs,
+  assignPersistentUserDataDir,
+} = require('./utils/puppeteer-chrome-launch');
 const {
   dismissInstagramPopups,
   ensurePoolScraperInstagramWebSession,
@@ -144,7 +150,26 @@ const LOAD_WAIT_RETRIES = 3;
 const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
 const SCROLL_CHUNK_DELAY_MS = 600;
-const HEADLESS = process.env.SCRAPER_HEADLESS !== 'false';
+/** false | true | 'new' — set SCRAPER_HEADLESS=new for Chromium new headless. */
+const HEADLESS = resolveHeadlessMode(process.env.SCRAPER_HEADLESS, true);
+const SCRAPER_PERSIST_PROFILES =
+  process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES == null ||
+  String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).trim() === '' ||
+  (String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== '0' &&
+    String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== 'false');
+
+function buildScraperBrowserLaunchOptions(platformSessionId, proxyUrl) {
+  const launchOpts = {
+    headless: HEADLESS,
+    args: [...baseChromeArgs()],
+  };
+  if (SCRAPER_PERSIST_PROFILES && platformSessionId) {
+    assignPersistentUserDataDir(launchOpts, `scrape-pool-${platformSessionId}`);
+    logger.log(`[Scraper] Persistent Chrome profile: scrape-pool-${platformSessionId}`);
+  }
+  applyProxyToLaunchOptions(launchOpts, proxyUrl || null);
+  return launchOpts;
+}
 /** page.goto timeout; 30s is often too tight for IG + 2+ concurrent Chromium on a small VPS. */
 const SCRAPER_NAV_TIMEOUT_MS = Math.max(15000, parseInt(process.env.SCRAPER_NAV_TIMEOUT_MS || '60000', 10) || 60000);
 const LIST_SCRAPE_NAV_WAIT_UNTIL = (() => {
@@ -213,7 +238,7 @@ async function recoverBlankInstagramProfilePage(page, cleanTarget, logger, reaso
 async function connectScraper(instagramUsername, instagramPassword) {
   const browser = await puppeteer.launch({
     headless: HEADLESS,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: baseChromeArgs(),
   });
   try {
     const page = await browser.newPage();
@@ -283,11 +308,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for ${listKind} scrape`);
 
-    browser = await puppeteer.launch({
-      headless: HEADLESS,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
     page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url || null);
     const useMobile = process.env.SCRAPER_USE_MOBILE === '1' || process.env.SCRAPER_USE_MOBILE === 'true';
     if (useMobile) {
       await applyMobileEmulation(page);
@@ -1541,11 +1564,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for comment scrape`);
 
-    browser = await puppeteer.launch({
-      headless: HEADLESS,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-    });
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
     page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url || null);
     await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
 

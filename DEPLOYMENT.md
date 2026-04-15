@@ -111,6 +111,17 @@ Optional overrides (defaults match the PulseAudio setup above):
 
 Do **not** expose an unauthenticated VNC port to the public internet; use SSH tunnel or firewall + VNC password.
 
+### Puppeteer: persistent profiles, sticky sessions, headless
+
+- **Send worker (`runBotMultiTenant`)** now uses a **dedicated Chrome profile per `cold_dm_instagram_sessions` row** (default on): `.browser-profiles/send-<sessionId>/`. That keeps localStorage / Service Worker / IndexedDB aligned with the same IG login instead of a fresh incognito-like profile every launch. Disable with `PUPPETEER_PERSIST_SEND_PROFILES=0`.
+- **Platform scrapes** (`scraper.js`) use `.browser-profiles/scrape-pool-<platformSessionId>/` when `PUPPETEER_PERSIST_SCRAPER_PROFILES` is not `0`, and honor **`proxy_url`** on the platform session row via `--proxy-server` + `page.authenticate`.
+- **Cookie refresh:** when switching which IG account is loaded into a tab, the worker clears **Instagram-only** cookies before applying the saved cookie jar from the DB — it no longer wipes unrelated domains.
+- **Soft logout:** after navigation, the worker treats **password / challenge UI** (`detectInstagramPasswordReauthScreen`) the same as `/accounts/login` and flags the session for refresh instead of burning sends.
+- **Headless:** set `HEADLESS_MODE=new` (or `SCRAPER_HEADLESS=new`) for Chromium’s newer headless mode; use `false` + `DISPLAY` when debugging.
+- **Sticky residential IP:** keep the **exact** proxy URL (including Decodo `session-…` in the username and the correct port) on the session row; changing the string rotates the exit IP and invalidates IG’s trust.
+
+**Concurrency:** one send worker process still handles one job at a time; do **not** run two PM2 send workers against the same Instagram session without pinning (see `SEND_WORKER_PIN_CAMPAIGNS` in `bot.js`).
+
 ## 5. Get the project onto the server
 
 Repo name is **ColdDMs**; on your Mac the folder may be **Cold DMs V1**. On the server, `cd` into whatever the folder is actually called there.

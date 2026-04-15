@@ -43,6 +43,11 @@ const {
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
+const {
+  resolveHeadlessMode,
+  baseChromeArgs,
+  assignPersistentUserDataDir,
+} = require('./utils/puppeteer-chrome-launch');
 const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
 puppeteer.use(StealthPlugin());
 
@@ -50,7 +55,14 @@ const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 
 const MIN_DELAY_MS = (parseInt(process.env.MIN_DELAY_MINUTES, 10) || 5) * 60 * 1000;
 const MAX_DELAY_MS = (parseInt(process.env.MAX_DELAY_MINUTES, 10) || 30) * 60 * 1000;
 const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
-const HEADLESS = process.env.HEADLESS_MODE !== 'false';
+/** false | true | 'new' (Chromium new headless; slightly less brittle than legacy true for some sites) */
+const HEADLESS = resolveHeadlessMode(process.env.HEADLESS_MODE, true);
+/** Per-Instagram-session persistent Chrome profile under .browser-profiles/send-<sessionId> (disable with 0/false). */
+const PUPPETEER_PERSIST_SEND_PROFILES =
+  process.env.PUPPETEER_PERSIST_SEND_PROFILES == null ||
+  String(process.env.PUPPETEER_PERSIST_SEND_PROFILES).trim() === '' ||
+  (String(process.env.PUPPETEER_PERSIST_SEND_PROFILES).toLowerCase() !== '0' &&
+    String(process.env.PUPPETEER_PERSIST_SEND_PROFILES).toLowerCase() !== 'false');
 const SEND_LEASE_SECONDS = Math.max(120, parseInt(process.env.SEND_LEASE_SECONDS || '600', 10) || 600);
 const SEND_WORKER_ID = process.env.SEND_WORKER_ID || `send-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 const SEND_WORKER_VERBOSE_LOGS =
@@ -99,6 +111,20 @@ function logColdDmConcurrencyDebug(message, details = null) {
   }
 }
 
+/** Avoid wiping non-IG cookies / storage when refreshing Instagram session cookies. */
+async function clearInstagramCookiesOnlyOnPage(pg) {
+  try {
+    const existing = await pg.cookies();
+    const ig = existing.filter((c) => {
+      const d = (c.domain || '').toLowerCase();
+      return d.includes('instagram');
+    });
+    if (ig.length) await pg.deleteCookie(...ig);
+  } catch (e) {
+    logger.warn(`clearInstagramCookiesOnlyOnPage: ${e.message || e}`);
+  }
+}
+
 async function withTimeout(promise, timeoutMs, timeoutMessage) {
   const ms = Math.max(1000, Number(timeoutMs) || 1000);
   let timeoutId;
@@ -139,7 +165,8 @@ function getChromeWindowPositionArg() {
 }
 
 function applyHeadedChromeWindowToLaunchOpts(launchOpts) {
-  if (HEADLESS || !launchOpts || !Array.isArray(launchOpts.args)) return;
+  /** Only when truly headed (HEADLESS_MODE=false). `new` headless still skips window chrome args. */
+  if (HEADLESS !== false || !launchOpts || !Array.isArray(launchOpts.args)) return;
   const vp = buildDesktopViewport();
   const { padX, padY } = getDesktopWindowPadding();
   const outerW = vp.width + padX;
@@ -2971,12 +2998,7 @@ function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV, p
   ensureChromeFakeMicPlaceholder(logger, fakeMicPath);
   const opts = {
     headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--autoplay-policy=no-user-gesture-required',
-    ],
+    args: [...baseChromeArgs(), '--autoplay-policy=no-user-gesture-required'],
   };
   appendChromeFakeMicArgs(opts.args, fakeMicPath);
   applyPuppeteerSlowMo(opts);
@@ -3687,6 +3709,8 @@ async function runBotMultiTenant() {
   /** @type {string|null|undefined} undefined = never launched; '' = no proxy */
   let currentProxyKey = undefined;
   let currentSessionId = null;
+  /** Instagram session row id for which `userDataDir` was opened (send worker persistent profile). */
+  let currentProfileSessionId = null;
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
   /** Set while this worker holds an IG session lease — PM2 stop may not run `finally` before exit. */
@@ -3753,33 +3777,45 @@ async function runBotMultiTenant() {
     browser = null;
     page = null;
     currentSessionId = null;
+    currentProfileSessionId = null;
   }
 
   async function ensureBrowserForSession(session) {
     const key = proxyKeyForSession(session);
+    const igSessionId = session && session.id != null ? String(session.id) : '';
 
     if (browser && typeof browser.isConnected === 'function' && !browser.isConnected()) {
       await invalidateSendWorkerBrowser('browser disconnected (Chrome exited or crashed)');
     }
 
-    if (browser && currentProxyKey !== key) {
+    const profileChanged = igSessionId && currentProfileSessionId != null && currentProfileSessionId !== igSessionId;
+    const proxyChanged = browser && currentProxyKey !== key;
+
+    if (browser && (proxyChanged || profileChanged)) {
+      logger.log(
+        `[send-worker] Relaunching Chrome (${proxyChanged ? 'proxy' : ''}${proxyChanged && profileChanged ? ' + ' : ''}${
+          profileChanged ? 'Instagram session' : ''
+        } changed) — persistent profile is per sender session.`
+      );
       await browser.close().catch(() => {});
       browser = null;
       page = null;
       currentSessionId = null;
+      currentProfileSessionId = null;
     }
 
     if (!browser) {
       currentProxyKey = key;
       const launchOpts = {
         headless: HEADLESS,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--autoplay-policy=no-user-gesture-required',
-        ],
+        args: [...baseChromeArgs(), '--autoplay-policy=no-user-gesture-required'],
       };
+      if (PUPPETEER_PERSIST_SEND_PROFILES && igSessionId) {
+        assignPersistentUserDataDir(launchOpts, `send-${igSessionId}`);
+        logger.log(`[send-worker] Persistent Chrome profile: send-${igSessionId} (PUPPETEER_USER_DATA_ROOT / .browser-profiles)`);
+      } else if (!PUPPETEER_PERSIST_SEND_PROFILES) {
+        logger.log('[send-worker] Ephemeral Chrome profile (PUPPETEER_PERSIST_SEND_PROFILES=0)');
+      }
       appendChromeFakeMicArgs(launchOpts.args);
       applyPuppeteerSlowMo(launchOpts);
       applyHeadedChromeWindowToLaunchOpts(launchOpts);
@@ -3791,6 +3827,7 @@ async function runBotMultiTenant() {
         logger.error('Browser launch failed', e);
         throw e;
       }
+      currentProfileSessionId = igSessionId || null;
       page = await browser.newPage();
       await authenticatePageForProxy(page, session.proxy_url);
       await grantMicrophoneForInstagram(page, logger);
@@ -3825,8 +3862,7 @@ async function runBotMultiTenant() {
     if (currentSessionId === session.id) return true;
     const sessionLabel = session.instagram_username || session.id;
     try {
-      const existing = await pg.cookies();
-      if (existing.length) await pg.deleteCookie(...existing);
+      await clearInstagramCookiesOnlyOnPage(pg);
       await pg.setCookie(...cookies);
       let gotoTimedOut = false;
       try {
@@ -3838,8 +3874,12 @@ async function runBotMultiTenant() {
         );
       }
       await delay(3000);
-      if (pg.url().includes('/accounts/login')) {
-        logger.error('Instagram session expired for account ' + sessionLabel);
+      const reauth = await detectInstagramPasswordReauthScreen(pg).catch(() => false);
+      if (pg.url().includes('/accounts/login') || reauth) {
+        logger.error(
+          `Instagram session expired or security screen for account ${sessionLabel}` +
+            (reauth ? ' (password / challenge UI detected)' : ' (login URL)')
+        );
         if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         return false;
       }
@@ -3849,7 +3889,8 @@ async function runBotMultiTenant() {
       if (e && e.name === 'TimeoutError') {
         try {
           await delay(2000);
-          if (!pg.url().includes('/accounts/login')) {
+          const reauthT = await detectInstagramPasswordReauthScreen(pg).catch(() => false);
+          if (!pg.url().includes('/accounts/login') && !reauthT) {
             logger.warn(`Session switch timeout for ${sessionLabel} but page is not login; continuing.`);
             currentSessionId = session.id;
             return true;
@@ -4563,12 +4604,7 @@ async function runBot() {
   ensureChromeFakeMicPlaceholder(logger);
   const launchOpts = {
     headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--autoplay-policy=no-user-gesture-required',
-    ],
+    args: [...baseChromeArgs(), '--autoplay-policy=no-user-gesture-required'],
   };
   appendChromeFakeMicArgs(launchOpts.args);
   applyPuppeteerSlowMo(launchOpts);
@@ -4604,8 +4640,7 @@ async function runBot() {
     if (currentSessionId === session.id) return true;
     const sessionLabel = session.instagram_username || session.id;
     try {
-      const existing = await page.cookies();
-      if (existing.length) await page.deleteCookie(...existing);
+      await clearInstagramCookiesOnlyOnPage(page);
       await page.setCookie(...cookies);
       let gotoTimedOut = false;
       try {
@@ -4617,8 +4652,12 @@ async function runBot() {
         );
       }
       await delay(3000);
-      if (page.url().includes('/accounts/login')) {
-        logger.error('Instagram session expired for account ' + sessionLabel);
+      const reauthLegacy = await detectInstagramPasswordReauthScreen(page).catch(() => false);
+      if (page.url().includes('/accounts/login') || reauthLegacy) {
+        logger.error(
+          `Instagram session expired or security screen for account ${sessionLabel}` +
+            (reauthLegacy ? ' (password / challenge UI)' : '')
+        );
         if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         return false;
       }
@@ -4628,7 +4667,8 @@ async function runBot() {
       if (e && e.name === 'TimeoutError') {
         try {
           await delay(2000);
-          if (!page.url().includes('/accounts/login')) {
+          const reauthT = await detectInstagramPasswordReauthScreen(page).catch(() => false);
+          if (!page.url().includes('/accounts/login') && !reauthT) {
             logger.warn(`Session switch timeout for ${sessionLabel} but page is not login; continuing.`);
             currentSessionId = session.id;
             return true;
