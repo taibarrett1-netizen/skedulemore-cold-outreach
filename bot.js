@@ -4394,6 +4394,10 @@ async function runBotMultiTenant() {
           last_error_class: 'session_logged_out',
           last_error_message: sendResult.statusMessage || 'session_logged_out',
         };
+        logger.error(
+          `[send-worker] Instagram session logged out — pausing client ${clientId} (lead @${work.username} not marked failed).`
+        );
+        await sb.setControl(clientId, 1).catch(() => {});
         sb.setClientStatusMessage(
           clientId,
           'Instagram logged out — reconnect your sender in Cold Outreach, then sending resumes.'
