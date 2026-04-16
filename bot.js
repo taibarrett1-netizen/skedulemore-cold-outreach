@@ -1600,6 +1600,32 @@ async function passInstagramDirectNewCoigLoginGate(page, tag = 'direct_new_gate'
     }
   }
 
+  async function screenshotPasswordReauthGate() {
+    let pwShot = null;
+    try {
+      fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+      pwShot = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_password_reauth_modal_${safeTag}.png`);
+      await page.screenshot({ path: pwShot, fullPage: true });
+      logger.warn(`[ig-direct-gate] password re-login modal (after Continue) screenshot=${pwShot}`);
+    } catch (_) {}
+    return pwShot;
+  }
+
+  if (clicked) {
+    await delay(1600);
+    if (await detectInstagramPasswordReauthScreen(page)) {
+      const pwShot = await screenshotPasswordReauthGate();
+      return {
+        ok: false,
+        skipped: false,
+        url: page.url(),
+        beforePath,
+        afterPath: pwShot,
+        error: 'instagram_password_reauth_required',
+      };
+    }
+  }
+
   if (!clicked) {
     logger.warn('[ig-direct-gate] Continue button not found or click failed');
     try {
@@ -1615,6 +1641,17 @@ async function passInstagramDirectNewCoigLoginGate(page, tag = 'direct_new_gate'
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     await delay(400);
+    if (await detectInstagramPasswordReauthScreen(page)) {
+      const pwShot = await screenshotPasswordReauthGate();
+      return {
+        ok: false,
+        skipped: false,
+        url: page.url(),
+        beforePath,
+        afterPath: pwShot,
+        error: 'instagram_password_reauth_required',
+      };
+    }
     const low = (page.url() || '').toLowerCase();
     if (!low.includes('/accounts/login')) {
       await delay(1200);
@@ -1650,6 +1687,12 @@ async function gotoInstagramDirectNewMaybePassCoigLoginGate(page, tag, opts = {}
       '[ig-direct-gate] failed ' +
         JSON.stringify({ error: gate.error, url: gate.url, beforePath: gate.beforePath, afterPath: gate.afterPath })
     );
+    if (gate.error === 'instagram_password_reauth_required') {
+      const e = new Error('instagram_password_reauth_required');
+      e.code = 'INSTAGRAM_PASSWORD_REAUTH';
+      e.gateDetails = gate;
+      throw e;
+    }
     const err =
       gate.error === 'continue_not_found'
         ? `Instagram login gate before DMs: Continue not found (${gate.url}). before_screenshot=${gate.beforePath || 'n/a'}`
@@ -3159,6 +3202,16 @@ async function previewDmLeadNamesFromSession(body) {
     }
     return { ok: false, error: 'Unexpected send path (preview only)' };
   } catch (e) {
+    if (e && e.code === 'INSTAGRAM_PASSWORD_REAUTH' && clientId && instagramSessionId) {
+      await sb.handleInstagramPasswordReauthDisruption(clientId, instagramSessionId).catch(() => {});
+      return {
+        ok: false,
+        error: 'instagram_password_reauth_required',
+        message:
+          'Instagram asked for your password again. Open Settings → Integrations (VPS Instagram) and tap Reconnect.',
+        gateDetails: e.gateDetails || undefined,
+      };
+    }
     logger.warn(`[preview-dm-names] ${e && e.message ? e.message : String(e)}`);
     let screenshotPath = null;
     try {
@@ -3766,6 +3819,26 @@ async function sendDM(page, username, adapter, options = {}) {
       }
       lastError = new Error(result.reason);
     } catch (err) {
+      if (
+        err &&
+        err.code === 'INSTAGRAM_PASSWORD_REAUTH' &&
+        options.clientId &&
+        instagramSessionId
+      ) {
+        await sb.handleInstagramPasswordReauthDisruption(options.clientId, instagramSessionId).catch(() => {});
+        await Promise.resolve(logSent('failed', null, 'instagram_password_reauth'));
+        if (campaignLeadId) {
+          await sb
+            .updateCampaignLeadStatus(campaignLeadId, 'failed', 'instagram_password_reauth', sendWorkerId)
+            .catch(() => {});
+        }
+        return {
+          ok: false,
+          reason: 'session_logged_out',
+          statusMessage:
+            'Instagram asked for your password again. Campaigns using this sender are paused. Open Settings → Integrations (VPS Instagram) and tap Reconnect.',
+        };
+      }
       lastError = err;
       logger.warn(`Attempt ${attempt}/${MAX_SEND_RETRIES} for @${u} failed: ${err.message}`);
       if (attempt < MAX_SEND_RETRIES) await delay(2000 + Math.floor(Math.random() * 3000));

@@ -2147,6 +2147,49 @@ async function markInstagramSessionWebNeedsRefresh(sessionId) {
     .eq('id', sessionId);
 }
 
+/**
+ * Pause active campaigns that use this Instagram session (junction cold_dm_campaign_instagram_sessions).
+ */
+async function pauseActiveCampaignsForInstagramSession(clientId, instagramSessionId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !instagramSessionId) return { ok: false, paused: 0 };
+  const { data: rows, error } = await sb
+    .from('cold_dm_campaign_instagram_sessions')
+    .select('campaign_id')
+    .eq('instagram_session_id', instagramSessionId);
+  if (error) {
+    console.error('[pauseActiveCampaignsForInstagramSession] select', error.message);
+    return { ok: false, paused: 0 };
+  }
+  const campaignIds = [...new Set((rows || []).map((r) => r.campaign_id).filter(Boolean))];
+  if (campaignIds.length === 0) return { ok: true, paused: 0 };
+  const { data: updatedRows, error: upErr } = await sb
+    .from('cold_dm_campaigns')
+    .update({ status: 'paused', updated_at: new Date().toISOString() })
+    .eq('client_id', clientId)
+    .eq('status', 'active')
+    .in('id', campaignIds)
+    .select('id');
+  if (upErr) {
+    console.error('[pauseActiveCampaignsForInstagramSession] update', upErr.message);
+    return { ok: false, paused: 0 };
+  }
+  return { ok: true, paused: (updatedRows || []).length };
+}
+
+/** After Instagram shows password re-login (post-Continue), flag session, pause affected campaigns, surface status. */
+async function handleInstagramPasswordReauthDisruption(clientId, instagramSessionId) {
+  if (!clientId || !instagramSessionId) return;
+  await markInstagramSessionWebNeedsRefresh(instagramSessionId).catch(() => {});
+  const r = await pauseActiveCampaignsForInstagramSession(clientId, instagramSessionId).catch(() => ({
+    paused: 0,
+  }));
+  const msg =
+    'Automation session needs reconnect — Instagram asked for your password again. Open Settings → Integrations (VPS Instagram) and tap Reconnect.' +
+    (r && r.paused ? ` Paused ${r.paused} active campaign(s) tied to this account.` : '');
+  await setClientStatusMessage(clientId, msg).catch(() => {});
+}
+
 async function markPlatformScraperWebNeedsRefresh(sessionId) {
   const sb = getSupabase();
   if (!sb || !sessionId) return;
@@ -4359,6 +4402,8 @@ module.exports = {
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
   markInstagramSessionWebNeedsRefresh,
+  pauseActiveCampaignsForInstagramSession,
+  handleInstagramPasswordReauthDisruption,
   markPlatformScraperWebNeedsRefresh,
   reportPlatformScraperScrapeFailure,
   recordScraperActions,
