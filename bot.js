@@ -1500,28 +1500,153 @@ async function runComposeDiagnostic(page, usernameForPane = null) {
   }, needleArg);
 }
 
+/** Instagram redirects /direct/new → /accounts/login?next=…/direct… (__coig_login) for cookie resume. */
+function isInstagramCoigLoginOrDirectGateUrl(pageUrl) {
+  if (!pageUrl || typeof pageUrl !== 'string') return false;
+  const u = pageUrl.toLowerCase();
+  if (!u.includes('/accounts/login')) return false;
+  try {
+    const parsed = new URL(pageUrl);
+    const next = (parsed.searchParams.get('next') || '').toLowerCase();
+    if (next.includes('/direct/')) return true;
+  } catch {}
+  if (u.includes('__coig_login') || u.includes('%2fdirect%2f')) return true;
+  return false;
+}
+
+/**
+ * Screenshot → click Continue → wait off /accounts/login → screenshot.
+ * Always writes PNGs under logs/login-debug (not gated on LOGIN_DEBUG_SCREENSHOTS).
+ */
+async function passInstagramDirectNewCoigLoginGate(page, tag = 'direct_new_gate') {
+  if (!page) return { ok: true, skipped: true, reason: 'no_page' };
+  const url0 = page.url();
+  if (!isInstagramCoigLoginOrDirectGateUrl(url0)) {
+    return { ok: true, skipped: true, url: url0 };
+  }
+  let beforePath = null;
+  let afterPath = null;
+  const safeTag = String(tag || 'gate').replace(/[^a-z0-9_-]/gi, '_').slice(0, 48);
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    beforePath = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_before_continue_${safeTag}.png`);
+    await page.screenshot({ path: beforePath, fullPage: true });
+    logger.log(`[ig-direct-gate] before-Continue screenshot=${beforePath} url=${url0}`);
+  } catch (e) {
+    logger.warn('[ig-direct-gate] before-Continue screenshot failed: ' + (e.message || e));
+  }
+
+  const clicked = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        try {
+          return !!el && el.offsetParent !== null;
+        } catch {
+          return false;
+        }
+      };
+      const textOf = (el) => ((el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
+      const ctas = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
+      const pick = ctas.find((el) => {
+        const t = textOf(el);
+        if (t === 'continue') return true;
+        if (t.includes('continue') && !t.includes('agree')) return true;
+        return false;
+      });
+      if (!pick) return false;
+      const btn = pick.closest('button') || pick.closest('[role="button"]') || pick;
+      try {
+        btn.scrollIntoView({ block: 'center' });
+      } catch {}
+      try {
+        btn.click();
+        return true;
+      } catch {
+        return false;
+      }
+    })
+    .catch(() => false);
+
+  if (!clicked) {
+    logger.warn('[ig-direct-gate] Continue button not found or click failed');
+    try {
+      fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+      const p = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_continue_not_found_${safeTag}.png`);
+      await page.screenshot({ path: p, fullPage: true });
+      logger.log(`[ig-direct-gate] continue-not-found screenshot=${p}`);
+    } catch (_) {}
+    return { ok: false, skipped: false, url: page.url(), beforePath, afterPath: null, error: 'continue_not_found' };
+  }
+
+  logger.log('[ig-direct-gate] clicked Continue; waiting to leave /accounts/login...');
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    await delay(400);
+    const low = (page.url() || '').toLowerCase();
+    if (!low.includes('/accounts/login')) {
+      await delay(1200);
+      try {
+        fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+        afterPath = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_after_continue_${safeTag}.png`);
+        await page.screenshot({ path: afterPath, fullPage: true });
+        logger.log(`[ig-direct-gate] after-Continue screenshot=${afterPath} url=${page.url()}`);
+      } catch (e) {
+        logger.warn('[ig-direct-gate] after-Continue screenshot failed: ' + (e.message || e));
+      }
+      return { ok: true, skipped: false, url: page.url(), beforePath, afterPath };
+    }
+  }
+
+  const finalUrl = page.url();
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    afterPath = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_after_continue_timeout_${safeTag}.png`);
+    await page.screenshot({ path: afterPath, fullPage: true });
+    logger.warn(`[ig-direct-gate] still on /accounts/login after Continue (timeout); screenshot=${afterPath} url=${finalUrl}`);
+  } catch (_) {}
+  return { ok: false, skipped: false, url: finalUrl, beforePath, afterPath, error: 'still_on_login_after_continue' };
+}
+
+async function gotoInstagramDirectNewMaybePassCoigLoginGate(page, tag, opts = {}) {
+  await gotoInstagramDirectNew(page);
+  if (opts.settleMs != null) await delay(Number(opts.settleMs));
+  else await humanDelay();
+  const gate = await passInstagramDirectNewCoigLoginGate(page, tag);
+  if (!gate.ok) {
+    logger.error(
+      '[ig-direct-gate] failed ' +
+        JSON.stringify({ error: gate.error, url: gate.url, beforePath: gate.beforePath, afterPath: gate.afterPath })
+    );
+    const err =
+      gate.error === 'continue_not_found'
+        ? `Instagram login gate before DMs: Continue not found (${gate.url}). before_screenshot=${gate.beforePath || 'n/a'}`
+        : `Instagram login gate before DMs: still on login after Continue (${gate.url}). after_screenshot=${gate.afterPath || 'n/a'}`;
+    throw new Error(err);
+  }
+  return gate;
+}
+
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
   const voiceCfg = buildVoiceSendConfig(sendOpts);
   if (wantsVoiceNotes(voiceCfg) && !isFfmpegAvailable()) {
     return { ok: false, reason: 'ffmpeg_missing', pageSnippet: 'Install ffmpeg on the VPS: sudo apt install ffmpeg' };
   }
+  const coigTag = `send_${normalizeUsername(u)}`;
   // Desktop layout for all sends: mobile thread header merges back-arrow + name in innerText ("BackTai"); desktop DMs behave better for automation.
   await applyDesktopEmulation(page);
-  await gotoInstagramDirectNew(page);
-  await humanDelay();
+  await gotoInstagramDirectNewMaybePassCoigLoginGate(page, coigTag);
   for (let termsRound = 0; termsRound < 3; termsRound++) {
     if (!isInstagramTermsUnblockUrl(page.url())) break;
     const handled = await handleInstagramTermsUnblock(page).catch(() => false);
     if (handled && !isInstagramTermsUnblockUrl(page.url())) {
       if (!page.url().toLowerCase().includes('/direct/')) {
-        await gotoInstagramDirectNew(page);
+        await gotoInstagramDirectNewMaybePassCoigLoginGate(page, coigTag, { settleMs: 1200 });
       }
       await delay(1200);
       break;
     }
     if (isInstagramTermsUnblockUrl(page.url())) {
-      await gotoInstagramDirectNew(page);
-      await delay(2000);
+      await gotoInstagramDirectNewMaybePassCoigLoginGate(page, coigTag, { settleMs: 2000 });
     }
   }
 
