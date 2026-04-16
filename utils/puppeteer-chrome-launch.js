@@ -178,6 +178,15 @@ function isChromeProfileSingletonLockError(err) {
   );
 }
 
+/**
+ * SingletonLock names another machine. Headless Chromium will not auto-unlink that (no GUI unlock);
+ * deleting lock files is unreliable if the profile was copied from NFS or another droplet.
+ */
+function isChromeSingletonForeignHostError(err) {
+  const msg = String((err && err.message) || err || '');
+  return /another computer|on another computer/i.test(msg);
+}
+
 const SINGLETON_NAMES = new Set(['SingletonLock', 'SingletonSocket', 'SingletonCookie']);
 
 function listProfileSubdirsForSingleton(profileDir) {
@@ -207,7 +216,7 @@ function unlinkSingletonArtifactsUnderProfile(profileDir) {
  * Kill Linux Chromium/Chrome processes whose argv references this user-data-dir (stray after PM2 restart).
  * Child GPU/renderer processes often omit --user-data-dir; killing the browser parent is enough when we match it.
  */
-function killLinuxChromiumProcessesUsingProfileDir(profileDir, log) {
+function killLinuxChromiumProcessesUsingProfileDir(profileDir, log, signal = 'SIGTERM') {
   if (process.platform !== 'linux') return;
   const resolved = path.resolve(profileDir);
   let entries;
@@ -253,8 +262,10 @@ function killLinuxChromiumProcessesUsingProfileDir(profileDir, log) {
       /[\\/]\.cache[\\/]puppeteer[\\/].+[\\/]chrome$/i.test(exe);
     if (!looksLikeChrome) continue;
     try {
-      process.kill(pid, 'SIGTERM');
-      if (log) log(`[send-worker] Sent SIGTERM to Chromium pid ${pidStr} holding ${path.basename(profileDir)}`);
+      process.kill(pid, signal);
+      if (log && signal === 'SIGTERM') {
+        log(`[send-worker] Sent SIGTERM to Chromium pid ${pidStr} holding ${path.basename(profileDir)}`);
+      }
     } catch (_) {}
   }
 }
@@ -272,17 +283,58 @@ function tryRecoverStaleChromeProfileLocks(profileDir, log) {
   }
   if (log) log(`[send-worker] Recovering stale Chromium profile locks for ${path.basename(profileDir)}…`);
   if (process.platform === 'linux') {
-    killLinuxChromiumProcessesUsingProfileDir(profileDir, log);
+    killLinuxChromiumProcessesUsingProfileDir(profileDir, log, 'SIGTERM');
     try {
       spawnSync('fuser', ['-TERM', profileDir], { stdio: 'ignore', timeout: 8000 });
     } catch (_) {
       /* fuser missing or no PIDs */
     }
+    killLinuxChromiumProcessesUsingProfileDir(profileDir, log, 'SIGKILL');
     try {
       spawnSync('fuser', ['-k', '-9', profileDir], { stdio: 'ignore', timeout: 8000 });
     } catch (_) {}
   }
   unlinkSingletonArtifactsUnderProfile(profileDir);
+}
+
+/**
+ * Rename send-* profile away and recreate an empty dir at the same path. Safe for send worker: Instagram
+ * state is re-applied from Supabase (cookies + web storage).
+ * @returns {boolean}
+ */
+function quarantineChromePersistentSendProfileDir(profileDir, log) {
+  if (!profileDir || typeof profileDir !== 'string') return false;
+  if (!isPathUnderBrowserProfilesRoot(profileDir)) {
+    if (log) log('[send-worker] skip profile quarantine: path not under browser profiles root');
+    return false;
+  }
+  const resolved = path.resolve(profileDir);
+  const base = path.basename(resolved);
+  if (!/^send-[a-zA-Z0-9._-]+$/.test(base)) {
+    if (log) log('[send-worker] skip profile quarantine: not a send-* profile directory');
+    return false;
+  }
+  const parent = path.dirname(resolved);
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const suffix = Math.random().toString(36).slice(2, 8);
+  const dest = path.join(parent, `${base}.stale-singleton-${stamp}-${suffix}`);
+  try {
+    if (!fs.existsSync(resolved)) {
+      fs.mkdirSync(resolved, { recursive: true });
+      return true;
+    }
+    fs.renameSync(resolved, dest);
+    fs.mkdirSync(resolved, { recursive: true });
+    if (log) {
+      log(
+        `[send-worker] Quarantined Chromium profile → ${path.basename(dest)}; empty ${base} (session reloads from DB).`
+      );
+    }
+    return true;
+  } catch (err) {
+    if (log) log(`[send-worker] Profile quarantine failed: ${err && err.message ? err.message : err}`);
+    return false;
+  }
 }
 
 module.exports = {
@@ -294,5 +346,7 @@ module.exports = {
   acquireChromeUserDataDirLock,
   isPathUnderBrowserProfilesRoot,
   isChromeProfileSingletonLockError,
+  isChromeSingletonForeignHostError,
   tryRecoverStaleChromeProfileLocks,
+  quarantineChromePersistentSendProfileDir,
 };

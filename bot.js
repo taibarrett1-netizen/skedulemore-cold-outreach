@@ -49,7 +49,9 @@ const {
   assignPersistentUserDataDir,
   acquireChromeUserDataDirLock,
   isChromeProfileSingletonLockError,
+  isChromeSingletonForeignHostError,
   tryRecoverStaleChromeProfileLocks,
+  quarantineChromePersistentSendProfileDir,
 } = require('./utils/puppeteer-chrome-launch');
 const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
 const {
@@ -4124,8 +4126,47 @@ async function runBotMultiTenant() {
               } catch {}
               chromeProfileDirLock = null;
             }
-            logger.error('Browser launch failed (after singleton recovery)', e2);
-            throw e2;
+            const msg2 = String((e2 && e2.message) || e2 || '');
+            if (!(profileDir && isChromeProfileSingletonLockError(e2))) {
+              logger.error('Browser launch failed (after singleton recovery)', e2);
+              throw e2;
+            }
+            if (isChromeSingletonForeignHostError(e2)) {
+              logger.warn(
+                '[send-worker] Singleton lock references another hostname (cloned disk, old droplet, or NFS). Headless Chrome will not clear that; quarantining profile.'
+              );
+            } else {
+              logger.warn(
+                '[send-worker] Singleton still failing after kill/unlink; quarantining send profile once and retrying.'
+              );
+            }
+            tryRecoverStaleChromeProfileLocks(profileDir, (m) => logger.warn(m));
+            await delay(1500);
+            if (!quarantineChromePersistentSendProfileDir(profileDir, (m) => logger.warn(m))) {
+              logger.error('Browser launch failed (after singleton recovery)', e2);
+              throw e2;
+            }
+            try {
+              chromeProfileDirLock = await acquireChromeUserDataDirLock(profileDir, {
+                log: (msg) => logger.warn(`[send-worker] ${msg}`),
+              });
+            } catch (lockErr) {
+              logger.error('Chrome profile lock failed (after quarantine)', lockErr);
+              throw lockErr;
+            }
+            try {
+              browser = await puppeteer.launch(launchOpts);
+              logger.warn('[send-worker] Chrome launched after profile quarantine (fresh userDataDir)');
+            } catch (e3) {
+              if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
+                try {
+                  chromeProfileDirLock.release();
+                } catch {}
+                chromeProfileDirLock = null;
+              }
+              logger.error('Browser launch failed (after profile quarantine)', e3);
+              throw e3;
+            }
           }
         } else {
           if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
