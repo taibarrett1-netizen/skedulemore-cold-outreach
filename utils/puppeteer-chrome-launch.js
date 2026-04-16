@@ -4,6 +4,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const DEFAULT_PROFILES_ROOT = path.join(process.cwd(), '.browser-profiles');
 
@@ -160,6 +161,57 @@ async function acquireChromeUserDataDirLock(profileDir, opts = {}) {
   );
 }
 
+/** True if `dir` is inside our managed .browser-profiles tree (never touch arbitrary paths). */
+function isPathUnderBrowserProfilesRoot(absDir) {
+  if (!absDir || typeof absDir !== 'string') return false;
+  const root = path.resolve(getBrowserProfilesRoot());
+  const d = path.resolve(absDir);
+  return d === root || d.startsWith(root + path.sep);
+}
+
+/** Puppeteer/Chromium failed because the profile singleton is held (stale process after PM2 restart/OOM). */
+function isChromeProfileSingletonLockError(err) {
+  const msg = String((err && err.message) || err || '');
+  return (
+    /profile appears to be in use|process_singleton|another Chromium process|SingletonLock/i.test(msg) ||
+    (/Failed to launch the browser process/i.test(msg) && /Code:\s*21/i.test(msg))
+  );
+}
+
+/**
+ * After PM2 restart or OOM, orphan Chromium can leave SingletonLock/Socket. Kill processes using the
+ * profile dir (Linux fuser) and remove stale lock files, then relaunch can succeed.
+ * @param {(msg: string) => void} [log]
+ */
+function tryRecoverStaleChromeProfileLocks(profileDir, log) {
+  if (!profileDir || typeof profileDir !== 'string') return;
+  if (!isPathUnderBrowserProfilesRoot(profileDir)) {
+    if (log) log('[send-worker] skip Chrome singleton recovery: path not under browser profiles root');
+    return;
+  }
+  if (log) log(`[send-worker] Recovering stale Chromium profile locks for ${path.basename(profileDir)}…`);
+  if (process.platform === 'linux') {
+    try {
+      spawnSync('fuser', ['-TERM', profileDir], { stdio: 'ignore', timeout: 8000 });
+    } catch (_) {
+      /* fuser missing or no PIDs — continue to unlink */
+    }
+  }
+  const candidates = [
+    path.join(profileDir, 'SingletonLock'),
+    path.join(profileDir, 'SingletonSocket'),
+    path.join(profileDir, 'SingletonCookie'),
+    path.join(profileDir, 'Default', 'SingletonLock'),
+    path.join(profileDir, 'Default', 'SingletonSocket'),
+    path.join(profileDir, 'Default', 'SingletonCookie'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) fs.unlinkSync(p);
+    } catch (_) {}
+  }
+}
+
 module.exports = {
   getBrowserProfilesRoot,
   ensureProfilesRoot,
@@ -167,4 +219,7 @@ module.exports = {
   baseChromeArgs,
   assignPersistentUserDataDir,
   acquireChromeUserDataDirLock,
+  isPathUnderBrowserProfilesRoot,
+  isChromeProfileSingletonLockError,
+  tryRecoverStaleChromeProfileLocks,
 };

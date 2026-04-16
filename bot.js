@@ -48,6 +48,8 @@ const {
   baseChromeArgs,
   assignPersistentUserDataDir,
   acquireChromeUserDataDirLock,
+  isChromeProfileSingletonLockError,
+  tryRecoverStaleChromeProfileLocks,
 } = require('./utils/puppeteer-chrome-launch');
 const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
 const {
@@ -4110,8 +4112,37 @@ async function runBotMultiTenant() {
           } catch {}
           chromeProfileDirLock = null;
         }
-        logger.error('Browser launch failed', e);
-        throw e;
+        const profileDir = launchOpts.userDataDir;
+        if (profileDir && isChromeProfileSingletonLockError(e)) {
+          logger.warn(
+            '[send-worker] Chromium profile singleton locked (often orphan Chrome after PM2 restart). Cleaning and retrying launch once…'
+          );
+          tryRecoverStaleChromeProfileLocks(profileDir, (m) => logger.warn(m));
+          await delay(2000);
+          try {
+            chromeProfileDirLock = await acquireChromeUserDataDirLock(profileDir, {
+              log: (msg) => logger.warn(`[send-worker] ${msg}`),
+            });
+          } catch (lockErr) {
+            logger.error('Chrome profile lock failed (after singleton recovery)', lockErr);
+            throw lockErr;
+          }
+          try {
+            browser = await puppeteer.launch(launchOpts);
+          } catch (e2) {
+            if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
+              try {
+                chromeProfileDirLock.release();
+              } catch {}
+              chromeProfileDirLock = null;
+            }
+            logger.error('Browser launch failed (after singleton recovery)', e2);
+            throw e2;
+          }
+        } else {
+          logger.error('Browser launch failed', e);
+          throw e;
+        }
       }
       currentProfileSessionId = igSessionId || null;
       page = await browser.newPage();
