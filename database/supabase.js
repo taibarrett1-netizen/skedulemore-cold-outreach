@@ -438,6 +438,57 @@ function formatOutsideScheduleResumeMessage(timezone, nextStartDate, availableAt
   return `Outside sending schedule — resumes at ${fallback || 'next window'} UTC.`;
 }
 
+/**
+ * Explains cold_dm_send_jobs.available_at when it is in the future (queue_wait).
+ * Same instant in UTC often looks like "evening" UTC while it is midnight in Europe/Berlin (CEST).
+ * `jobMeta` comes from the earliest row: that stamp may be from an earlier defer (not "today's cap" right now).
+ */
+function formatQueueWaitDeferMessage(availableAtIso, clientTimezone, jobMeta = null) {
+  const resumeAt = availableAtIso ? new Date(availableAtIso) : null;
+  if (!resumeAt || Number.isNaN(resumeAt.getTime())) {
+    return 'Queued send jobs are deferred (invalid available_at).';
+  }
+  const cls = String(jobMeta?.lastErrorClass || '').trim();
+  const clsHint =
+    cls === 'hourly_limit'
+      ? 'Oldest job: hourly_limit — client hourly cap counts all campaigns (rolling last 60 minutes of sends).'
+      : cls === 'daily_limit'
+        ? 'Oldest job: daily_limit — wait was stamped when the cap was hit; it can still sit in the future after the calendar day rolls over.'
+      : cls === 'outside_schedule'
+        ? 'Oldest job: outside_schedule — wait matches send-window defer, not random UTC.'
+        : cls === 'session_load_timeout' || cls === 'session_load_failed'
+          ? `Oldest job: ${cls} — browser/session hold; other workers may have deferred the queue.`
+          : cls
+            ? `Oldest job last marked: ${cls}.`
+            : 'Oldest job has no last_error_class (older row) — often send spacing cooldown.';
+
+  const tz = normalizeTimezoneInput(clientTimezone);
+  const utcShort = `${resumeAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  if (!tz) {
+    return (
+      `Queued send jobs are deferred until ${utcShort}. ${clsHint} ` +
+      'Set Cold DM timezone in Settings for local time. This is not the same rule as campaign send hours.'
+    );
+  }
+  try {
+    const localPart = resumeAt.toLocaleString('en-US', {
+      timeZone: tz,
+      weekday: 'short',
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
+    return (
+      `Queued send jobs are deferred until ${localPart} (${tz}) — ${utcShort}. ${clsHint} ` +
+      'Not the same rule as campaign send hours.'
+    );
+  } catch (_) {
+    return `Queued send jobs are deferred until ${utcShort}. ${clsHint}`;
+  }
+}
+
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
@@ -1685,7 +1736,7 @@ async function getClientNoWorkResumeAt(clientId) {
   const nowMs = Date.now();
   const { data: earliestQueuedJob } = await sb
     .from('cold_dm_send_jobs')
-    .select('available_at, status')
+    .select('available_at, status, last_error_class, last_error_message')
     .eq('client_id', clientId)
     .in('status', ['pending', 'retry'])
     .order('available_at', { ascending: true })
@@ -1695,8 +1746,12 @@ async function getClientNoWorkResumeAt(clientId) {
   const earliestQueuedAtMs = earliestQueuedAtRaw ? Date.parse(earliestQueuedAtRaw) : NaN;
   if (Number.isFinite(earliestQueuedAtMs) && earliestQueuedAtMs > nowMs + 1000) {
     const resumeAt = new Date(earliestQueuedAtMs);
+    const jobMeta = {
+      lastErrorClass: earliestQueuedJob?.last_error_class || '',
+      lastErrorMessage: earliestQueuedJob?.last_error_message || '',
+    };
     return {
-      message: `Queued send jobs are deferred until ${resumeAt.toISOString().slice(0, 16)} UTC.`,
+      message: formatQueueWaitDeferMessage(earliestQueuedAtRaw, settings?.timezone ?? null, jobMeta),
       reason: 'queue_wait',
       resumeAt,
     };
