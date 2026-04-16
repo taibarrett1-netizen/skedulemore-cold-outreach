@@ -33,6 +33,7 @@ const {
   markPlatformScraperWebNeedsRefresh,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
+const { applyInstagramWebStorageFromSessionData } = require('./utils/instagram-web-storage');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
 const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
 const {
@@ -324,6 +325,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       waitUntil: LIST_SCRAPE_NAV_WAIT_UNTIL,
       timeout: SCRAPER_NAV_TIMEOUT_MS,
     });
+    await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
     if (await poolScraperPageLooksLoggedOut(page)) {
@@ -1574,6 +1576,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     const scraperDebug = scraperDebugEnabled();
 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
+    await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
     const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);

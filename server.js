@@ -56,6 +56,7 @@ const {
 const { connectScraper } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 const logger = require('./utils/logger');
+const { mergeInstagramSessionData } = require('./utils/instagram-web-storage');
 
 const app = express();
 const PORT = process.env.DASHBOARD_PORT || 3000;
@@ -949,13 +950,13 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     // Connect succeeded without requiring a challenge (e.g. valid existing browser session/cookies).
-    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+    await saveSession(clientId, mergeInstagramSessionData(result.cookies, result.web_storage), result.username, {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
     if (isPlatformPool) {
       await savePlatformScraperSession(
-        { cookies: result.cookies },
+        mergeInstagramSessionData(result.cookies, result.web_storage),
         result.username,
         req.body?.daily_actions_limit != null ? req.body.daily_actions_limit : 500,
         { forceInsert: isPlatformBackup }
@@ -1020,13 +1021,13 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
         });
       }
     }
-    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+    await saveSession(clientId, mergeInstagramSessionData(result.cookies, result.web_storage), result.username, {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
     if (isPlatformPool || pending.platformScraperPool) {
       await savePlatformScraperSession(
-        { cookies: result.cookies },
+        mergeInstagramSessionData(result.cookies, result.web_storage),
         result.username,
         daily_actions_limit != null ? daily_actions_limit : 500,
         { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
@@ -1083,13 +1084,13 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
         });
       }
     }
-    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+    await saveSession(clientId, mergeInstagramSessionData(result.cookies, result.web_storage), result.username, {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
     if (isPlatformPool) {
       await savePlatformScraperSession(
-        { cookies: result.cookies },
+        mergeInstagramSessionData(result.cookies, result.web_storage),
         result.username,
         daily_actions_limit || 500,
         { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }

@@ -49,6 +49,10 @@ const {
   assignPersistentUserDataDir,
 } = require('./utils/puppeteer-chrome-launch');
 const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
+const {
+  navigateAndCaptureInstagramWebStorage,
+  applyInstagramWebStorageFromSessionData,
+} = require('./utils/instagram-web-storage');
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -3161,6 +3165,7 @@ async function previewDmLeadNamesFromSession(body) {
     else await applyMobileEmulation(page);
     await page.setCookie(...cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(3000);
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
@@ -3208,7 +3213,7 @@ async function previewDmLeadNamesFromSession(body) {
         ok: false,
         error: 'instagram_password_reauth_required',
         message:
-          'Instagram asked for your password again. Open Settings → Integrations (VPS Instagram) and tap Reconnect.',
+          'Instagram asked for your password again. Open Settings → Integrations and tap Reconnect.',
         gateDetails: e.gateDetails || undefined,
       };
     }
@@ -3289,6 +3294,7 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
     await applyDesktopEmulation(page);
     await page.setCookie(...cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(2000);
     await grantMicrophoneForInstagram(page, logger);
     await dismissInstagramHomeModals(page, logger);
@@ -3514,6 +3520,7 @@ async function sendFollowUp(body) {
     else await applyMobileEmulation(page);
 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(2000);
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
     await dismissInstagramHomeModals(page, logger);
@@ -3836,7 +3843,7 @@ async function sendDM(page, username, adapter, options = {}) {
           ok: false,
           reason: 'session_logged_out',
           statusMessage:
-            'Instagram asked for your password again. Campaigns using this sender are paused. Open Settings → Integrations (VPS Instagram) and tap Reconnect.',
+            'Instagram asked for your password again. Campaigns using this sender are paused. Open Settings → Integrations and tap Reconnect.',
         };
       }
       lastError = err;
@@ -4131,6 +4138,7 @@ async function runBotMultiTenant() {
           `Session switch navigation ${gotoTimedOut ? 'timed out' : 'failed'} for ${sessionLabel}: ${e.message}. Verifying current page before failing.`
         );
       }
+      await applyInstagramWebStorageFromSessionData(pg, session.session_data, logger);
       await delay(3000);
       const reauth = await detectInstagramPasswordReauthScreen(pg).catch(() => false);
       if (pg.url().includes('/accounts/login') || reauth) {
@@ -4909,6 +4917,7 @@ async function runBot() {
           `Session switch navigation ${gotoTimedOut ? 'timed out' : 'failed'} for ${sessionLabel}: ${e.message}. Verifying current page before failing.`
         );
       }
+      await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
       await delay(3000);
       const reauthLegacy = await detectInstagramPasswordReauthScreen(page).catch(() => false);
       if (page.url().includes('/accounts/login') || reauthLegacy) {
@@ -4952,6 +4961,7 @@ async function runBot() {
         if (session.id) currentSessionId = session.id;
       }
       await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+      if (session?.session_data) await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
       await delay(2000);
       const url = page.url();
       if (url.includes('/accounts/login')) {
@@ -5082,8 +5092,9 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       password: instagramPassword,
       twoFactorCode: twoFactorCode || undefined,
     });
+    const webStorageCap = await navigateAndCaptureInstagramWebStorage(page, logger).catch(() => null);
     const cookies = await page.cookies();
-    return { cookies, username: instagramUsername };
+    return { cookies, web_storage: webStorageCap || undefined, username: instagramUsername };
   } catch (e) {
     if (e.code === 'TWO_FACTOR_REQUIRED' && e.page) {
       keepBrowserOpen = true;
@@ -5228,10 +5239,11 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
     else break;
   }
   await assertHealthyInstagramSessionOrThrow(page, '2FA');
+  const webStorageCap = await navigateAndCaptureInstagramWebStorage(page, logger).catch(() => null);
   const cookies = await page.cookies();
   await browser.close().catch(() => {});
   logger.log('2FA completed, session saved.');
-  return { cookies, username: instagramUsername };
+  return { cookies, web_storage: webStorageCap || undefined, username: instagramUsername };
 }
 
 /**
@@ -5287,10 +5299,11 @@ async function completeInstagramEmailVerification(page, browser, emailCode, inst
     throw new Error('Email verification code may be wrong or expired. Try again with a fresh code.');
   }
   await assertHealthyInstagramSessionOrThrow(page, 'email verification');
+  const webStorageCap = await navigateAndCaptureInstagramWebStorage(page, logger).catch(() => null);
   const cookies = await page.cookies();
   await browser.close().catch(() => {});
   logger.log('Email verification completed, session saved.');
-  return { cookies, username: instagramUsername };
+  return { cookies, web_storage: webStorageCap || undefined, username: instagramUsername };
 }
 
 module.exports = {

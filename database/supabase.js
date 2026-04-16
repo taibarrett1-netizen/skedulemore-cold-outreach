@@ -2185,7 +2185,7 @@ async function handleInstagramPasswordReauthDisruption(clientId, instagramSessio
     paused: 0,
   }));
   const msg =
-    'Automation session needs reconnect — Instagram asked for your password again. Open Settings → Integrations (VPS Instagram) and tap Reconnect.' +
+    'Automation session needs reconnect — Instagram asked for your password again. Open Settings → Integrations and tap Reconnect.' +
     (r && r.paused ? ` Paused ${r.paused} active campaign(s) tied to this account.` : '');
   await setClientStatusMessage(clientId, msg).catch(() => {});
 }
