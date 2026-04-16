@@ -407,6 +407,27 @@ async function saveComposeFailureDebugScreenshot(page, username, label = 'compos
   }
 }
 
+/**
+ * Full-page screenshot right after a compose-recovery CTA (Continue, Accept, etc.).
+ * Not gated on DM_COMPOSE_FAILURE_SCREENSHOT — always written when recovery runs so
+ * account-picker / interstitial flows are visible on the VPS (logs/login-debug).
+ */
+async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUsername) {
+  if (!page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const u = String(leadUsername || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
+    const safe = String(recoveryClicked || 'recovery').replace(/[^a-z0-9_-]/gi, '_').slice(0, 80);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_after_compose_recovery_${safe}_${u}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[compose-recovery] after-CTA screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[compose-recovery] after-CTA screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   const u = String(username || '').trim().replace(/^@/, '');
   let url = '';
@@ -1816,6 +1837,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   logger.log('Waiting for compose area...');
   let composeFound = false;
   let noComposeReason = 'no_compose';
+  let composeRecoveryScreenshotPath = null;
   try {
     await page.waitForSelector(composeSelector, { timeout: 20000 });
     composeFound = true;
@@ -1884,6 +1906,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       logger.log(`Compose recovery click: ${recovery.clicked}`);
       await delay(1800);
       await dismissInstagramHomeModals(page, logger);
+      composeRecoveryScreenshotPath = await saveAfterComposeRecoveryScreenshot(page, recovery.clicked, u);
       try {
         await page.waitForSelector(composeSelector, { timeout: 12000 });
         composeFound = true;
@@ -2734,6 +2757,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       pane_scoped_snippet: diag.paneScopedSnippet || null,
       body_snippet: diag.bodySnippet || null,
       name_extraction_debug: nameExtractionDebugSnapshot,
+      ...(composeRecoveryScreenshotPath ? { compose_recovery_screenshot: composeRecoveryScreenshotPath } : {}),
     };
   }
   const shouldSendText = voiceCfg.mode !== 'voice_only';
@@ -2970,6 +2994,9 @@ async function previewDmLeadNamesFromSession(body) {
         pane_scoped_snippet: result.pane_scoped_snippet,
         body_snippet: result.body_snippet,
         name_extraction_debug: result.name_extraction_debug,
+        ...(result.compose_recovery_screenshot
+          ? { compose_recovery_screenshot: result.compose_recovery_screenshot }
+          : {}),
       };
     }
     return { ok: false, error: 'Unexpected send path (preview only)' };

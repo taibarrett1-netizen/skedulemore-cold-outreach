@@ -699,6 +699,8 @@ app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
 /**
  * Admin / debug: same DM navigation + thread display-name extraction as a real send; does not type or send.
  * Body: { clientId, instagramSessionId, username, first_name?, last_name?, display_name? }
+ * `username` is the **recipient** lead handle to open a thread with (not the sender). After a compose-recovery
+ * CTA (e.g. Continue), JSON may include `compose_recovery_screenshot` (VPS path under logs/login-debug).
  */
 app.post('/api/debug/preview-dm-names', async (req, res) => {
   if (!isSupabaseConfigured()) {
