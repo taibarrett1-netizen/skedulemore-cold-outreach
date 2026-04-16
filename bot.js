@@ -47,6 +47,7 @@ const {
   resolveHeadlessMode,
   baseChromeArgs,
   assignPersistentUserDataDir,
+  acquireChromeUserDataDirLock,
 } = require('./utils/puppeteer-chrome-launch');
 const { gotoInstagramDirectNew } = require('./utils/goto-instagram-direct-new');
 const {
@@ -3976,6 +3977,8 @@ async function runBotMultiTenant() {
   let currentSessionId = null;
   /** Instagram session row id for which `userDataDir` was opened (send worker persistent profile). */
   let currentProfileSessionId = null;
+  /** Cross-process lock for persistent Chrome userDataDir (PM2 cluster must not double-open one profile). */
+  let chromeProfileDirLock = null;
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
   /** Set while this worker holds an IG session lease — PM2 stop may not run `finally` before exit. */
@@ -4039,6 +4042,12 @@ async function runBotMultiTenant() {
   async function invalidateSendWorkerBrowser(reason) {
     if (reason) logger.warn(`[send-worker] Resetting Chrome: ${reason}`);
     await browser?.close?.().catch(() => {});
+    if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
+      try {
+        chromeProfileDirLock.release();
+      } catch {}
+      chromeProfileDirLock = null;
+    }
     browser = null;
     page = null;
     currentSessionId = null;
@@ -4062,11 +4071,7 @@ async function runBotMultiTenant() {
           profileChanged ? 'Instagram session' : ''
         } changed) — persistent profile is per sender session.`
       );
-      await browser.close().catch(() => {});
-      browser = null;
-      page = null;
-      currentSessionId = null;
-      currentProfileSessionId = null;
+      await invalidateSendWorkerBrowser(null);
     }
 
     if (!browser) {
@@ -4086,9 +4091,25 @@ async function runBotMultiTenant() {
       applyHeadedChromeWindowToLaunchOpts(launchOpts);
       applyProxyToLaunchOptions(launchOpts, session.proxy_url || null);
       if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
+      if (launchOpts.userDataDir) {
+        try {
+          chromeProfileDirLock = await acquireChromeUserDataDirLock(launchOpts.userDataDir, {
+            log: (msg) => logger.warn(`[send-worker] ${msg}`),
+          });
+        } catch (e) {
+          logger.error('Chrome profile lock failed', e);
+          throw e;
+        }
+      }
       try {
         browser = await puppeteer.launch(launchOpts);
       } catch (e) {
+        if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
+          try {
+            chromeProfileDirLock.release();
+          } catch {}
+          chromeProfileDirLock = null;
+        }
         logger.error('Browser launch failed', e);
         throw e;
       }
@@ -4260,7 +4281,7 @@ async function runBotMultiTenant() {
           continue;
         }
         logger.error('[send-worker] Giving up: still no pause=0 clients after ~6 min.');
-        await browser?.close().catch(() => {});
+        await invalidateSendWorkerBrowser(null);
         process.exit(0);
       }
       noPauseZeroEmptyRounds = 0;
@@ -4309,7 +4330,7 @@ async function runBotMultiTenant() {
           await sb.setControl(cid, 1).catch(() => {});
         }
         logger.log('No work. Exiting after surfacing the specific blocker for each client.');
-        await browser?.close().catch(() => {});
+        await invalidateSendWorkerBrowser(null);
         process.exit(0);
       }
       const sleepMs = Math.max(1000, earliestResumeAt.getTime() - Date.now());
@@ -4659,10 +4680,7 @@ async function runBotMultiTenant() {
           if (resolved.localPath) {
             const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
             options.voiceDurationSec = conv.durationSec;
-            await browser.close().catch(() => {});
-            browser = null;
-            page = null;
-            currentSessionId = null;
+            await invalidateSendWorkerBrowser(null);
             const okVoice = await ensurePageSession(session);
             if (!okVoice) {
               logger.warn('Could not restore session after voice browser restart.');

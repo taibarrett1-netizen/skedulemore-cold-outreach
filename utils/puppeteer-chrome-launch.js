@@ -55,10 +55,116 @@ function assignPersistentUserDataDir(launchOpts, subdir) {
   launchOpts.userDataDir = dir;
 }
 
+function isPidRunning(pid) {
+  const n = Number(pid);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
+function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const LOCK_NAME = 'skedulemore-send-chrome.lock';
+
+/**
+ * Serialize Chrome launches for a persistent userDataDir (PM2 cluster: multiple Node processes
+ * must not open the same profile — Chromium errors with "browser is already running").
+ * @param {string} profileDir - Chrome userDataDir path
+ * @param {{ log?: (msg: string) => void, waitMs?: number, pollMs?: number }} [opts]
+ * @returns {Promise<{ release: () => void }>}
+ */
+async function acquireChromeUserDataDirLock(profileDir, opts = {}) {
+  const log = typeof opts.log === 'function' ? opts.log : () => {};
+  const waitMs = Math.max(30_000, Number(opts.waitMs) || 240_000);
+  const pollMs = Math.max(200, Number(opts.pollMs) || 750);
+  if (!profileDir || typeof profileDir !== 'string') {
+    return { release: () => {} };
+  }
+  const lockPath = path.join(profileDir, LOCK_NAME);
+  const deadline = Date.now() + waitMs;
+  let lockFd = null;
+  let loggedWait = false;
+
+  const writePayload = () => {
+    const body = JSON.stringify({
+      pid: process.pid,
+      at: Date.now(),
+      worker: process.env.SEND_WORKER_ID || process.env.pm_id || process.env.name || '',
+    });
+    fs.writeSync(lockFd, body, 0, 'utf8');
+    fs.fsyncSync(lockFd);
+  };
+
+  while (Date.now() < deadline) {
+    try {
+      lockFd = fs.openSync(lockPath, 'wx');
+      try {
+        writePayload();
+      } catch (e) {
+        try {
+          fs.closeSync(lockFd);
+        } catch {}
+        lockFd = null;
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {}
+        throw e;
+      }
+      return {
+        release: () => {
+          try {
+            if (lockFd != null) {
+              try {
+                fs.closeSync(lockFd);
+              } catch {}
+              lockFd = null;
+            }
+            fs.unlinkSync(lockPath);
+          } catch {}
+        },
+      };
+    } catch (e) {
+      if (e && e.code !== 'EEXIST') throw e;
+      let steal = false;
+      try {
+        const raw = fs.readFileSync(lockPath, 'utf8');
+        const j = JSON.parse(raw);
+        if (j && j.pid != null && !isPidRunning(j.pid)) steal = true;
+      } catch {
+        steal = true;
+      }
+      if (steal) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {}
+        continue;
+      }
+      if (!loggedWait) {
+        loggedWait = true;
+        log(
+          `Chrome profile in use by another process (same Instagram session or PM2 cluster). Waiting for lock on ${path.basename(profileDir)}…`
+        );
+      }
+      await sleepMs(pollMs + Math.floor(Math.random() * 400));
+    }
+  }
+  throw new Error(
+    `Timeout waiting for Chrome profile lock (${path.basename(profileDir)}). ` +
+      'If no other send worker is running, kill stray Chromium for this profile or set SEND_WORKER_INSTANCES=1.'
+  );
+}
+
 module.exports = {
   getBrowserProfilesRoot,
   ensureProfilesRoot,
   resolveHeadlessMode,
   baseChromeArgs,
   assignPersistentUserDataDir,
+  acquireChromeUserDataDirLock,
 };
