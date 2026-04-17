@@ -4206,16 +4206,18 @@ async function runBotMultiTenant() {
   }
 
   async function ensurePageSession(session) {
-    const cookies = session?.session_data?.cookies;
-    if (!cookies?.length) return false;
     await ensureBrowserForSession(session);
     const pg = page;
     if (!pg) return false;
     if (currentSessionId === session.id) return true;
     const sessionLabel = session.instagram_username || session.id;
     try {
-      await clearInstagramCookiesOnlyOnPage(pg);
-      await pg.setCookie(...cookies);
+      const cookies = session?.session_data?.cookies;
+      const hasCookies = Array.isArray(cookies) && cookies.length > 0;
+      if (hasCookies) {
+        await clearInstagramCookiesOnlyOnPage(pg);
+        await pg.setCookie(...cookies);
+      }
       let gotoTimedOut = false;
       try {
         await pg.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -4225,7 +4227,9 @@ async function runBotMultiTenant() {
           `Session switch navigation ${gotoTimedOut ? 'timed out' : 'failed'} for ${sessionLabel}: ${e.message}. Verifying current page before failing.`
         );
       }
-      await applyInstagramWebStorageFromSessionData(pg, session.session_data, logger);
+      if (hasCookies && session?.session_data) {
+        await applyInstagramWebStorageFromSessionData(pg, session.session_data, logger);
+      }
       await delay(3000);
       const reauth = await detectInstagramPasswordReauthScreen(pg).catch(() => false);
       if (pg.url().includes('/accounts/login') || reauth) {
@@ -4235,6 +4239,22 @@ async function runBotMultiTenant() {
         );
         if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         return false;
+      }
+      // If DB cookies were missing but the Chrome profile is already authenticated, capture and persist them
+      // so future restarts can restore without relying on a warm disk profile.
+      if (!hasCookies && session?.id && typeof sb.updateInstagramSessionSessionData === 'function') {
+        try {
+          const webStorageCap = await navigateAndCaptureInstagramWebStorage(pg, logger).catch(() => null);
+          const freshCookies = await pg.cookies().catch(() => []);
+          if (Array.isArray(freshCookies) && freshCookies.length > 0) {
+            const nextSessionData = {
+              ...(session.session_data || {}),
+              cookies: freshCookies,
+              ...(webStorageCap ? { web_storage: webStorageCap } : {}),
+            };
+            await sb.updateInstagramSessionSessionData(session.id, nextSessionData).catch(() => {});
+          }
+        } catch {}
       }
       currentSessionId = session.id;
       return true;
@@ -4704,9 +4724,12 @@ async function runBotMultiTenant() {
       if (!ok) {
         logger.warn('Could not load Instagram session; re-queueing send job (lead not failed).');
         const timedOut = /timeout after|ensurePageSession timeout/i.test(ensurePageSessionErr);
+        const likelyLoggedOut = session?.web_session_needs_refresh === true || /security screen|login url|expired/i.test(ensurePageSessionErr || '');
         const statusMsg = timedOut
           ? 'Instagram browser did not become ready in time — often another send worker is waiting on the same Chrome profile. Retrying automatically. If this repeats, reduce concurrent send workers or restart ig-dm-send.'
-          : 'Could not load Instagram for this send; retrying. Reconnect the sender in Cold Outreach if this keeps happening.';
+          : likelyLoggedOut
+            ? 'Instagram session needs reconnect — Instagram asked for login again. Open Cold Outreach and reconnect this sender.'
+            : 'Instagram browser session was not ready for this send — retrying automatically.';
         await sb.setClientStatusMessage(clientId, statusMsg).catch(() => {});
         await sb.updateSendJob(
           claimedJob.id,
@@ -4716,7 +4739,7 @@ async function runBotMultiTenant() {
             last_error_class: timedOut ? 'session_load_timeout' : 'session_load_failed',
             last_error_message: timedOut
               ? ensurePageSessionErr.slice(0, 400) || 'session_load_timeout'
-              : 'Instagram session expired. Reconnect this sender in Cold Outreach.',
+              : (ensurePageSessionErr || statusMsg).slice(0, 400) || 'session_load_failed',
           },
           SEND_WORKER_ID
         ).catch(() => {});

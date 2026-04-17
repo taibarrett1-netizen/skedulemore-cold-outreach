@@ -2307,6 +2307,25 @@ async function markInstagramSessionWebNeedsRefresh(sessionId) {
 }
 
 /**
+ * Save refreshed Puppeteer session_data captured from a live browser (cookies + local/session storage).
+ * Also clears web_session_needs_refresh because we just verified the session is currently usable.
+ */
+async function updateInstagramSessionSessionData(sessionId, sessionData) {
+  const sb = getSupabase();
+  if (!sb || !sessionId || !sessionData) return false;
+  const nowIso = new Date().toISOString();
+  const { error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update({
+      session_data: sessionData,
+      web_session_needs_refresh: false,
+      updated_at: nowIso,
+    })
+    .eq('id', sessionId);
+  return !error;
+}
+
+/**
  * Pause active campaigns that use this Instagram session (junction cold_dm_campaign_instagram_sessions).
  */
 async function pauseActiveCampaignsForInstagramSession(clientId, instagramSessionId) {
@@ -4622,6 +4641,7 @@ module.exports = {
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
   markInstagramSessionWebNeedsRefresh,
+  updateInstagramSessionSessionData,
   pauseActiveCampaignsForInstagramSession,
   handleInstagramPasswordReauthDisruption,
   markPlatformScraperWebNeedsRefresh,
