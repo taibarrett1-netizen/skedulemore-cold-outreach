@@ -1045,6 +1045,66 @@ async function saveSession(clientId, sessionData, instagramUsername, proxyOpts =
   if (error) throw error;
 }
 
+async function getMostRecentInstagramSessionForClient(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, instagram_username, proxy_url, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+    )
+    .eq('client_id', clientId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function getInstagramSessionForClientAndUsername(clientId, instagramUsername) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const u = normalizeInstagramKey(instagramUsername);
+  if (!u) return null;
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, instagram_username, proxy_url, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+    )
+    .eq('client_id', clientId)
+    .eq('instagram_username', u)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function serviceSetInstagrapiSettings(instagramSessionId, settingsJson, proxyUrl) {
+  const sb = getSupabase();
+  if (!sb || !instagramSessionId) throw new Error('Supabase or instagramSessionId missing');
+  const { data, error } = await sb.rpc('service_set_instagrapi_settings', {
+    p_instagram_session_id: instagramSessionId,
+    p_settings_json: settingsJson,
+    p_proxy_url: proxyUrl || null,
+  });
+  if (error) throw error;
+  return data === true;
+}
+
+async function serviceSetInstagrapiState(instagramSessionId, state, errorClass = null, errorMessage = null) {
+  const sb = getSupabase();
+  if (!sb || !instagramSessionId) throw new Error('Supabase or instagramSessionId missing');
+  const { data, error } = await sb.rpc('service_set_instagrapi_state', {
+    p_instagram_session_id: instagramSessionId,
+    p_state: state,
+    p_error_class: errorClass,
+    p_error_message: errorMessage,
+  });
+  if (error) throw error;
+  return data === true;
+}
+
 async function alreadySent(clientId, username) {
   const sb = getSupabase();
   if (!sb || !clientId) return false;
@@ -2385,6 +2445,7 @@ async function createScrapeJob(
   scrapeType = 'followers',
   postUrls = null,
   platformScraperSessionId = null,
+  instagramSessionId = null,
   maxLeads = null,
   scrapeMethod = 'instagrapi'
 ) {
@@ -2401,6 +2462,7 @@ async function createScrapeJob(
   if (scrapeType) payload.scrape_type = scrapeType;
   if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
   if (platformScraperSessionId) payload.platform_scraper_session_id = platformScraperSessionId;
+  if (instagramSessionId) payload.instagram_session_id = instagramSessionId;
    // max_leads is an optional column on cold_dm_scrape_jobs used by the Python worker
   if (maxLeads != null && !Number.isNaN(Number(maxLeads))) {
     payload.max_leads = Number(maxLeads);
@@ -2574,20 +2636,17 @@ async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const onlyClientId = getClientId();
-  if (onlyClientId) {
-    // Dedicated per-client worker: never claim scrape jobs for other clients.
-    return claimColdDmScrapeJobFallback(workerId, leaseSeconds, onlyClientId);
-  }
   const { data, error } = await sb.rpc('claim_cold_dm_scrape_job', {
     p_worker_id: workerId,
     p_lease_seconds: leaseSeconds,
+    ...(onlyClientId ? { p_client_id: onlyClientId } : {}),
   });
   if (!error) {
     const rows = Array.isArray(data) ? data : data != null ? [data] : [];
     if (rows.length > 0) return rows[0];
     return null;
   }
-  return claimColdDmScrapeJobFallback(workerId, leaseSeconds);
+  return claimColdDmScrapeJobFallback(workerId, leaseSeconds, onlyClientId || null);
 }
 
 async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, workerId = null) {
@@ -2799,10 +2858,6 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const onlyClientId = getClientId();
-  if (onlyClientId) {
-    // Dedicated per-client worker: never claim send jobs for other clients.
-    return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId);
-  }
   const rpcTimeoutMs = Math.max(3000, parseInt(process.env.CLAIM_SEND_JOB_RPC_TIMEOUT_MS || '12000', 10) || 12000);
   const rpcPayload = {
     p_worker_id: workerId,
@@ -2810,6 +2865,9 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
   };
   if (Array.isArray(campaignIds) && campaignIds.length > 0) {
     rpcPayload.p_campaign_ids = campaignIds;
+  }
+  if (onlyClientId) {
+    rpcPayload.p_client_id = onlyClientId;
   }
   for (let attempt = 0; attempt < 8; attempt++) {
     let data;
@@ -2831,11 +2889,11 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
         timeoutMs: rpcTimeoutMs,
         error: String(rpcTimeoutErr?.message || rpcTimeoutErr || 'timeout'),
       });
-      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
     }
     if (error) {
       console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
-      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
     }
     const rows = Array.isArray(data) ? data : data != null ? [data] : [];
     const claimed = rows.length > 0 ? rows[0] : null;
@@ -2862,7 +2920,7 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
           firstJobAvailableAt: pendingCheck[0]?.available_at || null,
           nowIso,
         });
-        return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+        return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
       }
       return null;
     }
@@ -4522,6 +4580,10 @@ module.exports = {
   getUserAccountName,
   addCampaignLeadsFromGroups,
   reactivateCampaignsWithPendingLeads,
+  getMostRecentInstagramSessionForClient,
+  getInstagramSessionForClientAndUsername,
+  serviceSetInstagrapiSettings,
+  serviceSetInstagrapiState,
   syncSendJobsForCampaign,
   syncSendJobsForClient,
   buildSendWorkFromJob,

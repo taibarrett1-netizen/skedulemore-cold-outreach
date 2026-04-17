@@ -40,6 +40,10 @@ const {
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
+  getMostRecentInstagramSessionForClient,
+  getInstagramSessionForClientAndUsername,
+  serviceSetInstagrapiSettings,
+  serviceSetInstagrapiState,
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
@@ -223,6 +227,41 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+
+function normalizeProxyUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  // Decodo colon format: host:port:user:pass
+  if (!/^[a-z]+:\/\//i.test(s)) {
+    const parts = s.split(':');
+    if (parts.length >= 4 && parts[0] && parts[1] && parts[2]) {
+      const host = parts[0];
+      const port = parts[1];
+      const user = parts[2];
+      const pass = parts.slice(3).join(':');
+      return normalizeProxyUrl(`http://${user}:${pass}@${host}:${port}`);
+    }
+    return s;
+  }
+  try {
+    const u = new URL(s);
+    if (u.username || u.password) {
+      // Percent-encode userinfo; keep unreserved per RFC3986.
+      const enc = (v) =>
+        encodeURIComponent(v)
+          .replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())
+          .replace(/%7E/g, '~');
+      const user = enc(u.username || '');
+      const pass = enc(u.password || '');
+      const host = u.host;
+      const auth = user || pass ? `${user}:${pass}@` : '';
+      return `${u.protocol}//${auth}${host}${u.pathname || ''}${u.search || ''}${u.hash || ''}`;
+    }
+    return s;
+  } catch {
+    return s;
+  }
+}
 
 /** Hands-free PM2 scaling: on by default when Supabase is configured. Set SCALE_SEND_WORKERS_AUTO=0 to disable (e.g. laptop without PM2). */
 function shouldAutoScaleSendWorkers() {
@@ -1133,6 +1172,138 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   }
 });
 
+/**
+ * Per-client scraping bootstrap: instagrapi mobile private API login.
+ * Password is never stored; we store encrypted instagrapi settings on cold_dm_instagram_sessions.
+ *
+ * Flow:
+ * - First attempt: submit username/password (through the client's proxy).
+ * - If Instagram requires TOTP 2FA: return { code: 'two_factor_required' } and re-submit with verificationCode.
+ */
+app.post('/api/instagram/instagrapi/connect', connectLimiter, async (req, res) => {
+  const { username, password, verificationCode, clientId } = req.body || {};
+  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
+  if (!username || !password || !clientId) {
+    return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+
+  const igKey = String(username).trim().replace(/^@/, '').toLowerCase();
+  try {
+    // Prefer the session row for this username (sender connect creates it). Fall back to "most recent" for safety.
+    let sessionRow = await getInstagramSessionForClientAndUsername(clientId, igKey).catch(() => null);
+    if (!sessionRow) {
+      sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+    }
+    if (!sessionRow?.id) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Connect your Instagram automation session first (Settings → Integrations), then enable scraping.',
+      });
+    }
+
+    // Use the same proxy URL as the sender session (denormalized on cold_dm_instagram_sessions).
+    // If missing, allocate/resolve from cold_dm_proxy_assignments.
+    let proxyMeta = { proxyUrl: null, proxyAssignmentId: null };
+    try {
+      proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
+    } catch (pe) {
+      return res.status(503).json({
+        ok: false,
+        error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check provider)',
+      });
+    }
+    const proxyUrl = normalizeProxyUrl(sessionRow.proxy_url || proxyMeta.proxyUrl || '');
+    if (!proxyUrl) {
+      return res.status(503).json({ ok: false, error: 'Proxy URL missing for this Instagram account' });
+    }
+
+    const py = process.env.SCRAPER_PYTHON || process.env.ADMIN_LAB_PYTHON || 'python3';
+    const scriptPath = path.join(__dirname, 'scraper_worker', 'instagrapi_login.py');
+    const args = [
+      scriptPath,
+      '--username',
+      String(username).trim(),
+      '--password',
+      String(password),
+      '--proxy',
+      proxyUrl,
+    ];
+    if (verificationCode != null && String(verificationCode).trim()) {
+      args.push('--verification_code', String(verificationCode).trim());
+    }
+
+    const child = spawn(py, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d.toString('utf8')));
+    child.stderr.on('data', (d) => (err += d.toString('utf8')));
+
+    const code = await new Promise((resolve) => child.on('close', resolve));
+    void code;
+
+    const lines = out
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const last = lines.length > 0 ? lines[lines.length - 1] : '';
+    let payload = null;
+    try {
+      payload = last ? JSON.parse(last) : null;
+    } catch (_) {
+      payload = null;
+    }
+    if (!payload || typeof payload !== 'object') {
+      console.error('[API] instagrapi connect invalid response', { outPreview: out.slice(-1200), errPreview: err.slice(-1200) });
+      return res.status(500).json({ ok: false, error: 'instagrapi connect failed (invalid response). Check VPS logs.' });
+    }
+
+    if (payload.ok === true && typeof payload.settings_json === 'string' && payload.settings_json.trim()) {
+      await serviceSetInstagrapiSettings(sessionRow.id, payload.settings_json, proxyUrl);
+      return res.json({ ok: true });
+    }
+
+    const pcode = typeof payload.code === 'string' ? payload.code : '';
+    const perr = typeof payload.error === 'string' ? payload.error : '';
+    if (pcode === 'two_factor_required') {
+      return res.status(200).json({
+        ok: false,
+        code: 'two_factor_required',
+        message: 'Enter the 6-digit code from your authenticator app, then submit again.',
+      });
+    }
+    if (pcode === 'challenge_required') {
+      await serviceSetInstagrapiState(sessionRow.id, 'challenge_required', pcode, perr).catch(() => {});
+      return res.status(400).json({
+        ok: false,
+        code: 'challenge_required',
+        error:
+          'Instagram security challenge required. Open Instagram on your phone or browser to approve/clear the checkpoint, then retry.',
+      });
+    }
+    if (pcode === 'rate_limited') {
+      await serviceSetInstagrapiState(sessionRow.id, 'cooldown', pcode, perr).catch(() => {});
+      return res.status(429).json({
+        ok: false,
+        code: 'rate_limited',
+        error: 'Instagram rate limit. Wait 15–60 minutes and try again.',
+      });
+    }
+    if (pcode === 'bad_credentials') {
+      return res.status(400).json({ ok: false, code: 'bad_credentials', error: 'Invalid Instagram credentials' });
+    }
+
+    return res.status(400).json({ ok: false, error: perr || 'instagrapi connect failed' });
+  } catch (e) {
+    console.error('[API] instagrapi connect failed', e);
+    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
 // --- API: bot control (PM2 start/stop) ---
 // Return 200 immediately; pm2 start/stop runs in background. Sender loop does the actual wait (schedule, limits).
 app.post('/api/control/start', async (req, res) => {
@@ -1363,27 +1534,63 @@ app.post('/api/scraper/start', async (req, res) => {
   const rawType = String(scrape_type || 'followers')
     .trim()
     .toLowerCase();
-  const scrapeType =
-    rawType === 'comments' ? 'comments' : rawType === 'following' ? 'following' : 'followers';
+  const scrapeType = rawType === 'followers' ? 'followers' : rawType;
 
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  if ((scrapeType === 'followers' || scrapeType === 'following') && !target_username) {
+  if (scrapeType !== 'followers') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Only follower scraping is supported right now. Following/comments will be added incrementally.',
+      code: 'scrape_type_not_supported',
+    });
+  }
+  if (!target_username) {
     return res
       .status(400)
       .json({ ok: false, error: 'target_username is required for follower or following scrape' });
   }
-  if (scrapeType === 'comments') {
-    if (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0) {
-      return res.status(400).json({ ok: false, error: 'post_urls (array of Instagram post URLs) is required for comment scrape' });
-    }
-    if (post_urls.some((u) => typeof u !== 'string')) {
-      return res.status(400).json({ ok: false, error: 'post_urls must be an array of strings' });
-    }
-  }
 
   try {
+    // Hard safety gate: no scraping while any campaign is active.
+    const activeCampaigns = await getActiveCampaigns(clientId).catch(() => []);
+    if (Array.isArray(activeCampaigns) && activeCampaigns.some((c) => String(c?.status || '') === 'active')) {
+      return res.status(400).json({
+        ok: false,
+        code: 'campaigns_not_paused',
+        error: 'Pause all campaigns before scraping. Scraping is blocked while any campaign is Active.',
+      });
+    }
+
+    // Bind scrape job to the client's most-recent IG session (client view: only one account).
+    const sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+    if (!sessionRow?.id) {
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_instagram_session',
+        error: 'Connect your Instagram automation session first (Settings → Integrations).',
+      });
+    }
+    if (String(sessionRow.instagrapi_state || '').toLowerCase() !== 'ready') {
+      return res.status(400).json({
+        ok: false,
+        code: 'scraping_login_required',
+        error: 'Scraping login not enabled yet. Connect (sending + scraping) or enable scraping login, then retry.',
+      });
+    }
+    if (sessionRow.scrape_cooldown_until) {
+      const untilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
+      if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+        return res.status(400).json({
+          ok: false,
+          code: 'scrape_cooldown',
+          error: `Scraping cooldown active. Try again after ${new Date(untilMs).toLocaleTimeString()}.`,
+          scrapeCooldownUntil: sessionRow.scrape_cooldown_until,
+        });
+      }
+    }
+
     const quota = await getScrapeQuotaStatus(clientId);
     if (quota.remaining <= 0) {
       return res.status(400).json({
@@ -1392,8 +1599,7 @@ app.post('/api/scraper/start', async (req, res) => {
         scrapeQuota: quota,
       });
     }
-    const targetForJob =
-      scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
+    const targetForJob = target_username.trim().replace(/^@/, '');
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
     const boundedMax = requestedMaxLeads != null && requestedMaxLeads > 0 ? Math.min(requestedMaxLeads, quota.remaining) : quota.remaining;
     const effectiveMaxLeads = boundedMax > 0 ? boundedMax : null;
@@ -1402,8 +1608,9 @@ app.post('/api/scraper/start', async (req, res) => {
       targetForJob,
       lead_group_id || null,
       scrapeType,
-      scrapeType === 'comments' ? post_urls : null,
       null,
+      null, // legacy platformScraperSessionId (unused for per-client instagrapi)
+      sessionRow.id,
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
       'instagrapi'
     );

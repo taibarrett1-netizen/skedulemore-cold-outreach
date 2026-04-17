@@ -78,6 +78,7 @@ def fetch_scrape_job(conn, job_id):
         post_urls,
         lead_group_id,
         platform_scraper_session_id,
+        instagram_session_id,
         max_leads
       FROM cold_dm_scrape_jobs
       WHERE id = %s
@@ -85,6 +86,57 @@ def fetch_scrape_job(conn, job_id):
       (job_id,),
     )
     return cur.fetchone()
+
+
+def fetch_instagram_session_for_scrape(conn, instagram_session_id):
+  """
+  Load per-client IG session fields needed for instagrapi scraping.
+  Returns:
+    - proxy_url (current proxy)
+    - instagrapi_proxy_url (proxy used when settings were created)
+    - instagrapi_state
+    - settings_json (decrypted text)
+    - instagram_username
+  """
+  with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    cur.execute(
+      """
+      SELECT
+        id,
+        client_id,
+        instagram_username,
+        proxy_url,
+        instagrapi_proxy_url,
+        instagrapi_state,
+        decrypt_credential(instagrapi_settings_encrypted) AS settings_json
+      FROM cold_dm_instagram_sessions
+      WHERE id = %s
+      """,
+      (instagram_session_id,),
+    )
+    return cur.fetchone()
+
+
+def update_instagrapi_state(conn, instagram_session_id, state, error_class=None, error_message=None):
+  with conn.cursor() as cur:
+    cur.execute(
+      """
+      UPDATE cold_dm_instagram_sessions
+      SET
+        instagrapi_state = %s,
+        instagrapi_last_error_class = %s,
+        instagrapi_last_error_message = %s,
+        updated_at = NOW()
+      WHERE id = %s
+      """,
+      (
+        state,
+        (str(error_class)[:120] if error_class else None),
+        (str(error_message)[:2000] if error_message else None),
+        instagram_session_id,
+      ),
+    )
+  conn.commit()
 
 
 def update_scrape_job(conn, job_id, **fields):
@@ -283,4 +335,3 @@ def get_scrape_quota_status(conn, client_id):
       "reset_in_text": reset_in_text,
       "message": f"1000 leads maximum reached, please wait for your scraping usage to reset in {reset_in_text}.",
     }
-
