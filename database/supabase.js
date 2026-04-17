@@ -1799,6 +1799,29 @@ async function getClientNoWorkResumeAt(clientId) {
   const earliestQueuedAtRaw = earliestQueuedJob?.available_at || null;
   const earliestQueuedAtMs = earliestQueuedAtRaw ? Date.parse(earliestQueuedAtRaw) : NaN;
   if (Number.isFinite(earliestQueuedAtMs) && earliestQueuedAtMs > nowMs + 1000) {
+    // Self-heal: if we have pending work that is *currently* in schedule, but the queue is deferred
+    // due to outside_schedule, pull those jobs forward so we don't "wait until tomorrow" incorrectly.
+    // This also recovers from any past schedule math bugs that stamped a too-far-future available_at.
+    if (
+      pendingCampaignsInSchedule.length > 0 &&
+      String(earliestQueuedJob?.last_error_class || '').trim() === 'outside_schedule'
+    ) {
+      try {
+        const nowIso = new Date().toISOString();
+        const inScheduleCampaignIds = pendingCampaignsInSchedule.map((c) => c.id).filter(Boolean);
+        if (inScheduleCampaignIds.length > 0) {
+          await sb
+            .from('cold_dm_send_jobs')
+            .update({ available_at: nowIso, updated_at: nowIso })
+            .eq('client_id', clientId)
+            .in('campaign_id', inScheduleCampaignIds)
+            .in('status', ['pending', 'retry'])
+            .eq('last_error_class', 'outside_schedule')
+            .gt('available_at', nowIso);
+          return { message: null, reason: 'pending_ready', resumeAt: new Date(Date.now() + 15_000) };
+        }
+      } catch {}
+    }
     const resumeAt = new Date(earliestQueuedAtMs);
     const jobMeta = {
       lastErrorClass: earliestQueuedJob?.last_error_class || '',
