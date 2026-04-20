@@ -3515,7 +3515,7 @@ async function buildSendWorkFromJob(jobId) {
   try {
     const { data } = await sb
       .from('cold_dm_leads')
-      .select('id, username, first_name, last_name, display_name')
+      .select('id, username, first_name, last_name')
       .eq('id', leadLink.lead_id)
       .eq('client_id', job.client_id)
       .maybeSingle();
@@ -3529,7 +3529,7 @@ async function buildSendWorkFromJob(jobId) {
     username: lead?.username || leadLink.lead_username || null,
     first_name: lead?.first_name || leadLink.lead_first_name || null,
     last_name: lead?.last_name || leadLink.lead_last_name || null,
-    display_name: lead?.display_name || leadLink.lead_display_name || null,
+    display_name: leadLink.lead_display_name || null,
   };
 
   let messageText = null;
@@ -4153,7 +4153,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
 
     const { data: leadRows } = await sb
       .from('cold_dm_leads')
-      .select('id, username, first_name, last_name, display_name')
+      .select('id, username, first_name, last_name')
       .eq('client_id', clientId)
       .in('lead_group_id', leadGroupIds);
     dbg.leadRowsCount = leadRows?.length || 0;
@@ -4168,7 +4168,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         username: lead.username || null,
         first_name: lead.first_name || null,
         last_name: lead.last_name || null,
-        display_name: lead.display_name || null,
+        display_name: null,
       };
       const { data: existing } = await sb
         .from('cold_dm_campaign_leads')
@@ -4220,7 +4220,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       try {
         const { data } = await sb
           .from('cold_dm_leads')
-          .select('username, first_name, last_name, display_name')
+          .select('username, first_name, last_name')
           .eq('id', pendingRow.lead_id)
           .eq('client_id', clientId)
           .maybeSingle();
@@ -4236,7 +4236,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         username: leadData?.username || pendingRow.lead_username || null,
         first_name: leadData?.first_name || pendingRow.lead_first_name || null,
         last_name: leadData?.last_name || pendingRow.lead_last_name || null,
-        display_name: leadData?.display_name || pendingRow.lead_display_name || null,
+        display_name: pendingRow.lead_display_name || null,
       };
       const unameNorm = normalizeUsername(resolvedLead.username).toLowerCase();
       if (scrapeBlocklistSet.has(unameNorm)) {
