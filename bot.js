@@ -565,9 +565,9 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     return { ok: false, reason: 'instagram_technical_error', pageSnippet: 'No page available for recovery.' };
   }
 
-  const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   const u = normalizeUsername(username);
   const profileUrl = `https://www.instagram.com/${u}/`;
+  const profilePath = `/${u}/`;
 
   const clickExactProfileCta = async (texts) => {
     const clicked = await page
@@ -615,18 +615,68 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     return clicked?.clicked || null;
   };
 
+  const profileComposerVisible = async () => {
+    return page
+      .evaluate(() => {
+        const visible = (el) => {
+          try {
+            return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+          } catch {
+            return false;
+          }
+        };
+        const messageLike = (el) => {
+          const ph = String(el.getAttribute?.('placeholder') || '').toLowerCase();
+          const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
+          const text = String(el.textContent || '').toLowerCase();
+          return ph.includes('message') || ph.includes('write') || aria.includes('message') || text.includes('message');
+        };
+        const isProfileSideComposer = (el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (!vw || !vh) return false;
+            return r.width > 40 && r.height > 16 && r.left > vw * 0.45 && r.top > vh * 0.45;
+          } catch {
+            return false;
+          }
+        };
+        const candidates = Array.from(
+          document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]')
+        ).filter(visible);
+        return candidates.some((el) => messageLike(el) && isProfileSideComposer(el));
+      })
+      .catch(() => false);
+  };
+
   try {
     await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch {
     // If direct navigation fails, we still try the current page below.
   }
+  await page
+    .waitForFunction(
+      (path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path || location.href.toLowerCase().includes(path),
+      { timeout: 10000 },
+      profilePath
+    )
+    .catch(() => {});
+  await page.waitForSelector('header, main, [role="main"]', { timeout: 10000 }).catch(() => {});
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(2200);
-
-  const composerVisible = await page
-    .waitForSelector(composeSelector, { timeout: 9000 })
-    .then(() => true)
+  const isProfilePage = await page
+    .evaluate((path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path, profilePath)
     .catch(() => false);
+  if (!isProfilePage) {
+    return {
+      ok: false,
+      reason: 'instagram_technical_error',
+      pageSnippet: 'Instagram profile page did not open cleanly during recovery.',
+    };
+  }
+
+  const composerVisible = await profileComposerVisible();
   if (composerVisible) {
     logger.log('[compose-recovery] technical error recovery: profile composer already visible');
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible', u);
@@ -640,13 +690,17 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     await dismissInstagramHomeModals(page, logger).catch(() => {});
   }
 
-  const composerVisibleAfterMessage = await page
-    .waitForSelector(composeSelector, { timeout: 12000 })
-    .then(() => true)
-    .catch(() => false);
+  const composerVisibleAfterMessage = await profileComposerVisible();
   if (composerVisibleAfterMessage) {
     await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-cta', u);
     return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-cta' };
+  }
+
+  await page.waitForTimeout(1200).catch(() => {});
+  const composerVisibleAfterWait = await profileComposerVisible();
+  if (composerVisibleAfterWait) {
+    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-wait', u);
+    return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-wait' };
   }
 
   return {
@@ -3540,7 +3594,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
     noComposeReason = null;
 
-    const composeEl = await page.evaluateHandle(() => {
+    const composeEl = await page.evaluateHandle((preferProfileComposer) => {
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
       const byPlaceholder = (el) => {
         const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
         const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
@@ -3548,15 +3604,46 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         return t.includes('message') || t.includes('add a message') || t.includes('write a message');
       };
       const all = document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]');
+      const visible = [];
       for (const el of all) {
         if (el.offsetParent === null) continue;
+        visible.push(el);
+      }
+      const scored = visible
+        .map((el) => {
+          let score = 0;
+          const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const role = (el.getAttribute('role') || '').toLowerCase();
+          const tag = (el.tagName || '').toLowerCase();
+          const text = (el.textContent || '').toLowerCase();
+          const rect = el.getBoundingClientRect();
+          if (byPlaceholder(el)) score += 100;
+          if (ph.includes('message') || aria.includes('message') || text.includes('message')) score += 40;
+          if (tag === 'textarea') score += 25;
+          if (tag === 'div' && el.isContentEditable) score += 18;
+          if (role === 'textbox') score += 12;
+          if (preferProfileComposer) {
+            if (vw > 0 && vh > 0) {
+              if (rect.left > vw * 0.45) score += 40;
+              if (rect.top > vh * 0.45) score += 40;
+              if (rect.right > vw * 0.55) score += 20;
+              if (rect.bottom > vh * 0.55) score += 20;
+            }
+          }
+          if (rect.width < 40 || rect.height < 16) score -= 50;
+          return { el, score };
+        })
+        .sort((a, b) => b.score - a.score);
+      if (scored.length && scored[0].score > 0) return scored[0].el;
+      for (const el of visible) {
         if (byPlaceholder(el)) return el;
       }
-      for (const el of all) {
-        if (el.offsetParent !== null) return el;
+      for (const el of visible) {
+        return el;
       }
       return null;
-    });
+    }, !!sendOpts.preferSendIcon);
     const compose = composeEl.asElement();
     if (compose && shouldSendText) {
       await organicPause('compose', 0.55);
