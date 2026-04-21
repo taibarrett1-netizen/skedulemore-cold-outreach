@@ -614,6 +614,53 @@ async function saveTechnicalRecoveryDebugSnapshot(page, leadUsername, stage) {
   return { screenshotPath, summary };
 }
 
+/**
+ * Instagram shows "View profile" in the broken DM thread pane; clicking it fixes state without blowing away
+ * the floating composer the way a raw profile URL navigation can.
+ */
+async function clickInDmPaneViewProfile(page, username) {
+  const u = normalizeUsername(username);
+  const result = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        try {
+          return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+        } catch {
+          return false;
+        }
+      };
+      const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]')).filter(
+        visible
+      );
+      for (const el of candidates) {
+        const t = norm(el.textContent);
+        if (t === 'view profile' || t.includes('view profile')) {
+          const btn = el.closest('button, a, [role="button"]') || el;
+          try {
+            btn.scrollIntoView({ block: 'center' });
+          } catch {}
+          try {
+            btn.click();
+            return { ok: true, label: t.slice(0, 80) };
+          } catch {
+            return { ok: false, label: null, err: 'click failed' };
+          }
+        }
+      }
+      return { ok: false, label: null };
+    })
+    .catch((e) => ({ ok: false, label: null, err: e?.message || String(e) }));
+  if (result?.ok) {
+    logger.log(`[compose-recovery] in-DM View profile clicked for @${u}: ${result.label || 'ok'}`);
+  } else {
+    logger.log(
+      `[compose-recovery] in-DM View profile click missed for @${u}${result?.err ? ` (${result.err})` : ''}`
+    );
+  }
+  return !!result?.ok;
+}
+
 async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   if (!page) {
     return { ok: false, reason: 'instagram_technical_error', pageSnippet: 'No page available for recovery.' };
@@ -625,7 +672,8 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   logger.log(`[compose-recovery] technical error fallback start for @${u} from ${page.url()}`);
   await saveTechnicalRecoveryDebugSnapshot(page, u, 'start').catch(() => {});
 
-  const profileComposerVisible = async () => {
+  /** Thread pane, profile right column, or floating DM overlay — not the left inbox search box. */
+  const recoveryComposerVisible = async () => {
     return page
       .evaluate(() => {
         const visible = (el) => {
@@ -639,15 +687,23 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
           const ph = String(el.getAttribute?.('placeholder') || '').toLowerCase();
           const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
           const text = String(el.textContent || '').toLowerCase();
-          return ph.includes('message') || ph.includes('write') || aria.includes('message') || text.includes('message');
+          return (
+            ph.includes('message') ||
+            ph.includes('write') ||
+            aria.includes('message') ||
+            aria.includes('write a message') ||
+            text.includes('message')
+          );
         };
-        const isProfileSideComposer = (el) => {
+        const inDmComposerZone = (el) => {
           try {
             const r = el.getBoundingClientRect();
             const vw = window.innerWidth || document.documentElement.clientWidth || 0;
             const vh = window.innerHeight || document.documentElement.clientHeight || 0;
             if (!vw || !vh) return false;
-            return r.width > 40 && r.height > 16 && r.left > vw * 0.45 && r.top > vh * 0.45;
+            const rightish = r.left > vw * 0.3;
+            const lowish = r.top > vh * 0.28;
+            return r.width > 36 && r.height > 14 && rightish && lowish;
           } catch {
             return false;
           }
@@ -655,16 +711,63 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
         const candidates = Array.from(
           document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]')
         ).filter(visible);
-        return candidates.some((el) => messageLike(el) && isProfileSideComposer(el));
+        return candidates.some((el) => {
+          if (!inDmComposerZone(el)) return false;
+          try {
+            const r = el.getBoundingClientRect();
+            return messageLike(el) || r.height > 26;
+          } catch {
+            return messageLike(el);
+          }
+        });
       })
       .catch(() => false);
   };
 
+  let composerVisible = await recoveryComposerVisible();
+  logger.log(`[compose-recovery] recovery composer visible (initial) for @${u}: ${composerVisible}`);
+  if (composerVisible) {
+    logger.log('[compose-recovery] technical error recovery: composer already visible');
+    await saveAfterComposeRecoveryScreenshot(page, 'recovery-composer-visible-initial', u);
+    return { ok: true, recoveryClicked: 'recovery-composer-visible-initial' };
+  }
+
+  const startUrl = page.url();
+  const onDirect = /\/direct\//i.test(startUrl);
+  if (onDirect) {
+    logger.log(`[compose-recovery] on /direct/ thread — trying in-DM View profile before any profile URL navigation`);
+    const clickedVp = await clickInDmPaneViewProfile(page, u);
+    await saveTechnicalRecoveryDebugSnapshot(page, u, clickedVp ? 'after_in_dm_view_profile_click' : 'view_profile_not_found').catch(
+      () => {}
+    );
+    await delay(clickedVp ? 2400 : 800);
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
+    await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_in_dm_view_profile_settle').catch(() => {});
+
+    composerVisible = await recoveryComposerVisible();
+    logger.log(`[compose-recovery] recovery composer visible after in-DM View profile for @${u}: ${composerVisible}`);
+    if (composerVisible) {
+      await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile', u);
+      return { ok: true, recoveryClicked: 'in-dm-view-profile' };
+    }
+    await delay(1200);
+    composerVisible = await recoveryComposerVisible();
+    logger.log(`[compose-recovery] recovery composer visible after extra wait for @${u}: ${composerVisible}`);
+    if (composerVisible) {
+      await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile-wait', u);
+      return { ok: true, recoveryClicked: 'in-dm-view-profile-wait' };
+    }
+  } else {
+    logger.log(`[compose-recovery] not on /direct/ (url=${startUrl}) — skipping in-DM View profile click`);
+  }
+
+  logger.log(
+    `[compose-recovery] last-resort: navigating to profile URL ${profileUrl} (in-DM recovery did not expose composer)`
+  );
   try {
-    logger.log(`[compose-recovery] navigating to profile ${profileUrl}`);
     await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch {
-    // If direct navigation fails, we still try the current page below.
+    // continue with whatever URL we have
   }
   await page
     .waitForFunction(
@@ -676,13 +779,13 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   await page.waitForSelector('header, main, [role="main"]', { timeout: 10000 }).catch(() => {});
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(2200);
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_open').catch(() => {});
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_url_open').catch(() => {});
   const isProfilePage = await page
     .evaluate((path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path, profilePath)
     .catch(() => false);
   if (!isProfilePage) {
-    logger.warn(`[compose-recovery] profile page did not open cleanly for @${u}; current=${page.url()}`);
-    await saveTechnicalRecoveryDebugSnapshot(page, u, 'profile_open_failed').catch(() => {});
+    logger.warn(`[compose-recovery] profile URL did not open cleanly for @${u}; current=${page.url()}`);
+    await saveTechnicalRecoveryDebugSnapshot(page, u, 'profile_url_open_failed').catch(() => {});
     return {
       ok: false,
       reason: 'instagram_technical_error',
@@ -690,15 +793,13 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     };
   }
 
-  const composerVisible = await profileComposerVisible();
-  logger.log(`[compose-recovery] profile composer visible before CTA for @${u}: ${composerVisible}`);
+  composerVisible = await recoveryComposerVisible();
+  logger.log(`[compose-recovery] recovery composer visible on profile page for @${u}: ${composerVisible}`);
   if (composerVisible) {
-    logger.log('[compose-recovery] technical error recovery: profile composer already visible');
-    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible', u);
-    return { ok: true, recoveryClicked: 'profile-composer-visible' };
+    await saveAfterComposeRecoveryScreenshot(page, 'after-profile-url-fallback', u);
+    return { ok: true, recoveryClicked: 'profile-url-fallback' };
   }
 
-  // Do not click the profile header row "Message" CTA: many profiles omit it while the DM pane composer still works.
   logger.log(
     `[compose-recovery] profile CTA click result for @${u}: skipped_row_message_cta (relying on corner/thread composer only)`
   );
@@ -707,7 +808,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_settle_no_row_cta').catch(() => {});
 
-  const composerVisibleAfterMessage = await profileComposerVisible();
+  const composerVisibleAfterMessage = await recoveryComposerVisible();
   logger.log(`[compose-recovery] composer visible after settle (no row CTA) for @${u}: ${composerVisibleAfterMessage}`);
   if (composerVisibleAfterMessage) {
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-settle', u);
@@ -715,7 +816,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   }
 
   await delay(1200);
-  const composerVisibleAfterWait = await profileComposerVisible();
+  const composerVisibleAfterWait = await recoveryComposerVisible();
   logger.log(`[compose-recovery] composer visible after settle wait for @${u}: ${composerVisibleAfterWait}`);
   if (composerVisibleAfterWait) {
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-wait', u);
@@ -728,7 +829,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     ok: false,
     reason: 'instagram_technical_error',
     pageSnippet:
-      'Instagram shows "Something isn\'t working" in the DM pane, and the profile fallback did not restore a composer.',
+      'Instagram shows "Something isn\'t working" in the DM pane, and recovery (View profile + profile URL fallback) did not restore a composer.',
   };
 }
 

@@ -4649,8 +4649,16 @@ async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = 
       await sb.from('cold_dm_campaigns').update({ status: 'completed', updated_at: new Date().toISOString() }).eq('id', row.campaign_id);
       const { data: camp } = await sb.from('cold_dm_campaigns').select('client_id').eq('id', row.campaign_id).maybeSingle();
       if (camp?.client_id) {
-        await setControl(camp.client_id, 1);
-        await setClientStatusMessage(camp.client_id, 'Completed.').catch(() => {});
+        const { count: activeCampaignsLeft, error: activeCountErr } = await sb
+          .from('cold_dm_campaigns')
+          .select('*', { count: 'exact', head: true })
+          .eq('client_id', camp.client_id)
+          .eq('status', 'active');
+        const stillActive = activeCountErr ? 1 : Number(activeCampaignsLeft ?? 0);
+        if (stillActive === 0) {
+          await setControl(camp.client_id, 1);
+          await setClientStatusMessage(camp.client_id, 'Completed.').catch(() => {});
+        }
       }
     }
   }
