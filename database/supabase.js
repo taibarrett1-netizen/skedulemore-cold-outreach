@@ -3977,6 +3977,52 @@ async function getActiveCampaigns(clientId) {
   }
 }
 
+/**
+ * True only when this client has at least one campaign that could send a cold outreach message right now.
+ * Paused clients, completed campaigns, outside-schedule campaigns, capped campaigns, and campaigns with no
+ * pending leads are all treated as not actively sendable, so scraping may proceed once the post-send cooldown clears.
+ */
+async function canClientActivelySendNow(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return false;
+
+  const pause = await getControl(clientId).catch(() => '1');
+  if (pause === '1' || pause === 1) return false;
+
+  const campaigns = await getActiveCampaigns(clientId).catch(() => []);
+  if (!campaigns.length) return false;
+
+  const [stats, hourlySent] = await Promise.all([
+    getDailyStats(clientId).catch(() => ({ total_sent: 0, total_failed: 0 })),
+    getHourlySent(clientId).catch(() => 0),
+  ]);
+
+  for (const camp of campaigns) {
+    if (!hasValidCampaignSendDelayConfig(camp)) continue;
+
+    const { count: pendingCount, error: pendingErr } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if (pendingErr || (pendingCount ?? 0) === 0) continue;
+
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, camp.timezone ?? null)) continue;
+
+    const limitState = evaluateCampaignLimitState({
+      sentToday: stats.total_sent,
+      sentThisHour: hourlySent,
+      dailySendLimit: normalizeColdOutreachDailyLimit(camp.daily_send_limit),
+      hourlySendLimit: normalizeColdOutreachHourlyLimit(camp.hourly_send_limit),
+    });
+    if (limitState.blocked) continue;
+
+    return true;
+  }
+
+  return false;
+}
+
 async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -4869,6 +4915,7 @@ module.exports = {
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
   countActiveCampaignsForClient,
+  canClientActivelySendNow,
   getClientIdsWithPauseZero,
   getDistinctActiveCampaignIdsWithReadySendJobs,
   getClientSendCampaignTurn,

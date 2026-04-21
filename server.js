@@ -33,6 +33,7 @@ const {
   addCampaignLeadsFromGroups,
   syncSendJobsForClient,
   getNoWorkHint,
+  canClientActivelySendNow,
   getCampaignsMissingSendDelays,
   getSessionsForCampaign,
   reactivateCampaignsWithPendingLeads,
@@ -236,7 +237,7 @@ const PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS = Math.max(
 );
 const PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS = Math.max(
   30 * 1000,
-  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '120000', 10) || 120000
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '300000', 10) || 300000
 );
 
 let processScheduledResponsesFallbackInFlight = false;
@@ -336,6 +337,14 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
       `[process-scheduled-responses:fallback] tick ok reason=${reason} duration_ms=${Date.now() - startedAt} body=${snippet || '{}'}`
     );
   } catch (e) {
+    if (e?.name === 'AbortError' || String(e?.message || e) === 'This operation was aborted') {
+      logger.log(
+        `[process-scheduled-responses:fallback] tick timed out after ${Math.ceil(
+          PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS / 1000
+        )}s reason=${reason}`
+      );
+      return;
+    }
     logger.warn(
       `[process-scheduled-responses:fallback] tick exception reason=${reason} error=${e?.message || e}`
     );
@@ -1487,9 +1496,9 @@ app.post('/api/scraper/start', async (req, res) => {
   }
 
   try {
-    // Scraping may run only when no campaign is actively sendable right now.
-    const activeSendHint = await getNoWorkHint(clientId).catch(() => '');
-    if (!activeSendHint) {
+    // Scraping may run whenever nothing can actively send right now.
+    const activelySendableNow = await canClientActivelySendNow(clientId).catch(() => false);
+    if (activelySendableNow) {
       return res.status(400).json({
         ok: false,
         code: 'campaigns_active',
