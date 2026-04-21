@@ -1274,6 +1274,26 @@ async function sleepUntilDue(dueMs, username = '', shouldAbort = () => false) {
   }
 }
 
+/** Bump a pending follow-up row so pg_cron / workers retry after the session daily cap resets. */
+async function deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, rowId) {
+  if (!supabase || !clientId || !rowId) return null;
+  const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+  const { error } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .update({
+      scheduled_for: preciseResume.resumeAtIso,
+      error_message: 'deferred_session_daily_dm_limit',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', rowId)
+    .eq('status', 'pending');
+  if (error) {
+    logger.warn(`[follow-up-interleave] defer queue row ${rowId} failed: ${error.message || error}`);
+    return null;
+  }
+  return preciseResume.resumeAtIso;
+}
+
 /**
  * Optional same-session follow-up: after a cold send, if a cold_dm_follow_up_queue row is already due
  * or becomes due within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS, we may wait briefly and send in-browser.
@@ -1327,6 +1347,43 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     60_000,
     parseInt(process.env.COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS || '', 10) || 15 * 60 * 1000
   );
+
+  // Session daily cap (cold + follow-ups) from Integrations. The cold send is not `completed` in DB yet
+  // when we interleave, so count it via `pendingColdCompleting` to avoid an 11th outbound on a limit of 10.
+  const pendingColdCompleting = Number(options.pendingColdCompleting) === 1 ? 1 : 0;
+  const sessionDailyCap = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+  const usageForCap =
+    typeof sb.getInstagramSessionDailyUsage === 'function'
+      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+      : null;
+  const trackedOutbound = Number(usageForCap?.totalSent) || 0;
+  const effectiveOutbound = trackedOutbound + pendingColdCompleting;
+  if (effectiveOutbound >= sessionDailyCap) {
+    const horizonIso = new Date(Date.now() + followUpWaitCapMs + 2000).toISOString();
+    const { data: capRow, error: capErr } = await supabase
+      .from('cold_dm_follow_up_queue')
+      .select('id')
+      .eq('client_id', clientId)
+      .eq('status', 'pending')
+      .lte('scheduled_for', horizonIso)
+      .order('scheduled_for', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (!capErr && capRow?.id) {
+      const resumeIso = await deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, capRow.id);
+      if (resumeIso) {
+        logger.log(
+          `[follow-up-interleave] deferred queue row ${capRow.id} to ${resumeIso} (session daily cap ${sessionDailyCap}; ` +
+            `tracked=${trackedOutbound} pendingColdComplete=${pendingColdCompleting})`
+        );
+      }
+    }
+    logColdDmFollowUpDebug(
+      `skip: session daily cap (${sessionDailyCap}) — no room for interleaved follow-up (tracked=${trackedOutbound} pendingCold=${pendingColdCompleting})`
+    );
+    return { processed: false, skippedDueToSessionDailyLimit: true };
+  }
+
   const { data: nextPending, error: nextErr } = await supabase
     .from('cold_dm_follow_up_queue')
     .select('id, username, scheduled_for')
@@ -1406,6 +1463,31 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
       .eq('id', row.id)
       .eq('status', 'processing');
     return { processed: false };
+  }
+
+  // Second cap check after claim (row is `processing`); release back to `pending` if cap hit while we waited.
+  const usageAfterWait =
+    typeof sb.getInstagramSessionDailyUsage === 'function'
+      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+      : null;
+  const tracked2 = Number(usageAfterWait?.totalSent) || 0;
+  const effective2 = tracked2 + pendingColdCompleting;
+  if (effective2 >= sessionDailyCap) {
+    const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'pending',
+        scheduled_for: preciseResume.resumeAtIso,
+        error_message: 'deferred_session_daily_dm_limit',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    logger.log(
+      `[follow-up-interleave] re-queued claimed row ${row.id} to ${preciseResume.resumeAtIso} (session cap ${sessionDailyCap}; tracked=${tracked2} pendingCold=${pendingColdCompleting})`
+    );
+    return { processed: false, skippedDueToSessionDailyLimit: true };
   }
 
   const uname = normalizeUsername(row.username || '');
@@ -4248,6 +4330,19 @@ async function sendFollowUp(body) {
       );
     }
   }
+
+  const sessionDailyCapApi = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+  if (typeof sb.getInstagramSessionDailyUsage === 'function') {
+    const usageApi = await sb.getInstagramSessionDailyUsage(clientId, instagramSessionId).catch(() => null);
+    if (usageApi && usageApi.totalSent >= sessionDailyCapApi) {
+      const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+      return fail(
+        `Instagram session daily DM limit reached (${usageApi.totalSent}/${sessionDailyCapApi}). Retry after ${preciseResume.resumeAtIso}.`,
+        429
+      );
+    }
+  }
+
   const cookies = session.session_data?.cookies;
   if (!cookies?.length) {
     return fail('Session has no cookies; reconnect Instagram', 400);
@@ -5743,6 +5838,7 @@ async function runBotMultiTenant() {
           const interleaved = await maybeRunQueuedColdFollowUpForSession(page, session, {
             clientId,
             lookAheadMs: 0,
+            pendingColdCompleting: 1,
             forceExit: () => sendWorkerForceExit,
           }).catch((e) => {
             logger.warn(`[follow-up-interleave] check failed: ${e?.message || e}`);
