@@ -4194,26 +4194,53 @@ async function getRandomMessageFromGroup(messageGroupId) {
         .select('next_index')
         .eq('message_group_id', messageGroupId)
         .maybeSingle();
-      if (stateErr) throw stateErr;
+      if (stateErr) {
+        console.warn(`[getRandomMessageFromGroup] rotation state read failed for group=${messageGroupId}: ${stateErr.message || stateErr}`);
+        throw stateErr;
+      }
       rotationIndex = Math.max(0, Math.floor(Number(stateRow?.next_index ?? 0)));
     } catch (stateErr) {
       canPersistRotation = false;
+      if (!globalThis._coldDmRotationWarned) {
+        globalThis._coldDmRotationWarned = true;
+        console.warn(
+          '[getRandomMessageFromGroup] Rotation state table unavailable (missing, RLS, or permissions?). ' +
+          'Falling back to first message for all sends until fixed. See migration 20260421130000_cold_dm_message_group_rotation_state.sql'
+        );
+      }
     }
 
     const row = data[rotationIndex % data.length];
     if (canPersistRotation) {
       const nextIndex = data.length <= 1 ? 0 : (rotationIndex + 1) % data.length;
-      await sb
-        .from('cold_dm_message_group_rotation_state')
-        .upsert(
-          {
-            message_group_id: messageGroupId,
-            next_index: nextIndex,
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'message_group_id' }
-        )
-        .catch(() => {});
+      let upsertOk = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const { error: upsertErr } = await sb
+            .from('cold_dm_message_group_rotation_state')
+            .upsert(
+              {
+                message_group_id: messageGroupId,
+                next_index: nextIndex,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'message_group_id' }
+            );
+          if (upsertErr) throw upsertErr;
+          upsertOk = true;
+          break;
+        } catch (upsertErr) {
+          if (attempt === 0) {
+            console.warn(`[getRandomMessageFromGroup] upsert attempt 1 failed for group=${messageGroupId}: ${upsertErr.message || upsertErr}. Retrying...`);
+            await new Promise(r => setTimeout(r, 100));
+            continue;
+          }
+          console.warn(`[getRandomMessageFromGroup] upsert failed after retry for group=${messageGroupId}: ${upsertErr.message || upsertErr}`);
+        }
+      }
+      if (!upsertOk) {
+        canPersistRotation = false; // prevent future attempts in same process if persistent fail
+      }
     }
     return {
       id: row.id,
@@ -4222,6 +4249,7 @@ async function getRandomMessageFromGroup(messageGroupId) {
       voice_note_storage_path: row.voice_note_storage_path || null,
     };
   } catch (e) {
+    console.warn(`[getRandomMessageFromGroup] query failed for group=${messageGroupId}: ${e.message || e}. Using first message as fallback.`);
     const { data, error } = await sb
       .from('cold_dm_message_group_messages')
       .select('id, message_text, send_voice_note, voice_note_storage_path, sort_order, created_at')

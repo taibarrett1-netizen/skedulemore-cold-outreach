@@ -1236,6 +1236,49 @@ function logColdDmFollowUpDebug(msg) {
   if (coldDmFollowUpDebugEnabled()) logger.log(`[follow-up-interleave][debug] ${msg}`);
 }
 
+/** Human-readable duration for logs (ms → "45s", "30m", "2d", …). */
+function formatDurationRough(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const sec = Math.max(1, Math.ceil(ms / 1000));
+  if (sec < 120) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 120) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr}h`;
+  const d = Math.floor(hr / 24);
+  const remHr = hr % 24;
+  return remHr > 0 ? `${d}d ${remHr}h` : `${d}d`;
+}
+
+/**
+ * Chunked sleep until a target timestamp. Only used when the next queue row is due
+ * within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS (same-browser shortcut). Honors
+ * force-exit only; long delays are never slept here — cron delivers those via /api/follow-up/send.
+ */
+async function sleepUntilDue(dueMs, username = '', shouldAbort = () => false) {
+  const now = Date.now();
+  if (dueMs <= now) return;
+  const msLeft = dueMs - now;
+  const chunk = 500;
+  logger.log(
+    `[follow-up-interleave] waiting ${Math.ceil(msLeft / 1000)}s until follow-up due (@${username || '?'})`
+  );
+  const end = dueMs;
+  while (Date.now() < end) {
+    if (shouldAbort()) {
+      logger.warn(`[follow-up-interleave] force exit during follow-up due wait — aborting`);
+      return;
+    }
+    await delay(Math.min(chunk, Math.max(1, end - Date.now())));
+  }
+}
+
+/**
+ * Optional same-session follow-up: after a cold send, if a cold_dm_follow_up_queue row is already due
+ * or becomes due within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS, we may wait briefly and send in-browser.
+ * Anything scheduled farther out (minutes, days, …) stays `pending` for Supabase pg_cron
+ * `process-scheduled-responses` → Edge `processColdDmFollowUps` → this host `/api/follow-up/send`.
+ */
 async function maybeRunQueuedColdFollowUpForSession(page, session, options = {}) {
   const clientId = String(options.clientId || '').trim();
   if (!page || !session?.id || !clientId) {
@@ -1296,16 +1339,16 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     const slackMs = 500;
     const msLeft = dueMs - Date.now() - slackMs;
     if (msLeft > 0 && msLeft <= followUpWaitCapMs) {
-      logger.log(
-        `[follow-up-interleave] waiting ${Math.ceil(msLeft / 1000)}s until follow-up due (@${nextPending.username || '?'})`
-      );
-      await delay(msLeft);
+      const shouldAbort = typeof options.forceExit === 'function' ? options.forceExit : () => false;
+      await sleepUntilDue(dueMs, nextPending.username || '', shouldAbort);
     } else if (msLeft > followUpWaitCapMs) {
       logger.log(
-        `[follow-up-interleave] next follow-up in ${Math.ceil(msLeft / 60000)}m (>${Math.ceil(
-          followUpWaitCapMs / 60000
-        )}m worker cap) — use Supabase cron process-scheduled-responses / cold-dm follow-up path`
+        `[follow-up-interleave] next follow-up for @${nextPending.username || '?'} in ${formatDurationRough(msLeft)} ` +
+          `(>${formatDurationRough(followUpWaitCapMs)} same-session cap). Row stays pending — Supabase pg_cron ` +
+          `process-scheduled-responses invokes cold DM follow-up delivery (VPS /api/follow-up/send) when due.`
       );
+      logColdDmFollowUpDebug('skip: next follow-up beyond interleave cap (cron path)');
+      return { processed: false };
     }
   }
 
@@ -4826,7 +4869,9 @@ async function runBotMultiTenant() {
     }
     sendWorkerGracefulShutdown = true;
     logger.warn(
-      `[send-worker] ${sig}: graceful drain — completing in-flight send + follow-up sends; long cooldown sleeps will be skipped`
+      `[send-worker] ${sig}: graceful drain — finishing in-flight cold send and any follow-up due within the short interleave window ` +
+        `(see COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS). Campaign cooldown sleeps are skipped. ` +
+        `Follow-ups scheduled later are delivered by Supabase cron → /api/follow-up/send, not by holding this process.`
     );
   }
 
@@ -5665,6 +5710,7 @@ async function runBotMultiTenant() {
           const interleaved = await maybeRunQueuedColdFollowUpForSession(page, session, {
             clientId,
             lookAheadMs: 0,
+            forceExit: () => sendWorkerForceExit,
           }).catch((e) => {
             logger.warn(`[follow-up-interleave] check failed: ${e?.message || e}`);
             return { processed: false, error: e?.message || String(e) };
