@@ -696,7 +696,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-cta' };
   }
 
-  await page.waitForTimeout(1200).catch(() => {});
+  await delay(1200);
   const composerVisibleAfterWait = await profileComposerVisible();
   if (composerVisibleAfterWait) {
     await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-wait', u);
