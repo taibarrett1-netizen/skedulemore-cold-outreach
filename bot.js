@@ -560,6 +560,60 @@ async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUse
   }
 }
 
+async function saveTechnicalRecoveryDebugSnapshot(page, leadUsername, stage) {
+  if (!page) return { screenshotPath: null, summary: null };
+  const safeStage = String(stage || 'technical-recovery').replace(/[^a-z0-9_-]/gi, '_').slice(0, 80);
+  const screenshotPath = await saveAfterComposeRecoveryScreenshot(page, `technical_${safeStage}`, leadUsername).catch(() => null);
+  const summary = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        try {
+          return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+        } catch {
+          return false;
+        }
+      };
+      const textOf = (el) => String(el?.textContent || '').replace(/\s+/g, ' ').trim();
+      const ctas = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]'))
+        .filter(visible)
+        .map((el) => textOf(el))
+        .filter(Boolean)
+        .slice(0, 20);
+      const composers = Array.from(
+        document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]')
+      )
+        .filter(visible)
+        .map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            tag: String(el.tagName || '').toLowerCase(),
+            placeholder: String(el.getAttribute?.('placeholder') || ''),
+            aria: String(el.getAttribute?.('aria-label') || ''),
+            left: Math.round(rect.left),
+            top: Math.round(rect.top),
+            right: Math.round(rect.right),
+            bottom: Math.round(rect.bottom),
+          };
+        })
+        .slice(0, 10);
+      const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+      return {
+        url: location.href,
+        path: location.pathname,
+        title: document.title || '',
+        bodySnippet: body.slice(0, 800),
+        ctas,
+        composers,
+      };
+    })
+    .catch((e) => ({ error: e?.message || String(e) }));
+  logger.log(`[compose-recovery] debug ${safeStage}: ${JSON.stringify(summary)}`);
+  if (screenshotPath) {
+    logger.log(`[compose-recovery] debug ${safeStage} screenshot=${screenshotPath}`);
+  }
+  return { screenshotPath, summary };
+}
+
 async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   if (!page) {
     return { ok: false, reason: 'instagram_technical_error', pageSnippet: 'No page available for recovery.' };
@@ -568,6 +622,8 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   const u = normalizeUsername(username);
   const profileUrl = `https://www.instagram.com/${u}/`;
   const profilePath = `/${u}/`;
+  logger.log(`[compose-recovery] technical error fallback start for @${u} from ${page.url()}`);
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'start').catch(() => {});
 
   const clickExactProfileCta = async (texts) => {
     const clicked = await page
@@ -651,6 +707,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   };
 
   try {
+    logger.log(`[compose-recovery] navigating to profile ${profileUrl}`);
     await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch {
     // If direct navigation fails, we still try the current page below.
@@ -665,10 +722,13 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   await page.waitForSelector('header, main, [role="main"]', { timeout: 10000 }).catch(() => {});
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(2200);
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_open').catch(() => {});
   const isProfilePage = await page
     .evaluate((path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path, profilePath)
     .catch(() => false);
   if (!isProfilePage) {
+    logger.warn(`[compose-recovery] profile page did not open cleanly for @${u}; current=${page.url()}`);
+    await saveTechnicalRecoveryDebugSnapshot(page, u, 'profile_open_failed').catch(() => {});
     return {
       ok: false,
       reason: 'instagram_technical_error',
@@ -677,6 +737,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   }
 
   const composerVisible = await profileComposerVisible();
+  logger.log(`[compose-recovery] profile composer visible before CTA for @${u}: ${composerVisible}`);
   if (composerVisible) {
     logger.log('[compose-recovery] technical error recovery: profile composer already visible');
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible', u);
@@ -684,13 +745,16 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   }
 
   const clickedProfileMessage = await clickExactProfileCta(['message', 'send message', 'chat', 'send a message', 'start a chat']);
+  logger.log(`[compose-recovery] profile CTA click result for @${u}: ${clickedProfileMessage || 'none'}`);
   if (clickedProfileMessage) {
     logger.log(`[compose-recovery] technical error recovery: ${clickedProfileMessage}`);
     await delay(2200);
     await dismissInstagramHomeModals(page, logger).catch(() => {});
+    await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_cta').catch(() => {});
   }
 
   const composerVisibleAfterMessage = await profileComposerVisible();
+  logger.log(`[compose-recovery] composer visible after CTA for @${u}: ${composerVisibleAfterMessage}`);
   if (composerVisibleAfterMessage) {
     await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-cta', u);
     return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-cta' };
@@ -698,10 +762,13 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
 
   await delay(1200);
   const composerVisibleAfterWait = await profileComposerVisible();
+  logger.log(`[compose-recovery] composer visible after settle wait for @${u}: ${composerVisibleAfterWait}`);
   if (composerVisibleAfterWait) {
     await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-wait', u);
     return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-wait' };
   }
+
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'final_failure').catch(() => {});
 
   return {
     ok: false,
