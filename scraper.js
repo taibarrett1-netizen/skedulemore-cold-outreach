@@ -1097,6 +1097,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let stuckModalCount = 0;
     let loopIter = 0;
     let exhaustedConfirmCount = 0;
+    let detachedFrameRetryUsed = false;
 
     while (true) {
       loopIter++;
@@ -1109,7 +1110,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         break;
       }
 
-      const batchResult = await page.evaluate(() => {
+      let batchResult;
+      try {
+        batchResult = await page.evaluate(() => {
         const leads = [];
         let root = document.body;
         let bestCount = 0;
@@ -1210,7 +1213,35 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           }
         }
         return { leads: deduped };
-      });
+        });
+      } catch (batchErr) {
+        const msg = String(batchErr?.message || batchErr || "");
+        if (/detached frame/i.test(msg) && !detachedFrameRetryUsed) {
+          detachedFrameRetryUsed = true;
+          logger.warn(`[Scraper] Detached frame in scrape loop; attempting one recovery retry: ${msg}`);
+          const refreshed = await maybeRefreshInstagramListModal(
+            page,
+            cleanTarget,
+            listKind,
+            logger,
+            "detached_frame_recover"
+          ).catch(() => false);
+          if (refreshed) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(1800, 3600));
+            continue;
+          }
+          await closeInstagramListModal(page).catch(() => {});
+          await delay(randomDelay(1200, 2600));
+          const reopened = await tryOpenProfileList(page, cleanTarget, listKind).catch(() => false);
+          if (reopened) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(1500, 3200));
+            continue;
+          }
+        }
+        throw batchErr;
+      }
 
       const batch = batchResult.leads || [];
 
