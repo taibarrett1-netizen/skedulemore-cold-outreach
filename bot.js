@@ -1228,11 +1228,27 @@ function normalizeColdFollowUpItems(raw) {
     .filter(Boolean);
 }
 
+function coldDmFollowUpDebugEnabled() {
+  return process.env.COLD_DM_FOLLOW_UP_DEBUG === '1' || process.env.COLD_DM_FOLLOW_UP_DEBUG === 'true';
+}
+
+function logColdDmFollowUpDebug(msg) {
+  if (coldDmFollowUpDebugEnabled()) logger.log(`[follow-up-interleave][debug] ${msg}`);
+}
+
 async function maybeRunQueuedColdFollowUpForSession(page, session, options = {}) {
   const clientId = String(options.clientId || '').trim();
-  if (!page || !session?.id || !clientId) return { processed: false };
+  if (!page || !session?.id || !clientId) {
+    logColdDmFollowUpDebug('skip: missing page, session.id, or clientId');
+    return { processed: false };
+  }
   const supabase = typeof sb.getSupabase === 'function' ? sb.getSupabase() : null;
-  if (!supabase) return { processed: false };
+  if (!supabase) {
+    logColdDmFollowUpDebug('skip: Supabase client not available');
+    return { processed: false };
+  }
+
+  logColdDmFollowUpDebug(`start client=${clientId} session=${session.id} page=${typeof page.url === 'function' ? page.url() : '?'}`);
 
   const { data: settingsRow, error: settingsErr } = await supabase
     .from('cold_dm_settings')
@@ -1245,12 +1261,23 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   }
 
   const settings = settingsRow || {};
-  if (settings.follow_ups_enabled === false) return { processed: false };
+  if (settings.follow_ups_enabled === false) {
+    logColdDmFollowUpDebug('skip: follow_ups_enabled is false');
+    return { processed: false };
+  }
   const configuredSessionId = (settings.follow_up_instagram_session_id || '').toString().trim();
-  if (configuredSessionId && configuredSessionId !== String(session.id)) return { processed: false };
+  if (configuredSessionId && configuredSessionId !== String(session.id)) {
+    logColdDmFollowUpDebug(
+      `skip: session mismatch (worker session=${session.id} settings.follow_up_instagram_session_id=${configuredSessionId})`
+    );
+    return { processed: false };
+  }
 
   const followUps = normalizeColdFollowUpItems(settings.follow_ups);
-  if (!followUps.length) return { processed: false };
+  if (!followUps.length) {
+    logColdDmFollowUpDebug('skip: no follow-up steps in cold_dm_settings.follow_ups');
+    return { processed: false };
+  }
 
   const followUpWaitCapMs = Math.max(
     60_000,
@@ -1300,7 +1327,12 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   }
 
   const row = Array.isArray(pendingRows) ? pendingRows[0] : null;
-  if (!row?.id) return { processed: false };
+  if (!row?.id) {
+    logColdDmFollowUpDebug(
+      `no row due yet (cutoff=${dueCutoffIso} pendingQueryRows=${Array.isArray(pendingRows) ? pendingRows.length : 0})`
+    );
+    return { processed: false };
+  }
   logger.log(
     `[follow-up-interleave] found due row ${row.id} for @${row.username || 'unknown'} scheduled_for=${row.scheduled_for || 'n/a'}`
   );
@@ -1312,7 +1344,10 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     logger.warn(`[follow-up-interleave] claim failed for row ${row.id}: ${claimErr.message || claimErr}`);
     return { processed: false };
   }
-  if (!claimed) return { processed: false };
+  if (!claimed) {
+    logColdDmFollowUpDebug(`claim returned empty for row=${row.id} (another worker may have claimed)`);
+    return { processed: false };
+  }
 
   const followUpItem = followUps[row.follow_up_index];
   if (!followUpItem?.content) {
@@ -5591,10 +5626,10 @@ async function runBotMultiTenant() {
 
         if (sendResult.ok && delayMs > 1000 && page && session) {
           handledSendCooldownInline = true;
+          const cooldownWindowStart = Date.now();
           logger.log(
-            `[follow-up-interleave] waiting ${delaySec}s after cold send before checking queued follow-ups`
+            `[follow-up-interleave] cold send ok — checking follow-up queue first (then remaining campaign cooldown to ${delaySec}s total)`
           );
-          await delay(delayMs);
 
           const interleaved = await maybeRunQueuedColdFollowUpForSession(page, session, {
             clientId,
@@ -5610,10 +5645,10 @@ async function runBotMultiTenant() {
               normalizedDelayWindow.maxDelaySec * 1000
             );
             logger.log(
-              `[follow-up-interleave] sent queued follow-up for @${interleaved.username || 'unknown'}; waiting ${Math.max(
+              `[follow-up-interleave] sent queued follow-up for @${interleaved.username || 'unknown'}; inter-send spacing ${Math.max(
                 1,
                 Math.ceil(afterFollowUpDelayMs / 1000)
-              )}s before next cold send`
+              )}s`
             );
             sb
               .setClientStatusMessage(
@@ -5625,6 +5660,17 @@ async function runBotMultiTenant() {
               )
               .catch(() => {});
             await delay(afterFollowUpDelayMs);
+          }
+
+          const elapsedMs = Date.now() - cooldownWindowStart;
+          const remainderMs = Math.max(0, delayMs - elapsedMs);
+          if (remainderMs > 500) {
+            logger.log(
+              `[follow-up-interleave] campaign cooldown remainder ${Math.ceil(remainderMs / 1000)}s (${Math.ceil(
+                elapsedMs / 1000
+              )}s already used in ${delaySec}s window)`
+            );
+            await delay(remainderMs);
           }
 
           delayMs = 0;
