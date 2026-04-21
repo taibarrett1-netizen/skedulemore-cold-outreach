@@ -445,11 +445,10 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   const u = normalizeUsername(username);
   const profileUrl = `https://www.instagram.com/${u}/`;
 
-  const clickByText = async (texts, opts = {}) => {
+  const clickExactProfileCta = async (texts) => {
     const clicked = await page
       .evaluate(
-        ({ usernameRaw, textsRaw, allowProfileFallback }) => {
-          const username = (usernameRaw || '').replace(/^@/, '').toLowerCase().trim();
+        ({ textsRaw }) => {
           const texts = Array.isArray(textsRaw) ? textsRaw.map((t) => String(t || '').toLowerCase().trim()).filter(Boolean) : [];
           const visible = (el) => {
             try {
@@ -474,21 +473,10 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
           };
 
           const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]')).filter(visible);
-          const exactMatch = (t) => texts.includes(t);
-          const looseMatch = (t) =>
-            texts.some((needle) => needle && t.includes(needle));
-
-          let target = candidates.find((el) => exactMatch(textOf(el)));
-          if (!target) {
-            target = candidates.find((el) => looseMatch(textOf(el)));
-          }
-
-          if (!target && allowProfileFallback && username) {
-            target = candidates.find((el) => {
-              const t = textOf(el);
-              return t.includes(username) && (t.includes('profile') || t.includes('message'));
-            });
-          }
+          const target = candidates.find((el) => {
+            const t = textOf(el);
+            return texts.includes(t);
+          });
 
           if (target && clickEl(target)) {
             return { clicked: textOf(target) || 'unknown' };
@@ -496,9 +484,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
           return { clicked: null };
         },
         {
-          usernameRaw: u,
           textsRaw: texts,
-          allowProfileFallback: !!opts.allowProfileFallback,
         }
       )
       .catch(() => ({ clicked: null }));
@@ -513,33 +499,21 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(2200);
 
-  let clickedProfileMessage = await clickByText(['message', 'send message', 'chat', 'send a message', 'start a chat'], {
-    allowProfileFallback: true,
-  });
-  if (!clickedProfileMessage) {
-    clickedProfileMessage = await clickByText(['view profile', 'open profile', 'see profile', 'visit profile'], {
-      allowProfileFallback: true,
-    });
-  }
-  if (!clickedProfileMessage) {
-    return {
-      ok: false,
-      reason: 'instagram_technical_error',
-      pageSnippet: 'Could not find the profile Message button on the recovery path.',
-    };
-  }
-
-  logger.log(`[compose-recovery] technical error recovery: ${clickedProfileMessage}`);
-  await delay(2200);
-  await dismissInstagramHomeModals(page, logger).catch(() => {});
-
   const composerVisible = await page
     .waitForSelector(composeSelector, { timeout: 9000 })
     .then(() => true)
     .catch(() => false);
   if (composerVisible) {
-    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage, u);
-    return { ok: true, recoveryClicked: clickedProfileMessage };
+    logger.log('[compose-recovery] technical error recovery: profile composer already visible');
+    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible', u);
+    return { ok: true, recoveryClicked: 'profile-composer-visible' };
+  }
+
+  const clickedProfileMessage = await clickExactProfileCta(['message', 'send message', 'chat', 'send a message', 'start a chat']);
+  if (clickedProfileMessage) {
+    logger.log(`[compose-recovery] technical error recovery: ${clickedProfileMessage}`);
+    await delay(2200);
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
   }
 
   const composerVisibleAfterMessage = await page
@@ -547,8 +521,8 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     .then(() => true)
     .catch(() => false);
   if (composerVisibleAfterMessage) {
-    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage, u);
-    return { ok: true, recoveryClicked: clickedProfileMessage };
+    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-cta', u);
+    return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-cta' };
   }
 
   return {
