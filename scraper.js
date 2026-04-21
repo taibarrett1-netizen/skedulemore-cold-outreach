@@ -1096,6 +1096,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
     let stuckModalCount = 0;
     let loopIter = 0;
+    let exhaustedConfirmCount = 0;
 
     while (true) {
       loopIter++;
@@ -1334,6 +1335,27 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       if (!loadedMoreThisIter && exhaustedThisIter) {
+        exhaustedConfirmCount++;
+        const belowTarget = !!effectiveMax && newInsertsTotal < effectiveMax;
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Exhaustion signal ${exhaustedConfirmCount}/3 (belowTarget=${belowTarget} total=${newInsertsTotal}${effectiveMax ? `/${effectiveMax}` : ''})`
+        );
+        if (belowTarget && exhaustedConfirmCount < 3) {
+          const refreshed = await maybeRefreshInstagramListModal(
+            page,
+            cleanTarget,
+            listKind,
+            logger,
+            `exhausted_confirm=${exhaustedConfirmCount}`
+          );
+          if (refreshed) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(3500, 8000));
+            continue;
+          }
+          await delay(randomDelay(1800, 3500));
+          continue;
+        }
         logger.log('[Scraper] Followers/following modal appears exhausted after bottom-push load checks.');
         if (hadNoNewThisIter) noNewCount++;
         break;
@@ -1406,6 +1428,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         );
         break;
       }
+      if (loadedMoreThisIter || anyScrollThisIter) exhaustedConfirmCount = 0;
       logger.log(
         `[Scraper][Loop ${loopIter}] End: hadNoNew=${hadNoNewThisIter} noNew=${noNewCount}/${MAX_NO_NEW} anyScroll=${anyScrollThisIter} loadedMore=${loadedMoreThisIter} exhausted=${exhaustedThisIter} stuckModalCount=${stuckModalCount} retryLoadHit=${weGotMoreFromWaitRetry}`
       );
@@ -1430,7 +1453,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await organicPause('between_actions', 1.5);
       logger.log('[Scraper] Post-scrape warm done.');
     } catch (e) {
-      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+      const msg = String(e?.message || e || '');
+      if (/detached frame/i.test(msg)) logger.log('[Scraper] Post-scrape warm skipped: frame detached after job completion.');
+      else logger.warn('[Scraper] Post-scrape warm skipped: ' + msg);
     }
     if (instagramSessionId && newInsertsTotal > 0) {
       await recordScraperActions(instagramSessionId, newInsertsTotal).catch(() => {});
@@ -2212,7 +2237,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await delay(5000 + Math.floor(Math.random() * 8000));
       logger.log('[Scraper] Post-scrape warm done.');
     } catch (e) {
-      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+      const msg = String(e?.message || e || '');
+      if (/detached frame/i.test(msg)) logger.log('[Scraper] Post-scrape warm skipped: frame detached after job completion.');
+      else logger.warn('[Scraper] Post-scrape warm skipped: ' + msg);
     }
 
     if (instagramSessionId && leadsInsertedTotal > 0) {
