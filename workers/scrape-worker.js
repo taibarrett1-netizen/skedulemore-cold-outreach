@@ -16,6 +16,10 @@ const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.SCRAPE_MAX_CONCURRENT || '1', 10) || 1);
+const SEND_SCRAPE_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -24,18 +28,72 @@ function delay(ms) {
 async function processOneJob(workerId, job) {
   const jobId = job.id;
   let leaseHbTimer = null;
+  let instagramSessionLeaseHbTimer = null;
+  let leasedInstagramSessionId = null;
   const hbIntervalMs = Math.min(120000, Math.max(30000, LEASE_SEC * 250));
   leaseHbTimer = setInterval(() => {
     sb.heartbeatScrapeJobLease(jobId, workerId, LEASE_SEC).catch(() => {});
   }, hbIntervalMs);
 
   try {
-    const pause = await sb.getControl(String(job.client_id)).catch(() => null);
-    if (pause === '1' || pause === 1) {
-      await sb.retryScrapeJob(job.id, 'client_paused', 3600, workerId).catch(() => {});
-      logger.warn(`[scrape-worker] client paused; deferring scrape job=${job.id} client=${job.client_id}`);
+    const activelySendableNow = await sb.canClientActivelySendNow(String(job.client_id)).catch(() => false);
+    if (activelySendableNow) {
+      await sb.retryScrapeJob(job.id, 'campaigns_active', 3600, workerId).catch(() => {});
+      logger.warn(
+        `[scrape-worker] client has an actively sendable campaign; deferring scrape job=${job.id} client=${job.client_id}`
+      );
       return false;
     }
+
+    const latestSentAtIso = await sb.getLatestSuccessfulColdDmSentAt(String(job.client_id)).catch(() => null);
+    if (latestSentAtIso) {
+      const latestSentAtMs = new Date(latestSentAtIso).getTime();
+      const cooldownRemainingMs = latestSentAtMs + SEND_SCRAPE_COOLDOWN_MS - Date.now();
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+        await sb.retryScrapeJob(job.id, 'recent_send_cooldown', Math.ceil(cooldownRemainingMs / 1000), workerId).catch(() => {});
+        logger.warn(
+          `[scrape-worker] recent send cooldown; deferring scrape job=${job.id} client=${job.client_id} wait=${Math.ceil(
+            cooldownRemainingMs / 1000
+          )}s`
+        );
+        return false;
+      }
+    }
+
+    const sessionRow = await sb.getMostRecentInstagramSessionForClient(String(job.client_id)).catch(() => null);
+    if (sessionRow?.scrape_cooldown_until) {
+      const scrapeCooldownUntilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
+      const cooldownRemainingMs = scrapeCooldownUntilMs - Date.now();
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+        await sb.retryScrapeJob(job.id, 'scrape_cooldown', Math.ceil(cooldownRemainingMs / 1000), workerId).catch(() => {});
+        logger.warn(
+          `[scrape-worker] recent scrape cooldown; deferring scrape job=${job.id} client=${job.client_id} wait=${Math.ceil(
+            cooldownRemainingMs / 1000
+          )}s`
+        );
+        return false;
+      }
+    } else if (!sessionRow?.id) {
+      await sb.retryScrapeJob(job.id, 'missing_instagram_session', 300, workerId).catch(() => {});
+      logger.warn(`[scrape-worker] no instagram session found; deferring scrape job=${job.id} client=${job.client_id}`);
+      return false;
+    }
+
+    const sessionLeaseWorkerId = `scrape-session-${workerId}`;
+    const leaseOk = await sb
+      .claimInstagramSessionLease(sessionRow.id, sessionLeaseWorkerId, LEASE_SEC)
+      .catch(() => false);
+    if (!leaseOk) {
+      await sb.retryScrapeJob(job.id, 'waiting_for_session', 60, workerId).catch(() => {});
+      logger.warn(
+        `[scrape-worker] instagram session busy; deferring scrape job=${job.id} client=${job.client_id} session=${sessionRow.id}`
+      );
+      return false;
+    }
+    leasedInstagramSessionId = sessionRow.id;
+    instagramSessionLeaseHbTimer = setInterval(() => {
+      sb.heartbeatInstagramSessionLease(sessionRow.id, sessionLeaseWorkerId, LEASE_SEC).catch(() => {});
+    }, hbIntervalMs);
 
     const scrapeType = (job.scrape_type || 'followers').toLowerCase();
     if (scrapeType !== 'followers' && scrapeType !== 'following') {
@@ -81,6 +139,10 @@ async function processOneJob(workerId, job) {
     return false;
   } finally {
     if (leaseHbTimer) clearInterval(leaseHbTimer);
+    if (instagramSessionLeaseHbTimer) clearInterval(instagramSessionLeaseHbTimer);
+    if (leasedInstagramSessionId) {
+      await sb.releaseInstagramSessionLease(leasedInstagramSessionId, `scrape-session-${workerId}`).catch(() => {});
+    }
   }
 }
 
