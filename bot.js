@@ -436,6 +436,129 @@ async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUse
   }
 }
 
+async function recoverInstagramTechnicalErrorViaProfile(page, username) {
+  if (!page) {
+    return { ok: false, reason: 'instagram_technical_error', pageSnippet: 'No page available for recovery.' };
+  }
+
+  const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
+  const u = normalizeUsername(username);
+  const profileUrl = `https://www.instagram.com/${u}/`;
+
+  const clickByText = async (texts, opts = {}) => {
+    const clicked = await page
+      .evaluate(
+        ({ usernameRaw, textsRaw, allowProfileFallback }) => {
+          const username = (usernameRaw || '').replace(/^@/, '').toLowerCase().trim();
+          const texts = Array.isArray(textsRaw) ? textsRaw.map((t) => String(t || '').toLowerCase().trim()).filter(Boolean) : [];
+          const visible = (el) => {
+            try {
+              return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+            } catch {
+              return false;
+            }
+          };
+          const textOf = (el) => ((el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
+          const clickEl = (el) => {
+            if (!el) return false;
+            const btn = el.closest('button, a, [role="button"]') || el;
+            try {
+              btn.scrollIntoView({ block: 'center' });
+            } catch {}
+            try {
+              btn.click();
+              return true;
+            } catch {
+              return false;
+            }
+          };
+
+          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]')).filter(visible);
+          const exactMatch = (t) => texts.includes(t);
+          const looseMatch = (t) =>
+            texts.some((needle) => needle && t.includes(needle));
+
+          let target = candidates.find((el) => exactMatch(textOf(el)));
+          if (!target) {
+            target = candidates.find((el) => looseMatch(textOf(el)));
+          }
+
+          if (!target && allowProfileFallback && username) {
+            target = candidates.find((el) => {
+              const t = textOf(el);
+              return t.includes(username) && (t.includes('profile') || t.includes('message'));
+            });
+          }
+
+          if (target && clickEl(target)) {
+            return { clicked: textOf(target) || 'unknown' };
+          }
+          return { clicked: null };
+        },
+        {
+          usernameRaw: u,
+          textsRaw: texts,
+          allowProfileFallback: !!opts.allowProfileFallback,
+        }
+      )
+      .catch(() => ({ clicked: null }));
+    return clicked?.clicked || null;
+  };
+
+  try {
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  } catch {
+    // If direct navigation fails, we still try the current page below.
+  }
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+  await delay(2200);
+
+  let clickedProfileMessage = await clickByText(['message', 'send message', 'chat', 'send a message', 'start a chat'], {
+    allowProfileFallback: true,
+  });
+  if (!clickedProfileMessage) {
+    clickedProfileMessage = await clickByText(['view profile', 'open profile', 'see profile', 'visit profile'], {
+      allowProfileFallback: true,
+    });
+  }
+  if (!clickedProfileMessage) {
+    return {
+      ok: false,
+      reason: 'instagram_technical_error',
+      pageSnippet: 'Could not find the profile Message button on the recovery path.',
+    };
+  }
+
+  logger.log(`[compose-recovery] technical error recovery: ${clickedProfileMessage}`);
+  await delay(2200);
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+
+  const composerVisible = await page
+    .waitForSelector(composeSelector, { timeout: 9000 })
+    .then(() => true)
+    .catch(() => false);
+  if (composerVisible) {
+    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage, u);
+    return { ok: true, recoveryClicked: clickedProfileMessage };
+  }
+
+  const composerVisibleAfterMessage = await page
+    .waitForSelector(composeSelector, { timeout: 12000 })
+    .then(() => true)
+    .catch(() => false);
+  if (composerVisibleAfterMessage) {
+    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage, u);
+    return { ok: true, recoveryClicked: clickedProfileMessage };
+  }
+
+  return {
+    ok: false,
+    reason: 'instagram_technical_error',
+    pageSnippet:
+      'Instagram shows "Something isn\'t working" in the DM pane, and the profile fallback did not restore a composer.',
+  };
+}
+
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   const u = String(username || '').trim().replace(/^@/, '');
   let url = '';
@@ -2053,12 +2176,18 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     .catch(() => false);
   if (igTechnicalError) {
     await saveComposeFailureDebugScreenshot(page, u, 'instagram_technical_error').catch(() => {});
-    return {
-      ok: false,
-      reason: 'instagram_technical_error',
-      pageSnippet:
-        "Instagram shows \"Something isn't working\" (technical error) in the DM thread pane. Pausing for support.",
-    };
+    const recovered = await recoverInstagramTechnicalErrorViaProfile(page, u);
+    if (recovered.ok) {
+      sendOpts.preferSendIcon = true;
+      logger.log(`[compose-recovery] technical error recovered for @${u}`);
+    } else {
+      return {
+        ok: false,
+        reason: 'instagram_technical_error',
+        pageSnippet:
+          "Instagram shows \"Something isn't working\" (technical error) in the DM thread pane. Pausing for support.",
+      };
+    }
   }
 
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
@@ -2993,6 +3122,80 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   let textSent = false;
   let voiceSent = false;
   let voiceFailure = null;
+  let preferSendIcon = !!(sendOpts && sendOpts.preferSendIcon === true);
+
+  const clickInstagramTextSendIcon = async () => {
+    const clicked = await page
+      .evaluate(() => {
+        const visible = (el) => {
+          try {
+            return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+          } catch {
+            return false;
+          }
+        };
+        const lower = (s) => String(s || '').toLowerCase();
+        const isNotSend = (label, title, text) => {
+          const t = `${label} ${title} ${text}`;
+          return /\blike\b|\blove\b|\bheart\b|\breact\b|\bemoji\b|\bsticker\b|\bgif\b|\bgallery\b|\bmic\b|\bmicrophone\b|\brecord\b/.test(t);
+        };
+        const candidates = Array.from(
+          document.querySelectorAll('button, [role="button"], a[role="button"], div[tabindex="0"], span[tabindex="0"], a[tabindex="0"]')
+        ).filter(visible);
+        const scored = candidates
+          .map((el) => {
+            const label = lower(el.getAttribute && el.getAttribute('aria-label'));
+            const title = lower(el.getAttribute && el.getAttribute('title'));
+            const text = lower(el.textContent || '');
+            const cls = lower(el.className || '');
+            const tid = lower(el.getAttribute && el.getAttribute('data-testid'));
+            const matches =
+              label.includes('send') ||
+              title.includes('send') ||
+              tid.includes('send') ||
+              text === 'send' ||
+              text.includes('send message') ||
+              text.includes('send');
+            if (!matches || isNotSend(label, title, text)) return null;
+            try {
+              const r = el.getBoundingClientRect();
+              if (r.width < 16 || r.height < 16) return null;
+              const inBottomRight = r.bottom > window.innerHeight - 110 && r.right > window.innerWidth - 260;
+              if (!inBottomRight) return null;
+              return { el, score: (r.right + r.bottom) + (cls.includes('send') ? 10 : 0) };
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.score - a.score);
+        if (!scored.length) return null;
+        const target = scored[0].el;
+        try {
+          target.scrollIntoView({ block: 'center', inline: 'nearest' });
+        } catch {}
+        try {
+          target.click();
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .catch(() => false);
+    return !!clicked;
+  };
+
+  const submitTypedText = async () => {
+    await humanDelay();
+    await tinyHumanMouseMove(page);
+    if (preferSendIcon && (await clickInstagramTextSendIcon())) {
+      await delay(1500);
+      return true;
+    }
+    await page.keyboard.press('Enter');
+    await delay(1500);
+    return true;
+  };
 
   const attemptVoiceSend = async () => {
     if (!shouldSendVoice) return;
@@ -3004,6 +3207,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return;
     }
     try {
+      logger.log(
+        `Voice note flow: preparing mic UI for @${u}` +
+          (sendOpts.preferSendIcon ? ' (profile recovery / send-icon path)' : '')
+      );
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         voiceFailure = prep.reason || 'voice_mic_not_found';
@@ -3053,20 +3260,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return null;
     });
     const compose = composeEl.asElement();
-  if (compose && shouldSendText) {
-    await delay(500);
-    await tinyHumanMouseMove(page);
-    await compose.click();
-    await saveComposeTypingDebugScreenshot(page, u);
+    if (compose && shouldSendText) {
+      await delay(500);
+      await tinyHumanMouseMove(page);
+      await compose.click();
+      await saveComposeTypingDebugScreenshot(page, u);
     await typeInstagramDmPlainTextInComposer(page, compose, msg, {
       delay: 60 + Math.floor(Math.random() * 40),
     });
     await compose.dispose();
     await composeEl.dispose();
-    await humanDelay();
-    await tinyHumanMouseMove(page);
-    await page.keyboard.press('Enter');
-    await delay(1500);
+    await submitTypedText();
     await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
     } else if (compose) {
@@ -3103,10 +3307,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await delay(300);
     await saveComposeTypingDebugScreenshot(page, u);
     await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
-    await humanDelay();
-    await tinyHumanMouseMove(page);
-    await page.keyboard.press('Enter');
-    await delay(1500);
+    await submitTypedText();
     await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
     await attemptVoiceSend();
