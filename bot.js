@@ -625,52 +625,6 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   logger.log(`[compose-recovery] technical error fallback start for @${u} from ${page.url()}`);
   await saveTechnicalRecoveryDebugSnapshot(page, u, 'start').catch(() => {});
 
-  const clickExactProfileCta = async (texts) => {
-    const clicked = await page
-      .evaluate(
-        ({ textsRaw }) => {
-          const texts = Array.isArray(textsRaw) ? textsRaw.map((t) => String(t || '').toLowerCase().trim()).filter(Boolean) : [];
-          const visible = (el) => {
-            try {
-              return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
-            } catch {
-              return false;
-            }
-          };
-          const textOf = (el) => ((el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
-          const clickEl = (el) => {
-            if (!el) return false;
-            const btn = el.closest('button, a, [role="button"]') || el;
-            try {
-              btn.scrollIntoView({ block: 'center' });
-            } catch {}
-            try {
-              btn.click();
-              return true;
-            } catch {
-              return false;
-            }
-          };
-
-          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]')).filter(visible);
-          const target = candidates.find((el) => {
-            const t = textOf(el);
-            return texts.includes(t);
-          });
-
-          if (target && clickEl(target)) {
-            return { clicked: textOf(target) || 'unknown' };
-          }
-          return { clicked: null };
-        },
-        {
-          textsRaw: texts,
-        }
-      )
-      .catch(() => ({ clicked: null }));
-    return clicked?.clicked || null;
-  };
-
   const profileComposerVisible = async () => {
     return page
       .evaluate(() => {
@@ -744,28 +698,28 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
     return { ok: true, recoveryClicked: 'profile-composer-visible' };
   }
 
-  const clickedProfileMessage = await clickExactProfileCta(['message', 'send message', 'chat', 'send a message', 'start a chat']);
-  logger.log(`[compose-recovery] profile CTA click result for @${u}: ${clickedProfileMessage || 'none'}`);
-  if (clickedProfileMessage) {
-    logger.log(`[compose-recovery] technical error recovery: ${clickedProfileMessage}`);
-    await delay(2200);
-    await dismissInstagramHomeModals(page, logger).catch(() => {});
-    await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_cta').catch(() => {});
-  }
+  // Do not click the profile header row "Message" CTA: many profiles omit it while the DM pane composer still works.
+  logger.log(
+    `[compose-recovery] profile CTA click result for @${u}: skipped_row_message_cta (relying on corner/thread composer only)`
+  );
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_skip_profile_message_cta').catch(() => {});
+  await delay(2200);
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_settle_no_row_cta').catch(() => {});
 
   const composerVisibleAfterMessage = await profileComposerVisible();
-  logger.log(`[compose-recovery] composer visible after CTA for @${u}: ${composerVisibleAfterMessage}`);
+  logger.log(`[compose-recovery] composer visible after settle (no row CTA) for @${u}: ${composerVisibleAfterMessage}`);
   if (composerVisibleAfterMessage) {
-    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-cta', u);
-    return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-cta' };
+    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-settle', u);
+    return { ok: true, recoveryClicked: 'profile-composer-visible-after-settle' };
   }
 
   await delay(1200);
   const composerVisibleAfterWait = await profileComposerVisible();
   logger.log(`[compose-recovery] composer visible after settle wait for @${u}: ${composerVisibleAfterWait}`);
   if (composerVisibleAfterWait) {
-    await saveAfterComposeRecoveryScreenshot(page, clickedProfileMessage || 'profile-composer-visible-after-wait', u);
-    return { ok: true, recoveryClicked: clickedProfileMessage || 'profile-composer-visible-after-wait' };
+    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-wait', u);
+    return { ok: true, recoveryClicked: 'profile-composer-visible-after-wait' };
   }
 
   await saveTechnicalRecoveryDebugSnapshot(page, u, 'final_failure').catch(() => {});
