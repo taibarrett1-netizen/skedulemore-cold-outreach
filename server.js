@@ -527,6 +527,25 @@ const STATUS_SLOW_COMPONENT_LOG_MS = Math.max(
   250,
   parseInt(process.env.STATUS_SLOW_COMPONENT_LOG_MS || '1200', 10) || 1200
 );
+const STATUS_CACHE_TTL_MS = Math.max(
+  1000,
+  parseInt(process.env.STATUS_CACHE_TTL_MS || '12000', 10) || 12000
+);
+const STATUS_CACHE_STALE_MAX_MS = Math.max(
+  STATUS_CACHE_TTL_MS,
+  parseInt(process.env.STATUS_CACHE_STALE_MAX_MS || '120000', 10) || 120000
+);
+const PM2_STATUS_CACHE_TTL_MS = Math.max(
+  1000,
+  parseInt(process.env.PM2_STATUS_CACHE_TTL_MS || '15000', 10) || 15000
+);
+
+const statusCacheByKey = new Map();
+const pm2RunningCache = {
+  value: false,
+  updatedAt: 0,
+  inFlight: null,
+};
 
 function timeoutAfter(ms, label) {
   return new Promise((_, reject) => {
@@ -555,6 +574,119 @@ async function settleStatusComponent(label, promise, fallbackValue) {
   }
 }
 
+function getStatusCacheKey(useSupabase, clientId) {
+  if (useSupabase && clientId) return `sb:${clientId}`;
+  return 'local';
+}
+
+async function getBotProcessRunningCached() {
+  const now = Date.now();
+  if (now - pm2RunningCache.updatedAt <= PM2_STATUS_CACHE_TTL_MS) {
+    return pm2RunningCache.value;
+  }
+  if (pm2RunningCache.inFlight) {
+    return pm2RunningCache.inFlight;
+  }
+  pm2RunningCache.inFlight = new Promise((resolve) => getBotProcessRunning(resolve))
+    .then((v) => {
+      pm2RunningCache.value = !!v;
+      pm2RunningCache.updatedAt = Date.now();
+      return pm2RunningCache.value;
+    })
+    .catch(() => {
+      pm2RunningCache.updatedAt = Date.now();
+      return pm2RunningCache.value;
+    })
+    .finally(() => {
+      pm2RunningCache.inFlight = null;
+    });
+  return pm2RunningCache.inFlight;
+}
+
+async function buildStatusPayload({ useSupabase, clientId, requestStartedAt }) {
+  if (useSupabase) {
+    const [processRunningPm2Res, statsRes, statusMessageRes, leadsCountsRes, pauseFlagRes] =
+      await Promise.all([
+        settleStatusComponent('pm2_running', getBotProcessRunningCached(), false),
+        settleStatusComponent('daily_stats', getDailyStatsSupabase(clientId), {
+          total_sent: 0,
+          total_failed: 0,
+        }),
+        settleStatusComponent('status_message', getClientStatusMessageSupabase(clientId), null),
+        settleStatusComponent('lead_counts', getLeadsTotalAndRemaining(clientId), {
+          total: 0,
+          remaining: 0,
+        }),
+        settleStatusComponent('control_pause', getControlSupabase(clientId), '1'),
+      ]);
+
+    const paused = pauseFlagRes.value === '1' || pauseFlagRes.value === 1;
+    const processRunning = processRunningPm2Res.value && !paused;
+    const degraded =
+      !processRunningPm2Res.ok ||
+      !statsRes.ok ||
+      !statusMessageRes.ok ||
+      !leadsCountsRes.ok ||
+      !pauseFlagRes.ok;
+
+    if (degraded) {
+      const failedLabels = [
+        !processRunningPm2Res.ok ? 'pm2_running' : null,
+        !statsRes.ok ? 'daily_stats' : null,
+        !statusMessageRes.ok ? 'status_message' : null,
+        !leadsCountsRes.ok ? 'lead_counts' : null,
+        !pauseFlagRes.ok ? 'control_pause' : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      console.warn(
+        `[API] /api/status degraded response for client=${clientId} after ${Date.now() - requestStartedAt}ms; failed=${failedLabels}`
+      );
+    } else if (Date.now() - requestStartedAt >= STATUS_TIMEOUT_MS) {
+      console.warn(
+        `[API] /api/status exceeded target timeout (${Date.now() - requestStartedAt}ms) without failure`
+      );
+    }
+
+    return {
+      processRunning,
+      statusMessage: statusMessageRes.value ?? (processRunning ? null : 'Stopped'),
+      todaySent: statsRes.value.total_sent ?? 0,
+      todayFailed: statsRes.value.total_failed ?? 0,
+      leadsTotal: leadsCountsRes.value.total ?? 0,
+      leadsRemaining: leadsCountsRes.value.remaining ?? 0,
+      statusDegraded: degraded,
+    };
+  }
+
+  const processRunningRes = await settleStatusComponent('pm2_running', getBotProcessRunningCached(), false);
+  const stats = getDailyStats();
+  const leadsRes = await settleStatusComponent('csv_leads', loadLeadsFromCSV(leadsPath), []);
+  const leads = Array.isArray(leadsRes.value) ? leadsRes.value : [];
+  const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+  const degraded = !processRunningRes.ok || !leadsRes.ok;
+  return {
+    processRunning: processRunningRes.value,
+    todaySent: stats.total_sent,
+    todayFailed: stats.total_failed,
+    leadsTotal: leads.length,
+    leadsRemaining,
+    statusDegraded: degraded,
+  };
+}
+
+function readCachedStatus(cacheKey) {
+  const entry = statusCacheByKey.get(cacheKey);
+  if (!entry || !entry.payload || !entry.updatedAt) return null;
+  const ageMs = Date.now() - entry.updatedAt;
+  return {
+    entry,
+    ageMs,
+    isFresh: ageMs <= STATUS_CACHE_TTL_MS,
+    isWithinStaleWindow: ageMs <= STATUS_CACHE_STALE_MAX_MS,
+  };
+}
+
 // --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
@@ -569,86 +701,66 @@ app.get('/api/status', async (req, res) => {
   }
   const useSupabase = isSupabaseConfigured() && clientId;
   const requestStartedAt = Date.now();
+  const cacheKey = getStatusCacheKey(useSupabase, clientId);
+  const cached = readCachedStatus(cacheKey);
+
+  if (cached?.isFresh) {
+    return res.status(200).json({
+      ...cached.entry.payload,
+      statusCached: true,
+      statusCacheAgeMs: cached.ageMs,
+    });
+  }
 
   try {
-    if (useSupabase) {
-      const [processRunningPm2Res, statsRes, statusMessageRes, leadsCountsRes, pauseFlagRes] =
-        await Promise.all([
-          settleStatusComponent(
-            'pm2_running',
-            new Promise((resolve) => getBotProcessRunning(resolve)),
-            false
-          ),
-          settleStatusComponent('daily_stats', getDailyStatsSupabase(clientId), {
-            total_sent: 0,
-            total_failed: 0,
-          }),
-          settleStatusComponent('status_message', getClientStatusMessageSupabase(clientId), null),
-          settleStatusComponent('lead_counts', getLeadsTotalAndRemaining(clientId), {
-            total: 0,
-            remaining: 0,
-          }),
-          settleStatusComponent('control_pause', getControlSupabase(clientId), '1'),
-        ]);
+    let cacheEntry = statusCacheByKey.get(cacheKey);
+    if (!cacheEntry) {
+      cacheEntry = { payload: null, updatedAt: 0, inFlight: null };
+      statusCacheByKey.set(cacheKey, cacheEntry);
+    }
 
-      const paused = pauseFlagRes.value === '1' || pauseFlagRes.value === 1;
-      const processRunning = processRunningPm2Res.value && !paused;
-      const degraded =
-        !processRunningPm2Res.ok ||
-        !statsRes.ok ||
-        !statusMessageRes.ok ||
-        !leadsCountsRes.ok ||
-        !pauseFlagRes.ok;
+    if (!cacheEntry.inFlight) {
+      cacheEntry.inFlight = buildStatusPayload({ useSupabase, clientId, requestStartedAt })
+        .then((payload) => {
+          cacheEntry.payload = payload;
+          cacheEntry.updatedAt = Date.now();
+          return payload;
+        })
+        .finally(() => {
+          cacheEntry.inFlight = null;
+        });
+    }
 
-      if (degraded) {
-        const failedLabels = [
-          !processRunningPm2Res.ok ? 'pm2_running' : null,
-          !statsRes.ok ? 'daily_stats' : null,
-          !statusMessageRes.ok ? 'status_message' : null,
-          !leadsCountsRes.ok ? 'lead_counts' : null,
-          !pauseFlagRes.ok ? 'control_pause' : null,
-        ]
-          .filter(Boolean)
-          .join(', ');
-        console.warn(
-          `[API] /api/status degraded response for client=${clientId} after ${Date.now() - requestStartedAt}ms; failed=${failedLabels}`
-        );
-      } else if (Date.now() - requestStartedAt >= STATUS_TIMEOUT_MS) {
-        console.warn(
-          `[API] /api/status exceeded target timeout (${Date.now() - requestStartedAt}ms) without failure`
-        );
-      }
-
+    // Serve stale quickly while a refresh is happening; avoids hammering pm2/supabase under load.
+    if (cached?.isWithinStaleWindow && cacheEntry.inFlight) {
       return res.status(200).json({
-        processRunning,
-        statusMessage: statusMessageRes.value ?? (processRunning ? null : 'Stopped'),
-        todaySent: statsRes.value.total_sent ?? 0,
-        todayFailed: statsRes.value.total_failed ?? 0,
-        leadsTotal: leadsCountsRes.value.total ?? 0,
-        leadsRemaining: leadsCountsRes.value.remaining ?? 0,
-        statusDegraded: degraded,
+        ...cached.entry.payload,
+        statusCached: true,
+        statusStale: true,
+        statusCacheAgeMs: cached.ageMs,
       });
     }
 
-    const processRunningRes = await settleStatusComponent(
-      'pm2_running',
-      new Promise((resolve) => getBotProcessRunning(resolve)),
-      false
-    );
-    const stats = getDailyStats();
-    const leadsRes = await settleStatusComponent('csv_leads', loadLeadsFromCSV(leadsPath), []);
-    const leads = Array.isArray(leadsRes.value) ? leadsRes.value : [];
-    const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-    const degraded = !processRunningRes.ok || !leadsRes.ok;
+    const payload = await cacheEntry.inFlight;
     return res.status(200).json({
-      processRunning: processRunningRes.value,
-      todaySent: stats.total_sent,
-      todayFailed: stats.total_failed,
-      leadsTotal: leads.length,
-      leadsRemaining,
-      statusDegraded: degraded,
+      ...payload,
+      statusCached: false,
+      statusCacheAgeMs: 0,
     });
   } catch (e) {
+    const fallback = readCachedStatus(cacheKey);
+    if (fallback?.isWithinStaleWindow) {
+      console.warn(
+        `[API] /api/status using stale cache after refresh error (${e?.message || e}); age=${fallback.ageMs}ms`
+      );
+      return res.status(200).json({
+        ...fallback.entry.payload,
+        statusCached: true,
+        statusStale: true,
+        statusCacheAgeMs: fallback.ageMs,
+        statusDegraded: true,
+      });
+    }
     console.error('[API] Status error', e);
     return res.status(500).json({ error: e.message });
   }
