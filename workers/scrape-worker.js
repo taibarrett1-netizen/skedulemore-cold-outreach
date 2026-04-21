@@ -67,11 +67,12 @@ async function processOneJob(workerId, job) {
     if (sessionRow?.scrape_cooldown_until) {
       const scrapeCooldownUntilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
       const cooldownRemainingMs = scrapeCooldownUntilMs - Date.now();
-      const claimedThisSession = !!jobSessionId && sessionRow.id === jobSessionId;
-      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0 && !claimedThisSession) {
-        await sb.retryScrapeJob(job.id, 'scrape_cooldown', Math.ceil(cooldownRemainingMs / 1000), workerId).catch(() => {});
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+        await sb
+          .retryScrapeJob(job.id, 'scrape_cooldown', Math.ceil(cooldownRemainingMs / 1000), workerId)
+          .catch(() => {});
         logger.warn(
-          `[scrape-worker] recent scrape cooldown; deferring scrape job=${job.id} client=${job.client_id} wait=${Math.ceil(
+          `[scrape-worker] session ${sessionRow.id} in scrape cooldown; deferring job=${job.id} client=${job.client_id} wait=${Math.ceil(
             cooldownRemainingMs / 1000
           )}s`
         );

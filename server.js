@@ -1721,6 +1721,37 @@ app.post('/api/scraper/start', async (req, res) => {
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
     const boundedMax = requestedMaxLeads != null && requestedMaxLeads > 0 ? Math.min(requestedMaxLeads, quota.remaining) : quota.remaining;
     const effectiveMaxLeads = boundedMax > 0 ? boundedMax : null;
+
+    // Final cooldown re-check right before queueing — closes the race window where a DM
+    // finished (and set scrape_cooldown_until on the session) between our earlier read and
+    // this call. If still in cooldown, refuse loudly so the UI can toast.
+    const freshSessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+    if (freshSessionRow?.scrape_cooldown_until) {
+      const untilMs = new Date(freshSessionRow.scrape_cooldown_until).getTime();
+      if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+        const waitMs = untilMs - Date.now();
+        return res.status(400).json({
+          ok: false,
+          code: 'scrape_cooldown',
+          error: `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
+          scrapeCooldownUntil: freshSessionRow.scrape_cooldown_until,
+        });
+      }
+    }
+    const freshLatestSentAtIso = await getLatestSuccessfulColdDmSentAt(clientId).catch(() => null);
+    if (freshLatestSentAtIso) {
+      const freshLatestSentAtMs = new Date(freshLatestSentAtIso).getTime();
+      const freshCooldownRemainingMs = freshLatestSentAtMs + SEND_SCRAPE_COOLDOWN_MS - Date.now();
+      if (Number.isFinite(freshCooldownRemainingMs) && freshCooldownRemainingMs > 0) {
+        return res.status(400).json({
+          ok: false,
+          code: 'recent_send_cooldown',
+          error: `Account safety cooldown active after sending. Try scraping again in ${formatDurationShort(freshCooldownRemainingMs)}.`,
+          cooldownUntil: new Date(freshLatestSentAtMs + SEND_SCRAPE_COOLDOWN_MS).toISOString(),
+        });
+      }
+    }
+
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
@@ -1728,7 +1759,7 @@ app.post('/api/scraper/start', async (req, res) => {
       scrapeType,
       null,
       null, // legacy platformScraperSessionId (unused for per-client puppeteer scrape)
-      sessionRow.id,
+      (freshSessionRow && freshSessionRow.id) || sessionRow.id,
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
       'puppeteer'
     );

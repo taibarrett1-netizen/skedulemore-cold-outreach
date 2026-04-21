@@ -5518,15 +5518,27 @@ async function runBotMultiTenant() {
       return null;
     });
     if (!session) {
-      logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
       const waitingReason =
         (await sb.getWaitingInstagramSessionReason(clientId, work.campaignId).catch(() => null)) ||
         'Waiting for an available Instagram session…';
+      const isDailyCapWait = /daily limit/i.test(waitingReason);
+      throttleSendLimitLog(
+        isDailyCapWait
+          ? `waiting_session:daily_cap:${work.campaignId}`
+          : `waiting_session:${work.campaignId}`,
+        () => {
+          if (isDailyCapWait) {
+            logger.log(`[send-worker] ${waitingReason}`);
+          } else {
+            logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
+          }
+        }
+      );
       await sb.setClientStatusMessage(clientId, waitingReason).catch(() => {});
       await sb.updateSendJob(claimedJob.id, {
         status: 'retry',
         available_at: new Date(Date.now() + randomDelay(15, 45) * 1000).toISOString(),
-        last_error_class: 'waiting_for_session',
+        last_error_class: isDailyCapWait ? 'account_daily_limit' : 'waiting_for_session',
         last_error_message: waitingReason,
       }, SEND_WORKER_ID).catch(() => {});
       await releaseClaimedCampaignLease(claimedJob.campaign_id);

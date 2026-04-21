@@ -851,6 +851,22 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
   return false;
 }
 
+const CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS = Math.max(
+  1000,
+  parseInt(process.env.CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS || '60000', 10) || 60000
+);
+const campaignSessionClaimLogLast = new Map();
+
+function throttleCampaignSessionClaimLog(key, fingerprint, emit) {
+  const now = Date.now();
+  const prev = campaignSessionClaimLogLast.get(key);
+  if (prev && prev.fingerprint === fingerprint && now - prev.at < CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS) {
+    return;
+  }
+  campaignSessionClaimLogLast.set(key, { fingerprint, at: now });
+  emit();
+}
+
 async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, leaseSeconds = 600) {
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
@@ -877,11 +893,13 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
     });
     const dailyLimit = getInstagramSessionDailyLimit(candidate);
     if (usage && usage.totalSent >= dailyLimit) {
-      console.log(
-        `[claimInstagramSessionForCampaign] skip session ${candidate.id} at cap ` +
-          `client=${clientId} total=${usage.totalSent}/${dailyLimit} ` +
-          `sentMessages=${usage.sentMessagesTotal ?? '?'} jobsCompleted=${usage.jobsCompleted ?? '?'} followUpsSent=${usage.followUpsSent ?? '?'}`
-      );
+      const fingerprint = `${usage.totalSent}/${dailyLimit}:${usage.sentMessagesTotal ?? '?'}:${usage.jobsCompleted ?? '?'}:${usage.followUpsSent ?? '?'}`;
+      throttleCampaignSessionClaimLog(`cap:${clientId}:${candidate.id}`, fingerprint, () => {
+        console.log(
+          `[cold-dm] session ${candidate.id} at daily cap — client=${clientId} ${usage.totalSent}/${dailyLimit} ` +
+            `(cold=${usage.sentMessagesTotal ?? usage.jobsCompleted ?? '?'} follow-ups=${usage.followUpsSent ?? '?'}). Waiting for timezone reset.`
+        );
+      });
       continue;
     }
     const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
