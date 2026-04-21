@@ -38,11 +38,14 @@ const {
 } = require('./utils/instagram-modals');
 const {
   clickElementNaturally,
+  chance,
+  idleMouseDrift,
   maybeLightStoryInteraction,
   moveMouseToElement,
   naturalScrollPage,
   organicPause,
   randomMouseDrift,
+  viewStoriesNaturally,
 } = require('./utils/human-interaction');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
@@ -122,12 +125,9 @@ puppeteer.use(StealthPlugin());
 
 const SCRAPE_DELAY_MIN_MS = 2000;
 const SCRAPE_DELAY_MAX_MS = 5000;
-const SCROLL_PAUSE_MS = 1500;
 const LOAD_WAIT_MS = 4000;
 const LOAD_WAIT_RETRIES = 3;
-const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
-const SCROLL_CHUNK_DELAY_MS = 600;
 const SCRAPE_SESSION_COOLDOWN_MS = Math.max(
   60 * 1000,
   parseInt(process.env.SCRAPE_SESSION_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
@@ -282,6 +282,159 @@ async function getInstagramListScrollTargetHandle(page) {
   });
 }
 
+async function tryOpenProfileList(page, target, kind) {
+  return page.evaluate((targetUsername, listKind) => {
+    const lower = (s) => (s || '').toLowerCase();
+    const wantFollowing = listKind === 'following';
+
+    const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
+    const picked = links.find((a) => {
+      const href = lower(a.getAttribute('href') || '');
+      if (wantFollowing) {
+        return href.includes(`/${targetUsername}/following`) || (href.includes('/following') && !href.includes('/followers'));
+      }
+      return href.includes(`/${targetUsername}/followers`) || (href.includes('/followers') && !href.includes('/following'));
+    });
+    if (picked) {
+      picked.click();
+      return true;
+    }
+
+    const candidates = Array.from(document.querySelectorAll('a, span, div, button, [role="button"]'));
+    const needle = wantFollowing ? 'following' : 'followers';
+    const statsLike = candidates.find((el) => {
+      const text = (el.textContent || '').trim();
+      const l = lower(text);
+      return l.includes(needle) && /\d/.test(text);
+    });
+    if (statsLike) {
+      const clickable = statsLike.closest('a, button, [role="button"]') || statsLike;
+      if (clickable && clickable instanceof HTMLElement) {
+        clickable.click();
+        return true;
+      }
+    }
+
+    const roleButtons = Array.from(document.querySelectorAll('[role="button"], button, a'));
+    for (const btn of roleButtons) {
+      const t = lower(btn.textContent || '');
+      if (wantFollowing) {
+        if (t.includes('following') || /\d+\s*following/.test(t)) {
+          btn.click();
+          return true;
+        }
+      } else if (t.includes('followers') || /\d+\s*followers/.test(t)) {
+        btn.click();
+        return true;
+      }
+    }
+
+    return false;
+  }, target, kind);
+}
+
+async function getInstagramListModalSnapshot(page) {
+  return page.evaluate(() => {
+    function countProfileLinks(el) {
+      let c = 0;
+      for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+        const href = (a.getAttribute('href') || '').trim();
+        const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) || href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+        if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+      }
+      return c;
+    }
+
+    let dialog = null;
+    let bestCount = 0;
+    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+      const count = countProfileLinks(d);
+      if (count > bestCount && count >= 5) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (bestCount < 5) {
+      for (const d of document.querySelectorAll('div')) {
+        if (d.clientHeight < 80) continue;
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 10) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) return null;
+
+    let scrollTarget = null;
+    let bestScore = -1;
+    for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
+      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
+      if (!hasOverflow || el.clientHeight <= 80) continue;
+      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      if (score > bestScore) {
+        bestScore = score;
+        scrollTarget = el;
+      }
+    }
+
+    const target = scrollTarget || dialog;
+    return {
+      scrollTop: Math.round(target.scrollTop || 0),
+      remaining: Math.max(0, Math.round((target.scrollHeight || 0) - (target.clientHeight || 0) - (target.scrollTop || 0))),
+      linkCount: countProfileLinks(target),
+    };
+  }).catch(() => null);
+}
+
+async function getVisibleInstagramListUsernameHandles(page, scrollTargetHandle, limit = 4) {
+  if (!scrollTargetHandle) return [];
+  const anchors = await scrollTargetHandle.$$('a[href^="/"], a[href*="instagram.com/"]').catch(() => []);
+  const picked = [];
+  const seen = new Set();
+  try {
+    for (const anchor of anchors) {
+      const href = await anchor.evaluate((el) => el.getAttribute('href') || '').catch(() => '');
+      const match =
+        href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
+        href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+      const username = (match && match[1] ? match[1] : '').toLowerCase();
+      if (!username || seen.has(username)) {
+        await anchor.dispose().catch(() => {});
+        continue;
+      }
+      const box = await anchor.boundingBox().catch(() => null);
+      if (!box || box.width < 8 || box.height < 8 || box.y < 0 || box.y > 760) {
+        await anchor.dispose().catch(() => {});
+        continue;
+      }
+      seen.add(username);
+      picked.push(anchor);
+      if (picked.length >= limit) break;
+    }
+  } finally {
+    for (const anchor of anchors) {
+      if (!picked.includes(anchor)) await anchor.dispose().catch(() => {});
+    }
+  }
+  return picked;
+}
+
+async function maybeHoverVisibleInstagramUsernames(page, scrollTargetHandle, opts = {}) {
+  if (!scrollTargetHandle || Math.random() >= (opts.probability ?? 0.35)) return false;
+  const handles = await getVisibleInstagramListUsernameHandles(page, scrollTargetHandle, randomDelay(2, 4));
+  if (!handles.length) return false;
+  try {
+    for (const handle of handles) {
+      await moveMouseToElement(page, handle, { totalDurationMs: randomDelay(320, 900) }).catch(() => {});
+      await delay(randomDelay(1200, 3600));
+    }
+    return true;
+  } finally {
+    for (const handle of handles) await handle.dispose().catch(() => {});
+  }
+}
+
 async function humanScrollInstagramListModal(page, opts = {}) {
   if (!page) return false;
   const targetHandleRef = await getInstagramListScrollTargetHandle(page).catch(() => null);
@@ -292,29 +445,208 @@ async function humanScrollInstagramListModal(page, opts = {}) {
   }
   try {
     const beforeTop = await targetHandle.evaluate((el) => el.scrollTop).catch(() => 0);
-    await moveMouseToElement(page, targetHandle, { totalDurationMs: randomDelay(180, 360) }).catch(() => {});
-    await clickElementNaturally(page, targetHandle, { totalDurationMs: randomDelay(180, 360) }).catch(() => {});
+    await moveMouseToElement(page, targetHandle, { totalDurationMs: randomDelay(220, 560) }).catch(() => {});
+    if (Math.random() < 0.3) {
+      await clickElementNaturally(page, targetHandle, { totalDurationMs: randomDelay(180, 360) }).catch(() => {});
+    }
+    if (Math.random() < 0.45) {
+      await randomMouseDrift(page, { totalDurationMs: randomDelay(320, 880) }).catch(() => {});
+    }
+    await maybeHoverVisibleInstagramUsernames(page, targetHandle, { probability: 0.42 }).catch(() => {});
     const rounds = Math.max(1, opts.rounds || randomDelay(2, 4));
+    let moved = false;
     for (let i = 0; i < rounds; i++) {
-      const deltaY = randomDelay(180, 430);
-      if (page.mouse?.wheel) {
-        await page.mouse.wheel({ deltaY }).catch(() => {});
-      }
-      await organicPause('scroll', 0.7);
-      if (Math.random() < 0.2) {
-        const reverseDelta = -Math.round(deltaY * (0.15 + Math.random() * 0.18));
-        if (page.mouse?.wheel) {
-          await page.mouse.wheel({ deltaY: reverseDelta }).catch(() => {});
+      const stepResult = await targetHandle.evaluate(
+        async (el, config) => {
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          let didMove = false;
+          for (let step = 0; step < config.steps; step++) {
+            const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+            if (maxScroll <= 0) break;
+            const remaining = Math.max(0, maxScroll - el.scrollTop);
+            if (remaining <= 3) break;
+            const prev = el.scrollTop;
+            const delta = Math.min(remaining, config.baseStep + Math.round(Math.random() * config.stepVariance));
+            el.scrollTop = Math.min(maxScroll, prev + delta);
+            if (Math.abs(el.scrollTop - prev) > 1) didMove = true;
+            await sleep(config.stepPauseMin + Math.round(Math.random() * (config.stepPauseMax - config.stepPauseMin)));
+          }
+          return { didMove, top: Math.round(el.scrollTop || 0) };
+        },
+        {
+          steps: randomDelay(5, 10),
+          baseStep: randomDelay(90, 180),
+          stepVariance: randomDelay(30, 110),
+          stepPauseMin: 140,
+          stepPauseMax: 360,
         }
-        await organicPause('micro');
+      ).catch(() => ({ didMove: false, top: beforeTop }));
+      if (stepResult.didMove) moved = true;
+      if (Math.random() < 0.25) {
+        await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 720) }).catch(() => {});
       }
+      await maybeHoverVisibleInstagramUsernames(page, targetHandle, { probability: 0.25 }).catch(() => {});
+      await organicPause('scroll', 0.8);
     }
     const afterTop = await targetHandle.evaluate((el) => el.scrollTop).catch(() => beforeTop);
-    return Math.abs(afterTop - beforeTop) > 2;
+    return moved || Math.abs(afterTop - beforeTop) > 2;
   } finally {
     await targetHandle.dispose().catch(() => {});
     await targetHandleRef.dispose().catch(() => {});
   }
+}
+
+async function closeInstagramListModal(page) {
+  const closeHandle = await page
+    .$([
+      '[role="dialog"] button[aria-label="Close"]',
+      '[role="dialog"] svg[aria-label="Close"]',
+      '[role="dialog"] [role="button"][aria-label*="close" i]',
+    ].join(', '))
+    .catch(() => null);
+  if (closeHandle) {
+    try {
+      await clickElementNaturally(page, closeHandle, { totalDurationMs: randomDelay(220, 520) }).catch(() => {});
+      await delay(randomDelay(900, 2200));
+      return true;
+    } finally {
+      await closeHandle.dispose().catch(() => {});
+    }
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+  await delay(randomDelay(900, 2200));
+  return true;
+}
+
+async function maybeRefreshInstagramListModal(page, cleanTarget, listKind, logger, reason) {
+  if (!chance(0.6)) return false;
+  logger.log(`[Scraper] Refreshing ${listKind} modal after stall: ${reason}`);
+  await closeInstagramListModal(page).catch(() => {});
+  await delay(randomDelay(5000, 11000));
+  await dismissInstagramPopups(page, logger).catch(() => {});
+  const reopened = await tryOpenProfileList(page, cleanTarget, listKind).catch(() => false);
+  if (!reopened) return false;
+  await delay(randomDelay(4000, 9000));
+  await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
+  return true;
+}
+
+async function runScrapeWarmupPattern(page, patternName) {
+  if (patternName === 'stories-first') {
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 620) });
+    await maybeLightStoryInteraction(page, { openChance: 0.18 }).catch(() => {});
+    await organicPause('between_actions', 1.9);
+    await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.85 });
+    await organicPause('between_actions', 1.4);
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 540) });
+    return;
+  }
+
+  if (patternName === 'idle-heavy') {
+    await idleMouseDrift(page, { durationMs: randomDelay(9000, 18000) }).catch(() => {});
+    await naturalScrollPage(page, { rounds: randomDelay(1, 3), pauseMultiplier: 0.75 });
+    if (Math.random() < 0.45) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 });
+    }
+    await maybeLightStoryInteraction(page, { openChance: 0.1 }).catch(() => {});
+    return;
+  }
+
+  await organicPause('between_actions', 1.6);
+  for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 420) });
+    await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.9 });
+    if (Math.random() < 0.35) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.6 });
+    }
+    await maybeLightStoryInteraction(page, { openChance: 0.12 }).catch(() => {});
+    await organicPause('between_actions', 1.8);
+  }
+}
+
+async function getVisibleHandles(page, selector, limit) {
+  const handles = await page.$$(selector).catch(() => []);
+  const picked = [];
+  try {
+    for (const handle of handles) {
+      const box = await handle.boundingBox().catch(() => null);
+      if (!box || box.width < 12 || box.height < 12 || box.y < 0 || box.y > 760) {
+        await handle.dispose().catch(() => {});
+        continue;
+      }
+      picked.push(handle);
+      if (picked.length >= limit) break;
+    }
+  } finally {
+    for (const handle of handles) {
+      if (!picked.includes(handle)) await handle.dispose().catch(() => {});
+    }
+  }
+  return picked;
+}
+
+async function maybeBrowseProfilePosts(page) {
+  if (!chance(randomDelay(15, 25) / 100)) return;
+  await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.8 }).catch(() => {});
+  await delay(randomDelay(4000, 9000));
+  const postHandles = await getVisibleHandles(page, 'a[href*="/p/"], a[href*="/reel/"]', randomDelay(1, 2));
+  try {
+    for (const postHandle of postHandles) {
+      await moveMouseToElement(page, postHandle, { totalDurationMs: randomDelay(420, 1100) }).catch(() => {});
+      await delay(randomDelay(5000, 12000));
+    }
+  } finally {
+    for (const handle of postHandles) await handle.dispose().catch(() => {});
+  }
+}
+
+async function maybeBrowseProfileComments(page) {
+  if (!chance(0.18)) return;
+  const postHandles = await getVisibleHandles(page, 'a[href*="/p/"], a[href*="/reel/"]', 1);
+  if (!postHandles.length) return;
+  try {
+    await clickElementNaturally(page, postHandles[0], { totalDurationMs: randomDelay(260, 620) }).catch(() => {});
+    await delay(randomDelay(2500, 5000));
+    const commentHandles = await getVisibleHandles(
+      page,
+      '[role="dialog"] ul ul span, [role="dialog"] h1 ~ div span',
+      randomDelay(1, 2)
+    );
+    try {
+      for (const commentHandle of commentHandles) {
+        await moveMouseToElement(page, commentHandle, { totalDurationMs: randomDelay(420, 980) }).catch(() => {});
+        await delay(randomDelay(3500, 9000));
+      }
+    } finally {
+      for (const handle of commentHandles) await handle.dispose().catch(() => {});
+    }
+    await closeInstagramListModal(page).catch(() => {});
+  } finally {
+    for (const handle of postHandles) await handle.dispose().catch(() => {});
+  }
+}
+
+async function maybeIdleOnProfile(page) {
+  if (!chance(0.28)) return;
+  await idleMouseDrift(page, {
+    durationMs: randomDelay(20000, 60000),
+    segmentDurationMs: randomDelay(700, 2200),
+  }).catch(() => {});
+}
+
+async function maybeBrowseTargetProfile(page) {
+  if (chance(0.42)) {
+    await viewStoriesNaturally(page, {
+      minStories: 2,
+      maxStories: 4,
+      minViewMs: 8000,
+      maxViewMs: 20000,
+    }).catch(() => {});
+    await delay(randomDelay(3000, 7000));
+  }
+  await maybeBrowseProfilePosts(page).catch(() => {});
+  await maybeBrowseProfileComments(page).catch(() => {});
+  await maybeIdleOnProfile(page).catch(() => {});
 }
 
 /**
@@ -398,19 +730,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await dismissInstagramPopups(page, logger).catch(() => {});
 
     logger.log('[Scraper] Warming session before scrape...');
-    await organicPause('between_actions', 1.6);
-    for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
-      await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 420) });
-      await naturalScrollPage(page, {
-        rounds: randomDelay(2, 4),
-        pauseMultiplier: 0.9,
-      });
-      if (Math.random() < 0.35) {
-        await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.6 });
-      }
-      await maybeLightStoryInteraction(page, { openChance: 0.12 }).catch(() => {});
-      await organicPause('between_actions', 1.8);
-    }
+    const warmupPatterns = ['baseline', 'stories-first', 'idle-heavy'];
+    const chosenWarmup = warmupPatterns[randomDelay(0, warmupPatterns.length - 1)];
+    logger.log(`[Scraper] Warmup pattern: ${chosenWarmup}`);
+    await runScrapeWarmupPattern(page, chosenWarmup).catch(() => {});
     await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 380) });
     await organicPause('between_actions', 1.2);
     logger.log('[Scraper] Warm behaviour done.');
@@ -431,7 +754,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     if (Math.random() < 0.28) {
       await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 }).catch(() => {});
     }
-    await maybeLightStoryInteraction(page, { openChance: 0.08 }).catch(() => {});
+    await maybeBrowseTargetProfile(page).catch(() => {});
+    await delay(randomDelay(8000, 18000));
 
     if (await instagramListProfilePageLooksBroken(page)) {
       await recoverBlankInstagramProfilePage(
@@ -492,68 +816,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       );
     } else {
       logger.log('[Scraper] Could not parse stat count from profile; using max_leads only');
-    }
-
-    async function tryOpenProfileList(page, target, kind) {
-      return page.evaluate((targetUsername, listKind) => {
-        const lower = (s) => (s || '').toLowerCase();
-        const wantFollowing = listKind === 'following';
-
-        const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
-        const picked = links.find((a) => {
-          const href = lower(a.getAttribute('href') || '');
-          if (wantFollowing) {
-            return (
-              href.includes(`/${targetUsername}/following`) ||
-              (href.includes('/following') && !href.includes('/followers'))
-            );
-          }
-          return (
-            href.includes(`/${targetUsername}/followers`) ||
-            (href.includes('/followers') && !href.includes('/following'))
-          );
-        });
-        if (picked) {
-          picked.click();
-          return true;
-        }
-
-        const candidates = Array.from(
-          document.querySelectorAll('a, span, div, button, [role="button"]')
-        );
-        const needle = wantFollowing ? 'following' : 'followers';
-        const statsLike = candidates.find((el) => {
-          const text = (el.textContent || '').trim();
-          const l = lower(text);
-          return l.includes(needle) && /\d/.test(text);
-        });
-        if (statsLike) {
-          const clickable =
-            statsLike.closest('a, button, [role="button"]') || statsLike;
-          if (clickable && clickable instanceof HTMLElement) {
-            clickable.click();
-            return true;
-          }
-        }
-
-        const roleButtons = Array.from(
-          document.querySelectorAll('[role="button"], button, a')
-        );
-        for (const btn of roleButtons) {
-          const t = lower(btn.textContent || '');
-          if (wantFollowing) {
-            if (t.includes('following') || /\d+\s*following/.test(t)) {
-              btn.click();
-              return true;
-            }
-          } else if (t.includes('followers') || /\d+\s*followers/.test(t)) {
-            btn.click();
-            return true;
-          }
-        }
-
-        return false;
-      }, target, kind);
     }
 
     let profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
@@ -646,42 +908,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] ${listKind === 'following' ? 'Following' : 'Followers'} modal opened, extracting...`);
     await delay(randomDelay(2500, 5000));
-    await page.evaluate(() => {
-      function countProfileLinks(el) {
-        let c = 0;
-        for (const a of el.querySelectorAll('a[href^="/"]')) {
-          const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-          if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-        }
-        return c;
-      }
-      let best = null;
-      let bestCount = 0;
-      for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-        const count = countProfileLinks(d);
-        if (count > bestCount && count >= 5) {
-          bestCount = count;
-          best = d;
-        }
-      }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                best = d;
-              }
-            }
-          }
-      if (best) {
-        best.focus();
-        for (let i = 0; i < 3; i++) {
-          best.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, bubbles: true }));
-        }
-      }
-    });
-    await delay(1500);
+    await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
 
     const saveLoginHandled = await page.evaluate(function () {
       const dialogs = document.querySelectorAll('[role="dialog"]');
@@ -731,6 +958,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
     ]);
     let scrollCount = 0;
+    let lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+    let stuckModalCount = 0;
 
     while (true) {
       const jobCheck = await getScrapeJob(jobId);
@@ -887,6 +1116,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           `[Scraper] Batch: +${batchInserted} new row(s) (${newLeads.length} passed filters), job total ${newInsertsTotal}`
         );
         scrapedSinceCooldown += batchInserted;
+        if (chance(0.18)) {
+          const batchPauseMs = randomDelay(45000, 90000);
+          const driftMs = Math.min(batchPauseMs, randomDelay(12000, 26000));
+          logger.log(`[Scraper] Taking a long post-batch pause for ${Math.round(batchPauseMs / 1000)}s.`);
+          await idleMouseDrift(page, {
+            durationMs: driftMs,
+            segmentDurationMs: randomDelay(700, 1800),
+          }).catch(() => {});
+          await delay(Math.max(0, batchPauseMs - driftMs));
+        }
         if (!effectiveMax && COOLDOWN_CHUNK > 0 && scrapedSinceCooldown >= COOLDOWN_CHUNK) {
           const pauseMs = randomDelay(COOLDOWN_MIN_MS, COOLDOWN_MAX_MS);
           logger.log(
@@ -919,252 +1158,14 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       scrollCount++;
       let weGotMoreFromWaitRetry = false;
 
-      const scrollIncrementally = () =>
-        page.evaluate((chunkPx) => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return { scrolled: false };
-          let scrollTarget = null;
-          let maxLinks = 0;
-          for (const div of dialog.querySelectorAll('div')) {
-            const links = div.querySelectorAll('a[href^="/"]');
-            const hasOverflow = div.scrollHeight > div.clientHeight;
-            const isTallEnough = div.clientHeight > 80;
-            if (links.length > maxLinks && hasOverflow && isTallEnough) {
-              maxLinks = links.length;
-              scrollTarget = div;
-            }
-          }
-          if (!scrollTarget && dialog.scrollHeight > dialog.clientHeight) scrollTarget = dialog;
-          if (!scrollTarget) {
-            for (const div of dialog.querySelectorAll('div')) {
-              if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
-                scrollTarget = div;
-                break;
-              }
-            }
-          }
-          if (!scrollTarget) {
-            maxLinks = 0;
-            for (const div of dialog.querySelectorAll('div')) {
-              const links = div.querySelectorAll('a[href^="/"]');
-              if (links.length > maxLinks && div.clientHeight > 80) {
-                maxLinks = links.length;
-                scrollTarget = div;
-              }
-            }
-          }
-          const scrollables = [];
-          if (scrollTarget) scrollables.push(scrollTarget);
-          for (const div of dialog.querySelectorAll('div')) {
-            if (div.scrollHeight > div.clientHeight && div.clientHeight > 80 && !scrollables.includes(div)) {
-              scrollables.push(div);
-            }
-          }
-          let didScroll = false;
-          for (const el of scrollables) {
-            if (!el) continue;
-            const prev = el.scrollTop;
-            el.scrollBy(0, chunkPx);
-            if (el.scrollTop !== prev) {
-              didScroll = true;
-              break;
-            }
-          }
-          if (!didScroll && scrollTarget) {
-            const prevTop = scrollTarget.scrollTop;
-            scrollTarget.focus();
-            scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaY: chunkPx, bubbles: true, cancelable: true }));
-            if (scrollTarget.scrollTop !== prevTop) didScroll = true;
-          }
-          return { scrolled: didScroll };
-        }, SCROLL_CHUNK_PX);
-
       let anyScrollThisIter = false;
-      if (await humanScrollInstagramListModal(page, { rounds: randomDelay(2, 4) }).catch(() => false)) {
-        anyScrollThisIter = true;
-      }
-      for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-        const result = await scrollIncrementally();
-        if (result.scrolled) anyScrollThisIter = true;
-        await delay(SCROLL_CHUNK_DELAY_MS);
-      }
-
-      if (!anyScrollThisIter) {
-        const scrollIntoViewResult = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let root = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              root = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                root = d;
-              }
-            }
-          }
-          if (!root) return false;
-          const links = root.querySelectorAll('a[href^="/"]');
-          const lastLink = links[links.length - 1];
-          if (lastLink) {
-            lastLink.scrollIntoView({ block: 'end', behavior: 'instant' });
-            return true;
-          }
-          return false;
-        });
-        if (scrollIntoViewResult) await delay(1500);
-        const wheelScrolled = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return false;
-          dialog.focus();
-          const targets = [dialog, ...dialog.querySelectorAll('div')].filter((el) => el.clientHeight > 80);
-          for (const el of targets) {
-            el.dispatchEvent(new WheelEvent('wheel', { deltaY: 400, bubbles: true }));
-          }
-          return true;
-        });
-        if (wheelScrolled) await delay(800);
-        await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (dialog) dialog.focus();
-        });
-        for (let k = 0; k < 4; k++) {
-          await page.keyboard.press('PageDown');
-          await delay(400);
+      for (let batchIndex = 0; batchIndex < Math.max(2, Math.min(5, SCROLL_CHUNKS_PER_ITER / 2)); batchIndex++) {
+        const scrolled = await humanScrollInstagramListModal(page, { rounds: randomDelay(2, 4) }).catch(() => false);
+        if (scrolled) anyScrollThisIter = true;
+        if (batchIndex < 3 && Math.random() < 0.45) {
+          await randomMouseDrift(page, { totalDurationMs: randomDelay(380, 1100) }).catch(() => {});
         }
-        const { scrolled: kbdScrolled } = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return { scrolled: false };
-          let anyScroll = false;
-          for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
-            if (el.scrollHeight > el.clientHeight && el.clientHeight > 80) {
-              const prev = el.scrollTop;
-              el.scrollTop = el.scrollHeight;
-              if (el.scrollTop !== prev) anyScroll = true;
-            }
-          }
-          return { scrolled: anyScroll };
-        });
-        if (kbdScrolled) anyScrollThisIter = true;
+        await delay(randomDelay(12000, 35000));
       }
 
       if (!anyScrollThisIter) {
@@ -1173,11 +1174,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           await delay(LOAD_WAIT_MS);
           if (await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 3) }).catch(() => false)) {
             anyScrollThisIter = true;
-          }
-          for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-            const { scrolled } = await scrollIncrementally();
-            if (scrolled) anyScrollThisIter = true;
-            await delay(SCROLL_CHUNK_DELAY_MS);
           }
           if (anyScrollThisIter) {
             weGotMoreFromWaitRetry = true;
@@ -1190,6 +1186,28 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           if (hadNoNewThisIter) noNewCount++;
           break;
         }
+      }
+
+      const modalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+      const snapshotLooksStuck =
+        hadNoNewThisIter &&
+        modalSnapshot &&
+        lastModalSnapshot &&
+        modalSnapshot.scrollTop === lastModalSnapshot.scrollTop &&
+        modalSnapshot.linkCount === lastModalSnapshot.linkCount &&
+        modalSnapshot.remaining === lastModalSnapshot.remaining;
+      if (snapshotLooksStuck) stuckModalCount++;
+      else if (anyScrollThisIter || !hadNoNewThisIter) stuckModalCount = 0;
+      lastModalSnapshot = modalSnapshot;
+
+      if (
+        (stuckModalCount >= 2 || (!anyScrollThisIter && hadNoNewThisIter)) &&
+        (await maybeRefreshInstagramListModal(page, cleanTarget, listKind, logger, `stuck=${stuckModalCount}`))
+      ) {
+        stuckModalCount = 0;
+        lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+        await delay(randomDelay(12000, 35000));
+        continue;
       }
 
       if (hadNoNewThisIter && !weGotMoreFromWaitRetry && scrollCount >= 3) {

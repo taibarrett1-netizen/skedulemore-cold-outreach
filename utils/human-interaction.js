@@ -318,6 +318,27 @@ async function naturalScrollPage(page, opts = {}) {
   }
 }
 
+async function idleMouseDrift(page, opts = {}) {
+  if (!page?.mouse) return;
+  const durationMs = Math.max(1500, opts.durationMs || randomInt(6000, 18000));
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < durationMs) {
+    await randomMouseDrift(page, {
+      totalDurationMs: opts.segmentDurationMs || randomInt(500, 1800),
+    }).catch(() => {});
+    if (opts.allowPageScroll && chance(0.18)) {
+      await naturalScrollPage(page, {
+        rounds: 1,
+        direction: chance(0.16) ? 'up' : 'down',
+        pauseMultiplier: 0.5,
+      }).catch(() => {});
+    }
+    const remaining = durationMs - (Date.now() - startedAt);
+    if (remaining <= 0) break;
+    await delay(Math.min(remaining, randomInt(900, 3200)));
+  }
+}
+
 async function maybeLightStoryInteraction(page, opts = {}) {
   if (!page) return false;
   const openChance = opts.openChance ?? 0.18;
@@ -344,12 +365,110 @@ async function maybeLightStoryInteraction(page, opts = {}) {
   }
 }
 
+async function closeStoryViewer(page) {
+  const closeHandle = await page
+    .$([
+      'button[aria-label="Close"]',
+      'svg[aria-label="Close"]',
+      '[role="button"][aria-label*="close" i]',
+    ].join(', '))
+    .catch(() => null);
+  if (closeHandle) {
+    try {
+      await clickElementNaturally(page, closeHandle, { totalDurationMs: randomInt(180, 420) }).catch(() => {});
+      await delay(randomInt(240, 700));
+      return true;
+    } finally {
+      await closeHandle.dispose().catch(() => {});
+    }
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+  await delay(randomInt(220, 600));
+  return false;
+}
+
+async function viewStoriesNaturally(page, opts = {}) {
+  if (!page) return false;
+  const triggerHandle = await page
+    .$([
+      'a[href*="/stories/"]',
+      'button[aria-label*="story" i]',
+      'canvas[aria-label*="story" i]',
+      'img[alt*="story" i]',
+    ].join(', '))
+    .catch(() => null);
+  if (!triggerHandle) return false;
+
+  const minStories = Math.max(1, opts.minStories || 2);
+  const maxStories = Math.max(minStories, opts.maxStories || 4);
+  const storiesToView = randomInt(minStories, maxStories);
+
+  try {
+    await moveMouseToElement(page, triggerHandle, { totalDurationMs: randomInt(220, 520) }).catch(() => {});
+    await delay(randomInt(240, 700));
+    await clickElementNaturally(page, triggerHandle, { totalDurationMs: randomInt(220, 520) }).catch(() => {});
+    await delay(randomInt(1600, 3200));
+
+    for (let index = 0; index < storiesToView; index++) {
+      const dwellMs = randomInt(opts.minViewMs || 8000, opts.maxViewMs || 20000);
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < dwellMs) {
+        if (chance(0.4)) {
+          await randomMouseDrift(page, { totalDurationMs: randomInt(300, 900) }).catch(() => {});
+        }
+        const remaining = dwellMs - (Date.now() - startedAt);
+        if (remaining <= 0) break;
+        await delay(Math.min(remaining, randomInt(1400, 4200)));
+      }
+
+      if (index >= storiesToView - 1) break;
+
+      const nextHandle = await page
+        .$([
+          'button[aria-label*="Next" i]',
+          '[role="button"][aria-label*="Next" i]',
+          'svg[aria-label*="Next" i]',
+        ].join(', '))
+        .catch(() => null);
+
+      if (nextHandle) {
+        try {
+          await clickElementNaturally(page, nextHandle, { totalDurationMs: randomInt(180, 420) }).catch(() => {});
+        } finally {
+          await nextHandle.dispose().catch(() => {});
+        }
+      } else {
+        const vp = getViewportBounds(page);
+        await moveMouseNaturally(
+          page,
+          {
+            x: randomBetween(vp.width * 0.74, vp.width * 0.92),
+            y: randomBetween(vp.height * 0.36, vp.height * 0.64),
+          },
+          { totalDurationMs: randomInt(280, 720) }
+        ).catch(() => {});
+        await page.mouse.down().catch(() => {});
+        await delay(randomInt(30, 90));
+        await page.mouse.up().catch(() => {});
+      }
+
+      await delay(randomInt(800, 1800));
+    }
+
+    await closeStoryViewer(page).catch(() => {});
+    return true;
+  } finally {
+    await triggerHandle.dispose().catch(() => {});
+  }
+}
+
 module.exports = {
   chance,
   clickElementNaturally,
   clickSelectorNaturally,
   delay,
   focusAndTypeNaturally,
+  idleMouseDrift,
   moveMouseNaturally,
   moveMouseToElement,
   naturalScrollPage,
@@ -358,4 +477,5 @@ module.exports = {
   randomMouseDrift,
   typeTextNaturally,
   maybeLightStoryInteraction,
+  viewStoriesNaturally,
 };
