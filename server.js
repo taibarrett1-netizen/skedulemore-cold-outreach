@@ -224,9 +224,8 @@ app.post('/api/admin/assign-client', (req, res) => {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
   try {
-    const env = readEnv();
-    env.COLD_DM_CLIENT_ID = clientId;
-    writeEnv(env);
+    // Do not rewrite the whole .env (it contains secrets); patch just this key.
+    upsertEnvKey('COLD_DM_CLIENT_ID', clientId);
     setClientId(clientId);
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
@@ -870,9 +869,37 @@ function readEnv() {
   const content = fs.readFileSync(envPath, 'utf8');
   for (const line of content.split('\n')) {
     const m = line.match(/^([^#=]+)=(.*)$/);
-    if (m) out[m[1].trim()] = m[2].trim();
+    if (!m) continue;
+    const k = m[1].trim();
+    // Only expose/edit non-secret dashboard settings keys.
+    if (ENV_KEYS.includes(k)) {
+      out[k] = m[2].trim();
+    }
   }
   return out;
+}
+
+function upsertEnvKey(key, value) {
+  const k = String(key || '').trim();
+  if (!k) return;
+  const v = value == null ? '' : String(value).trim();
+  const nextLine = `${k}=${v}`;
+  const existing = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+  const lines = existing.split('\n');
+  let replaced = false;
+  const out = lines.map((line) => {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (!m) return line;
+    const lk = m[1].trim();
+    if (lk !== k) return line;
+    replaced = true;
+    return nextLine;
+  });
+  if (!replaced) {
+    if (out.length > 0 && out[out.length - 1] !== '') out.push('');
+    out.push(nextLine);
+  }
+  fs.writeFileSync(envPath, out.join('\n').replace(/\n+$/g, '\n') + '\n', 'utf8');
 }
 
 function writeEnv(obj) {
