@@ -283,23 +283,14 @@ app.post('/api/admin/assign-client', (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
   }
-  // Restart dashboard so requireScopedClientId enforces the pin immediately.
-  exec('pm2 restart ig-dm-dashboard', { maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
-    if (err) {
-      return res.status(500).json({
-        ok: false,
-        error: String(err.message || err),
-        stdout: String(stdout || '').slice(0, 4000),
-        stderr: String(stderr || '').slice(0, 4000),
-      });
-    }
-    return res.json({
-      ok: true,
-      clientId,
-      stdout: String(stdout || '').slice(0, 4000),
-      stderr: String(stderr || '').slice(0, 4000),
+  // IMPORTANT: respond before restarting. Restarting the process can kill this request mid-flight,
+  // which makes the Edge function hang/timeout even though the assignment succeeded.
+  res.json({ ok: true, clientId, restarting: true });
+  setTimeout(() => {
+    exec('pm2 restart ig-dm-dashboard', { maxBuffer: 2 * 1024 * 1024 }, (err) => {
+      if (err) console.error('[API] assign-client pm2 restart failed', err);
     });
-  });
+  }, 250);
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');
