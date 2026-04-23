@@ -382,14 +382,7 @@ app.post('/api/admin/update', (req, res) => {
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const updateLogPath = `/tmp/cold-dm-update-${updateId}.log`;
-  const cmd = [
-    getPuppeteerDepsInstallCommand(),
-    `cd ${projectRoot}`,
-    `git pull origin ${branch}`,
-    'npm install',
-    'pm2 restart all --update-env',
-    'pm2 save',
-  ].join(' && ');
+  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all && pm2 save`;
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
   res.json({
@@ -403,7 +396,7 @@ app.post('/api/admin/update', (req, res) => {
   });
 
   setTimeout(() => {
-    const runner = `set -euo pipefail; (${cmd}) >> ${updateLogPath} 2>&1`;
+    const runner = `set -euo pipefail; (${cmd}) > ${updateLogPath} 2>&1`;
     try {
       const child = spawn('bash', ['-lc', runner], {
         cwd: projectRoot,
