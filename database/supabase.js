@@ -1847,13 +1847,16 @@ async function getClientStatusMessage(clientId) {
 async function getClientIdsWithPauseZero() {
   const sb = getSupabase();
   if (!sb) return [];
+  const pinnedClientId = (getClientId() || '').trim();
   const { data, error } = await sb
     .from('cold_dm_control')
     .select('client_id')
     .eq('pause', 0)
     .order('client_id', { ascending: true });
   if (error) throw error;
-  return (data || []).map((r) => r.client_id).filter(Boolean);
+  const clientIds = (data || []).map((r) => r.client_id).filter(Boolean);
+  if (!pinnedClientId) return clientIds;
+  return clientIds.includes(pinnedClientId) ? [pinnedClientId] : [];
 }
 
 /**
