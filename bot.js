@@ -5201,6 +5201,8 @@ async function runBotMultiTenant() {
   let sendWorkerForceExit = false;
   /** Concurrency debug signal: only log claim when client changes. */
   let lastClaimedClientIdForDebug = null;
+  /** Keep the idle worker heartbeat useful without flooding PM2 logs. */
+  let sendWorkerLastLoopTickLogAt = 0;
 
 async function drainSleep(ms, label) {
   if (!ms || ms < 1) return;
@@ -5501,7 +5503,11 @@ async function drainSleep(ms, label) {
   }
 
   for (;;) {
-    logger.log('[send-worker] loop tick');
+    const nowMs = Date.now();
+    if (nowMs - sendWorkerLastLoopTickLogAt >= 5 * 60 * 1000) {
+      logger.log('[send-worker] loop tick');
+      sendWorkerLastLoopTickLogAt = nowMs;
+    }
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
 
     if (sendWorkerGracefulShutdown && !sendWorkerForceExit) {
