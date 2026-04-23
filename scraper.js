@@ -246,6 +246,23 @@ async function getInstagramListScrollTargetHandle(page) {
       return c;
     }
 
+    function scrollCandidateScore(el, linkCount) {
+      const scrollRange = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+      if (scrollRange <= 16 || el.clientHeight <= 80) return -1;
+      const style = window.getComputedStyle(el);
+      const overflowY = String(style.overflowY || '').toLowerCase();
+      const overflowScore = /(auto|scroll|overlay)/.test(overflowY) ? 5000 : 0;
+      const rect = el.getBoundingClientRect();
+      const visibleScore = rect.width > 120 && rect.height > 120 ? 1000 : 0;
+      const prev = el.scrollTop || 0;
+      const probe = Math.min(scrollRange, prev + 24);
+      el.scrollTop = probe;
+      const movedBySet = Math.abs((el.scrollTop || 0) - prev) > 1;
+      el.scrollTop = prev;
+      const moveScore = movedBySet ? 10000 : 0;
+      return moveScore + overflowScore + visibleScore + scrollRange + linkCount * 100;
+    }
+
     let dialog = null;
     let bestCount = 0;
     for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
@@ -270,9 +287,7 @@ async function getInstagramListScrollTargetHandle(page) {
     let scrollTarget = null;
     let bestScore = -1;
     for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
-      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
-      if (!hasOverflow || el.clientHeight <= 80) continue;
-      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      const score = scrollCandidateScore(el, countProfileLinks(el));
       if (score > bestScore) {
         bestScore = score;
         scrollTarget = el;
@@ -345,6 +360,23 @@ async function getInstagramListModalSnapshot(page) {
       return c;
     }
 
+    function scrollCandidateScore(el, linkCount) {
+      const scrollRange = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+      if (scrollRange <= 16 || el.clientHeight <= 80) return -1;
+      const style = window.getComputedStyle(el);
+      const overflowY = String(style.overflowY || '').toLowerCase();
+      const overflowScore = /(auto|scroll|overlay)/.test(overflowY) ? 5000 : 0;
+      const rect = el.getBoundingClientRect();
+      const visibleScore = rect.width > 120 && rect.height > 120 ? 1000 : 0;
+      const prev = el.scrollTop || 0;
+      const probe = Math.min(scrollRange, prev + 24);
+      el.scrollTop = probe;
+      const movedBySet = Math.abs((el.scrollTop || 0) - prev) > 1;
+      el.scrollTop = prev;
+      const moveScore = movedBySet ? 10000 : 0;
+      return moveScore + overflowScore + visibleScore + scrollRange + linkCount * 100;
+    }
+
     let dialog = null;
     let bestCount = 0;
     for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
@@ -369,9 +401,7 @@ async function getInstagramListModalSnapshot(page) {
     let scrollTarget = null;
     let bestScore = -1;
     for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
-      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
-      if (!hasOverflow || el.clientHeight <= 80) continue;
-      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      const score = scrollCandidateScore(el, countProfileLinks(el));
       if (score > bestScore) {
         bestScore = score;
         scrollTarget = el;
@@ -482,6 +512,18 @@ async function humanScrollInstagramListModal(page, opts = {}) {
         }
       ).catch(() => ({ didMove: false, top: beforeTop }));
       if (stepResult.didMove) moved = true;
+      if (!stepResult.didMove) {
+        const box = await targetHandle.boundingBox().catch(() => null);
+        if (box && box.width > 8 && box.height > 8) {
+          await page.mouse
+            .move(box.x + box.width * 0.55, box.y + box.height * 0.72, { steps: randomDelay(4, 9) })
+            .catch(() => {});
+          await page.mouse.wheel({ deltaY: randomDelay(520, 980) }).catch(() => {});
+          await delay(randomDelay(450, 950));
+          const wheelTop = await targetHandle.evaluate((el) => Math.round(el.scrollTop || 0)).catch(() => beforeTop);
+          if (Math.abs(wheelTop - stepResult.top) > 2) moved = true;
+        }
+      }
       if (Math.random() < 0.25) {
         await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 720) }).catch(() => {});
       }
@@ -515,6 +557,23 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
       return c;
     }
 
+    function scrollCandidateScore(el, linkCount) {
+      const scrollRange = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+      if (scrollRange <= 16 || el.clientHeight <= 80) return -1;
+      const style = window.getComputedStyle(el);
+      const overflowY = String(style.overflowY || '').toLowerCase();
+      const overflowScore = /(auto|scroll|overlay)/.test(overflowY) ? 5000 : 0;
+      const rect = el.getBoundingClientRect();
+      const visibleScore = rect.width > 120 && rect.height > 120 ? 1000 : 0;
+      const prev = el.scrollTop || 0;
+      const probe = Math.min(scrollRange, prev + 24);
+      el.scrollTop = probe;
+      const movedBySet = Math.abs((el.scrollTop || 0) - prev) > 1;
+      el.scrollTop = prev;
+      const moveScore = movedBySet ? 10000 : 0;
+      return moveScore + overflowScore + visibleScore + scrollRange + linkCount * 100;
+    }
+
     function rootHasSpinner(root) {
       return !!root.querySelector('svg[aria-label*="Loading" i], [role="progressbar"]');
     }
@@ -533,9 +592,7 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
     let target = null;
     let bestScore = -1;
     for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
-      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
-      if (!hasOverflow || el.clientHeight <= 80) continue;
-      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      const score = scrollCandidateScore(el, countProfileLinks(el));
       if (score > bestScore) {
         bestScore = score;
         target = el;
