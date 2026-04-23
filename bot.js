@@ -985,6 +985,7 @@ async function handleInstagramTermsUnblock(page) {
   await logTermsUnblockVisibleButtons(page);
 
   const maxPasses = 40;
+  let refreshedBlankTermsPage = false;
 
   for (let pass = 0; pass < maxPasses; pass++) {
     if (!isInstagramTermsUnblockUrl(page.url())) {
@@ -1023,11 +1024,48 @@ async function handleInstagramTermsUnblock(page) {
         if (!el) return false;
         const btn = el.closest('button, [role="button"], a') || el;
         try {
+          btn.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        } catch {
+          // ignore
+        }
+        try {
           btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
         } catch {
           btn.click();
         }
         return true;
+      }
+
+      function areaOf(el) {
+        try {
+          const r = el.getBoundingClientRect();
+          return Math.max(0, r.width) * Math.max(0, r.height);
+        } catch {
+          return 0;
+        }
+      }
+
+      function bottomGap(el) {
+        try {
+          const r = el.getBoundingClientRect();
+          return Math.max(0, window.innerHeight - r.bottom);
+        } catch {
+          return Number.POSITIVE_INFINITY;
+        }
+      }
+
+      function findTallestScrollableContainer() {
+        const candidates = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], div, main, section, article'))
+          .filter((el) => {
+            try {
+              if (!visible(el)) return false;
+              return (el.scrollHeight || 0) > (el.clientHeight || 0) + 120;
+            } catch {
+              return false;
+            }
+          })
+          .sort((a, b) => areaOf(b) - areaOf(a));
+        return candidates[0] || null;
       }
 
       // Scroll window and inner scroll regions (terms are often in a nested div).
@@ -1048,6 +1086,18 @@ async function handleInstagramTermsUnblock(page) {
           // ignore
         }
       });
+      const tallScrollable = findTallestScrollableContainer();
+      if (tallScrollable) {
+        try {
+          const nextTop = Math.min(
+            tallScrollable.scrollHeight,
+            (tallScrollable.scrollTop || 0) + Math.max(700, Math.floor((tallScrollable.clientHeight || 0) * 0.9))
+          );
+          tallScrollable.scrollTop = nextTop;
+        } catch {
+          // ignore
+        }
+      }
 
       const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
       const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div[tabindex="0"]'));
@@ -1061,7 +1111,6 @@ async function handleInstagramTermsUnblock(page) {
       const successHint =
         bodyText.includes("you're all set") ||
         bodyText.includes('you’re all set') ||
-        bodyText.includes('review and agree') ||
         bodyText.includes('thank you for reviewing');
       if (successHint) {
         for (const el of nodes) {
@@ -1094,6 +1143,7 @@ async function handleInstagramTermsUnblock(page) {
 
       // 2) Primary terms CTAs (exact-ish; avoid matching random "next" in nav)
       const primaryRes = [
+        /^agree to terms$/i,
         /^accept$/i,
         /^i agree$/i,
         /^agree$/i,
@@ -1101,24 +1151,32 @@ async function handleInstagramTermsUnblock(page) {
         /^continue$/i,
         /^review now$/i,
       ];
+      const primaryCandidates = nodes
+        .map((el) => {
+          const t = norm(el.textContent);
+          const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+          const pick = t || aria;
+          return { el, pick };
+        })
+        .filter(({ el, pick }) => {
+          if (!pick || pick.length > 96) return false;
+          if (!visible(el)) return false;
+          return primaryRes.some((re) => re.test(pick));
+        })
+        .sort((a, b) => bottomGap(a.el) - bottomGap(b.el));
+      for (const { el, pick } of primaryCandidates) {
+        return { action: 'primary_cta', label: pick, ok: clickEl(el) };
+      }
+
       for (const el of nodes) {
         const t = norm(el.textContent);
         const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
         const pick = t || aria;
         if (!pick || pick.length > 96) continue;
         if (!visible(el)) continue;
-        if (primaryRes.some((re) => re.test(pick))) {
-          return { action: 'primary_cta', label: pick, ok: clickEl(el) };
-        }
-      }
-
-      // 3) Looser: line is mostly an accept phrase
-      for (const el of nodes) {
-        const t = lower(el.textContent);
-        if (!t || t.length > 72) continue;
-        if (!visible(el)) continue;
         if (
-          /\baccept\b/.test(t) ||
+          /\bagree to terms\b/.test(lower(pick)) ||
+          /\baccept\b/.test(lower(pick)) ||
           /\bagree\b/.test(t) ||
           (t.includes('continue') && (t.includes('agree') || t.includes('terms')))
         ) {
@@ -1132,6 +1190,35 @@ async function handleInstagramTermsUnblock(page) {
     if (step.ok) {
       logger.log(`terms/unblock pass ${pass + 1}: ${step.action} "${step.label || ''}"`);
       await delay(1600);
+      const blankState = await page.evaluate(() => {
+        const bodyText = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+        const visibleInteractive = Array.from(document.querySelectorAll('button, [role="button"], a, input, textarea'))
+          .filter((el) => {
+            try {
+              const st = window.getComputedStyle(el);
+              if (st.visibility === 'hidden' || st.display === 'none') return false;
+              const r = el.getBoundingClientRect();
+              return r.width >= 2 && r.height >= 2;
+            } catch {
+              return false;
+            }
+          });
+        return {
+          blankish: bodyText.length < 80 && visibleInteractive.length <= 1,
+          bodyLen: bodyText.length,
+          href: location.href,
+        };
+      }).catch(() => ({ blankish: false, bodyLen: 999, href: page.url() }));
+      if (
+        !refreshedBlankTermsPage &&
+        blankState.blankish &&
+        String(blankState.href || '').includes('instagram.com')
+      ) {
+        refreshedBlankTermsPage = true;
+        logger.warn(`terms/unblock click landed on a blank/sticky page (bodyLen=${blankState.bodyLen}); reloading once.`);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        await delay(2500);
+      }
       continue;
     }
 
