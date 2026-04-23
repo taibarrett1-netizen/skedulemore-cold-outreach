@@ -1110,6 +1110,15 @@ async function handleInstagramTermsUnblock(page) {
         }
       }
 
+      function buttonScore(el) {
+        try {
+          const r = el.getBoundingClientRect();
+          return Math.max(0, r.width) * 2 + Math.max(0, r.height) - bottomGap(el);
+        } catch {
+          return Number.NEGATIVE_INFINITY;
+        }
+      }
+
       function findTallestScrollableContainer() {
         const candidates = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], div, main, section, article'))
           .filter((el) => {
@@ -1161,11 +1170,43 @@ async function handleInstagramTermsUnblock(page) {
         bodyText.includes('updates to our terms and privacy policy') ||
         bodyText.includes('read the full terms and privacy policy') ||
         bodyText.includes('we updated our intellectual property licenses');
+      const looksLikeTermsInterstitial =
+        bodyText.includes('updates to our terms and privacy policy') ||
+        bodyText.includes("you need to finish reviewing this information before you can use instagram") ||
+        bodyText.includes('please take a moment to review these changes');
       const labelOf = (el) => {
         const t = lower(el.textContent);
         const a = lower(el.getAttribute && el.getAttribute('aria-label'));
         return { t, a, combined: `${t} ${a}`.trim() };
       };
+
+      function pickMainDialogCta() {
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+        const roots = dialogs.length ? dialogs : [document.body];
+        for (const root of roots) {
+          const btns = Array.from(root.querySelectorAll('button, [role="button"], a, div[tabindex="0"]'))
+            .filter(visible)
+            .map((el) => {
+              const { t, a, combined } = labelOf(el);
+              const pick = t || a || combined;
+              return { el, pick, combined };
+            })
+            .filter(({ pick, combined }) => {
+              if (!pick) return false;
+              if (/privacy policy|full terms|read the full/i.test(combined)) return false;
+              return true;
+            });
+          const explicit = btns
+            .filter(({ pick }) => /^(review now|agree to terms|ok|next|continue|accept|agree|done)$/i.test(pick))
+            .sort((a, b) => buttonScore(b.el) - buttonScore(a.el))[0];
+          if (explicit) return explicit;
+          const fallback = btns
+            .filter(({ el, combined }) => !/privacy policy|full terms|read the full/i.test(combined) && bottomGap(el) < window.innerHeight * 0.55)
+            .sort((a, b) => buttonScore(b.el) - buttonScore(a.el))[0];
+          if (fallback) return fallback;
+        }
+        return null;
+      }
 
       // 1) Success overlay: "Review and Agree" / "You're all set!" → blue OK
       const successHint =
@@ -1198,6 +1239,13 @@ async function handleInstagramTermsUnblock(page) {
           });
           if (primary) return { action: 'ok_modal_dialog', label: norm(primary.textContent), ok: clickEl(primary) };
           if (btns.length === 1) return { action: 'ok_modal_single', label: norm(btns[0].textContent), ok: clickEl(btns[0]) };
+        }
+      }
+
+      if (looksLikeTermsInterstitial) {
+        const mainCta = pickMainDialogCta();
+        if (mainCta) {
+          return { action: 'main_terms_cta', label: mainCta.pick, ok: clickEl(mainCta.el) };
         }
       }
 
