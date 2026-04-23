@@ -542,29 +542,26 @@ function formatOutsideScheduleResumeMessage(timezone, nextStartDate, availableAt
 function formatQueueWaitDeferMessage(availableAtIso, clientTimezone, jobMeta = null) {
   const resumeAt = availableAtIso ? new Date(availableAtIso) : null;
   if (!resumeAt || Number.isNaN(resumeAt.getTime())) {
-    return 'Queued send jobs are deferred (invalid available_at).';
+    return 'Campaign is waiting for the next send window.';
   }
   const cls = String(jobMeta?.lastErrorClass || '').trim();
-  const clsHint =
+  const reason =
     cls === 'hourly_limit'
-      ? 'Oldest job: hourly_limit — client hourly cap counts all campaigns (rolling last 60 minutes of sends).'
+      ? 'Hourly send limit reached.'
       : cls === 'daily_limit'
-        ? 'Oldest job: daily_limit — wait was stamped when the cap was hit; it can still sit in the future after the calendar day rolls over.'
+        ? 'Daily send limit reached.'
       : cls === 'outside_schedule'
-        ? 'Oldest job: outside_schedule — wait matches send-window defer, not random UTC.'
+        ? 'Outside the campaign send schedule.'
         : cls === 'session_load_timeout' || cls === 'session_load_failed'
-          ? `Oldest job: ${cls} — browser/session hold; other workers may have deferred the queue.`
+          ? 'Instagram session is still getting ready.'
           : cls
-            ? `Oldest job last marked: ${cls}.`
-            : 'Oldest job has no last_error_class (older row) — often send spacing cooldown.';
+            ? 'Campaign is waiting for the next send window.'
+            : 'Campaign is waiting for the next send window.';
 
   const tz = normalizeTimezoneInput(clientTimezone);
   const utcShort = `${resumeAt.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
   if (!tz) {
-    return (
-      `Queued send jobs are deferred until ${utcShort}. ${clsHint} ` +
-      'Set Cold DM timezone in Settings for local time. This is not the same rule as campaign send hours.'
-    );
+    return `${reason} Campaign will retry soon.`;
   }
   try {
     const localPart = resumeAt.toLocaleString('en-US', {
@@ -576,12 +573,9 @@ function formatQueueWaitDeferMessage(availableAtIso, clientTimezone, jobMeta = n
       minute: '2-digit',
       hour12: true,
     });
-    return (
-      `Queued send jobs are deferred until ${localPart} (${tz}) — ${utcShort}. ${clsHint} ` +
-      'Not the same rule as campaign send hours.'
-    );
+    return `${reason} Next send window at ${localPart} (${tz}).`;
   } catch (_) {
-    return `Queued send jobs are deferred until ${utcShort}. ${clsHint}`;
+    return `${reason} Campaign will retry soon.`;
   }
 }
 
@@ -2211,9 +2205,8 @@ async function getClientNoWorkResumeAt(clientId) {
     (camp) => stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)
   );
   if (blockedDaily) {
-    const effectiveDailyLimit = normalizeColdOutreachDailyLimit(blockedDaily.daily_send_limit);
     return {
-      message: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
+      message: 'Daily send limit reached',
       reason: 'daily_limit',
       resumeAt: getNextMidnightInTimezone(clientTz),
     };
@@ -2222,9 +2215,8 @@ async function getClientNoWorkResumeAt(clientId) {
     (camp) => hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)
   );
   if (blockedHourly) {
-    const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(blockedHourly.hourly_send_limit);
     return {
-      message: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
+      message: 'Hourly send limit reached',
       reason: 'hourly_limit',
       resumeAt: getNextHourStartInTimezone(clientTz),
     };

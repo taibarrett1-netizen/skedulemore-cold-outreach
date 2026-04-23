@@ -5081,14 +5081,14 @@ function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, h
     return {
       blocked: true,
       reason: 'daily_limit',
-      statusMessage: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${sentToday}, counting=successful sends only)`,
+      statusMessage: 'Daily send limit reached',
     };
   }
   if (effectiveHourlyLimit != null && sentThisHour >= effectiveHourlyLimit) {
     return {
       blocked: true,
       reason: 'hourly_limit',
-      statusMessage: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
+      statusMessage: 'Hourly send limit reached',
     };
   }
   return { blocked: false, reason: null, statusMessage: null };
@@ -5202,21 +5202,23 @@ async function runBotMultiTenant() {
   /** Concurrency debug signal: only log claim when client changes. */
   let lastClaimedClientIdForDebug = null;
 
-  async function drainSleep(ms, label) {
-    if (!ms || ms < 1) return;
-    const chunk = 500;
-    const end = Date.now() + ms;
-    while (Date.now() < end) {
-      if (sendWorkerForceExit) return;
-      if (sendWorkerGracefulShutdown) {
-        logger.log(
-          `[send-worker] drain: skipping "${label}" (${Math.max(0, Math.ceil((end - Date.now()) / 1000))}s left) — shutdown requested`
-        );
-        return;
-      }
-      await delay(Math.min(chunk, Math.max(1, end - Date.now())));
+async function drainSleep(ms, label) {
+  if (!ms || ms < 1) return;
+  const chunk = 500;
+  const end = Date.now() + ms;
+  logger.log(`[send-worker] sleep start "${label}" for ${Math.ceil(ms / 1000)}s`);
+  while (Date.now() < end) {
+    if (sendWorkerForceExit) return;
+    if (sendWorkerGracefulShutdown) {
+      logger.log(
+        `[send-worker] drain: skipping "${label}" (${Math.max(0, Math.ceil((end - Date.now()) / 1000))}s left) — shutdown requested`
+      );
+      return;
     }
+    await delay(Math.min(chunk, Math.max(1, end - Date.now())));
   }
+  logger.log(`[send-worker] sleep done "${label}"`);
+}
 
   function onSendWorkerShutdownSignal(sig) {
     if (sendWorkerForceExit) return;
@@ -5499,6 +5501,7 @@ async function runBotMultiTenant() {
   }
 
   for (;;) {
+    logger.log('[send-worker] loop tick');
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
 
     if (sendWorkerGracefulShutdown && !sendWorkerForceExit) {
@@ -5557,6 +5560,7 @@ async function runBotMultiTenant() {
 
     let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS, pinnedCampaignIdsForClaim);
     if (!claimedJob) {
+      logger.log('[send-worker] no ready send job claimed on first attempt; syncing jobs for active clients');
       const clientIds = await sb.getClientIdsWithPauseZero();
       logColdDmConcurrencyDebug('claim_miss_syncing_clients', {
         workerId: SEND_WORKER_ID,
@@ -5580,6 +5584,7 @@ async function runBotMultiTenant() {
       claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS, pinnedCampaignIdsForClaim);
     }
     if (!claimedJob) {
+      logger.log('[send-worker] still no send job after sync attempt');
       const clientIds = await sb.getClientIdsWithPauseZero();
       if (clientIds.length === 0) {
         noPauseZeroEmptyRounds += 1;
@@ -6302,13 +6307,16 @@ async function runBotMultiTenant() {
         await delay(500);
       } else {
         const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
-        if (!handledSendCooldownInline && isSendCooldown && delayMs > 1000 && work && work.campaignId) {
-          const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
-          await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
-          await delay(500);
-        } else {
-          await drainSleep(Math.min(delayMs, 1500), 'send job tail delay');
-        }
+      if (!handledSendCooldownInline && isSendCooldown && delayMs > 1000 && work && work.campaignId) {
+        const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
+        logger.log(
+          `[send-worker] deferring remaining jobs for campaign ${work.campaignId} until ${cooldownUntilIso} after ${sendJobStatus}`
+        );
+        await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
+        await delay(500);
+      } else {
+        await drainSleep(Math.min(delayMs, 1500), 'send job tail delay');
+      }
       }
     } catch (e) {
       logger.error(`Unexpected send loop error for client ${clientId} campaign ${work.campaignId}: ${e.message}`, e);
