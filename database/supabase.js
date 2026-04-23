@@ -1313,6 +1313,7 @@ function normalizeInstagramKey(instagramUsername) {
  * Options:
  * - forceRotate: ignore the stored sticky tunnel and mint a fresh proxy URL
  * - stickySeed: extra entropy for the Decodo sticky-session id when force-rotating
+ * - allowRefresh: if true, allow refreshing an existing stored proxy URL when it appears outdated (default false)
  * @returns {{ proxyUrl: string|null, proxyAssignmentId: string|null }}
  */
 async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}) {
@@ -1321,9 +1322,7 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}
   const ig = normalizeInstagramKey(instagramUsername);
   if (!ig) throw new Error('instagram username required for proxy resolution');
   const forceRotate = !!opts.forceRotate;
-  const neverRefresh =
-    process.env.COLD_DM_NEVER_REFRESH_PROXY_ASSIGNMENTS === '1' ||
-    process.env.COLD_DM_NEVER_REFRESH_PROXY_ASSIGNMENTS === 'true';
+  const allowRefresh = !!opts.allowRefresh;
   const forceGermany = (process.env.DECODO_GATE_COUNTRY || '').trim().toLowerCase() === 'de' || !(process.env.DECODO_GATE_COUNTRY || '').trim();
 
   const { data: existing, error: selErr } = await sb
@@ -1334,10 +1333,10 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}
     .maybeSingle();
   if (selErr) throw selErr;
   if (existing?.proxy_url) {
-    // Safety: keep a stable exit IP for the lifetime of an IG session. Refreshing a stored proxy URL
-    // can swap exit IPs under the same cookies/session_data and trigger IG checkpoints/suspensions.
-    // Allow refresh only when explicitly forced by the caller.
-    if (neverRefresh && !forceRotate) {
+    // Safety: keep a stable exit IP for the lifetime of an IG session.
+    // Refreshing a stored proxy URL can swap exit IPs under the same cookies/session_data and trigger IG checkpoints/suspensions.
+    // Default is to NEVER refresh/rotate an existing assignment unless explicitly forced.
+    if (!forceRotate && !allowRefresh) {
       return { proxyUrl: existing.proxy_url, proxyAssignmentId: existing.id };
     }
     const needsRefresh = decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref);
