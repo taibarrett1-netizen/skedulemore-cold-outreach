@@ -672,7 +672,10 @@ app.post('/api/internal/scale-send-workers', async (req, res) => {
   }
 });
 
-const PM2_JLIST_TIMEOUT_MS = 5000;
+const PM2_JLIST_TIMEOUT_MS = Math.max(
+  800,
+  parseInt(process.env.PM2_JLIST_TIMEOUT_MS || '1500', 10) || 1500
+);
 
 function getBotProcessRunning(cb) {
   exec(
@@ -854,7 +857,7 @@ const STATUS_SLOW_COMPONENT_LOG_MS = Math.max(
 );
 const STATUS_CACHE_TTL_MS = Math.max(
   1000,
-  parseInt(process.env.STATUS_CACHE_TTL_MS || '12000', 10) || 12000
+  parseInt(process.env.STATUS_CACHE_TTL_MS || '30000', 10) || 30000
 );
 const STATUS_CACHE_STALE_MAX_MS = Math.max(
   STATUS_CACHE_TTL_MS,
@@ -862,7 +865,11 @@ const STATUS_CACHE_STALE_MAX_MS = Math.max(
 );
 const PM2_STATUS_CACHE_TTL_MS = Math.max(
   1000,
-  parseInt(process.env.PM2_STATUS_CACHE_TTL_MS || '15000', 10) || 15000
+  parseInt(process.env.PM2_STATUS_CACHE_TTL_MS || '60000', 10) || 60000
+);
+const STATUS_FIRST_RESPONSE_TIMEOUT_MS = Math.max(
+  500,
+  parseInt(process.env.STATUS_FIRST_RESPONSE_TIMEOUT_MS || '1200', 10) || 1200
 );
 
 const statusCacheByKey = new Map();
@@ -910,7 +917,7 @@ async function getBotProcessRunningCached() {
     return pm2RunningCache.value;
   }
   if (pm2RunningCache.inFlight) {
-    return pm2RunningCache.inFlight;
+    return pm2RunningCache.updatedAt ? pm2RunningCache.value : true;
   }
   pm2RunningCache.inFlight = new Promise((resolve) => getBotProcessRunning(resolve))
     .then((v) => {
@@ -925,7 +932,22 @@ async function getBotProcessRunningCached() {
     .finally(() => {
       pm2RunningCache.inFlight = null;
     });
-  return pm2RunningCache.inFlight;
+  if (pm2RunningCache.updatedAt) return pm2RunningCache.value;
+  // First status after boot should not block on PM2 when Chrome/PM2 is busy.
+  return true;
+}
+
+function optimisticStatusPayload({ useSupabase }) {
+  const stats = useSupabase ? { total_sent: 0, total_failed: 0 } : getDailyStats();
+  return {
+    processRunning: true,
+    statusMessage: null,
+    todaySent: stats.total_sent ?? 0,
+    todayFailed: stats.total_failed ?? 0,
+    leadsTotal: 0,
+    leadsRemaining: 0,
+    statusDegraded: true,
+  };
 }
 
 async function buildStatusPayload({ useSupabase, clientId, requestStartedAt }) {
@@ -1046,6 +1068,13 @@ app.get('/api/status', async (req, res) => {
 
     if (!cacheEntry.inFlight) {
       cacheEntry.inFlight = buildStatusPayload({ useSupabase, clientId, requestStartedAt })
+        .catch((err) => {
+          console.warn(`[API] /api/status background refresh failed: ${err?.message || err}`);
+          return {
+            ...(cacheEntry.payload || optimisticStatusPayload({ useSupabase })),
+            statusDegraded: true,
+          };
+        })
         .then((payload) => {
           cacheEntry.payload = payload;
           cacheEntry.updatedAt = Date.now();
@@ -1066,10 +1095,14 @@ app.get('/api/status', async (req, res) => {
       });
     }
 
-    const payload = await cacheEntry.inFlight;
+    const payload = await Promise.race([
+      cacheEntry.inFlight,
+      timeoutAfter(STATUS_FIRST_RESPONSE_TIMEOUT_MS, 'status first response'),
+    ]).catch(() => optimisticStatusPayload({ useSupabase }));
     return res.status(200).json({
       ...payload,
       statusCached: false,
+      statusPendingRefresh: payload.statusDegraded === true,
       statusCacheAgeMs: 0,
     });
   } catch (e) {
