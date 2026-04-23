@@ -417,6 +417,97 @@ async function getInstagramListModalSnapshot(page) {
   }).catch(() => null);
 }
 
+function scraperScrollDebugEnabled() {
+  const raw = String(process.env.SCRAPER_SCROLL_DEBUG || process.env.SCRAPER_DEBUG || '1').trim().toLowerCase();
+  return raw !== '0' && raw !== 'false' && raw !== 'no';
+}
+
+async function captureInstagramListScrollDebug(page, loggerRef, jobId, label) {
+  if (!scraperScrollDebugEnabled() || !page) return;
+  try {
+    const debugDir = path.join(process.cwd(), 'scraper-debug');
+    if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
+    const safeJob = String(jobId || 'job').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 64);
+    const safeLabel = String(label || 'scroll').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80);
+    const stamp = Date.now();
+    const screenshotPath = path.join(debugDir, `${safeJob}_${safeLabel}_${stamp}.png`);
+    const snippetPath = path.join(debugDir, `${safeJob}_${safeLabel}_${stamp}.json`);
+    const diag = await page.evaluate(() => {
+      function parseUsernameFromHref(href) {
+        if (!href || typeof href !== 'string') return null;
+        let path = href.trim();
+        if (path.indexOf('http') === 0) {
+          try { path = new URL(path).pathname; } catch (_) { return null; }
+        }
+        const m = path.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
+        if (!m) return null;
+        const u = m[1].toLowerCase();
+        return /^[a-z0-9._]{2,30}$/.test(u) ? u : null;
+      }
+      function countProfileLinks(el) {
+        let c = 0;
+        for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+          if (parseUsernameFromHref(a.getAttribute('href') || '')) c++;
+        }
+        return c;
+      }
+      function visibleUsernames(root) {
+        const out = [];
+        const seen = new Set();
+        for (const a of root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+          const u = parseUsernameFromHref(a.getAttribute('href') || '');
+          if (!u || seen.has(u)) continue;
+          const r = a.getBoundingClientRect();
+          if (r.width < 4 || r.height < 4 || r.bottom < 0 || r.top > window.innerHeight) continue;
+          seen.add(u);
+          out.push(u);
+          if (out.length >= 20) break;
+        }
+        return out;
+      }
+      const candidates = [];
+      const roots = Array.from(document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"], div'));
+      for (const el of roots) {
+        const links = countProfileLinks(el);
+        const range = Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0));
+        if (links < 3 && range < 20) continue;
+        const r = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        candidates.push({
+          tag: el.tagName,
+          role: el.getAttribute('role') || '',
+          className: String(el.getAttribute('class') || '').slice(0, 160),
+          links,
+          usernames: visibleUsernames(el),
+          scrollTop: Math.round(el.scrollTop || 0),
+          scrollHeight: Math.round(el.scrollHeight || 0),
+          clientHeight: Math.round(el.clientHeight || 0),
+          overflowY: style.overflowY,
+          rect: {
+            x: Math.round(r.x),
+            y: Math.round(r.y),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+          },
+          text: String(el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600),
+        });
+      }
+      candidates.sort((a, b) => (b.links * 1000 + (b.scrollHeight - b.clientHeight)) - (a.links * 1000 + (a.scrollHeight - a.clientHeight)));
+      return {
+        url: location.href,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        bodyText: String(document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 1200),
+        candidates: candidates.slice(0, 12),
+      };
+    }).catch((e) => ({ error: e?.message || String(e) }));
+    await page.screenshot({ path: screenshotPath, fullPage: false }).catch(() => {});
+    fs.writeFileSync(snippetPath, JSON.stringify(diag, null, 2));
+    loggerRef.log(`[Scraper][scroll-debug] ${label}: screenshot=${screenshotPath} snippet=${snippetPath}`);
+  } catch (e) {
+    loggerRef.warn(`[Scraper][scroll-debug] capture failed: ${e?.message || e}`);
+  }
+}
+
 async function getVisibleInstagramListUsernameHandles(page, scrollTargetHandle, limit = 4) {
   if (!scrollTargetHandle) return [];
   const anchors = await scrollTargetHandle.$$('a[href^="/"], a[href*="instagram.com/"]').catch(() => []);
@@ -545,16 +636,39 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
   const bottomOffsetPx = opts.bottomOffsetPx ?? randomDelay(120, 260);
 
   const before = await page.evaluate(() => {
+    function parseUsernameFromHref(href) {
+      if (!href || typeof href !== 'string') return null;
+      let path = href.trim();
+      if (path.indexOf('http') === 0) {
+        try { path = new URL(path).pathname; } catch (_) { return null; }
+      }
+      const m = path.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
+      if (!m) return null;
+      const u = m[1].toLowerCase();
+      return /^[a-z0-9._]{2,30}$/.test(u) ? u : null;
+    }
+
     function countProfileLinks(el) {
       let c = 0;
       for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
-        const href = (a.getAttribute('href') || '').trim();
-        const m =
-          href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
-          href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
-        if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+        if (parseUsernameFromHref(a.getAttribute('href') || '')) c++;
       }
       return c;
+    }
+
+    function visibleUsernames(root) {
+      const out = [];
+      const seen = new Set();
+      for (const a of root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+        const u = parseUsernameFromHref(a.getAttribute('href') || '');
+        if (!u || seen.has(u)) continue;
+        const r = a.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4 || r.bottom < 0 || r.top > window.innerHeight) continue;
+        seen.add(u);
+        out.push(u);
+        if (out.length >= 30) break;
+      }
+      return out;
     }
 
     function scrollCandidateScore(el, linkCount) {
@@ -605,6 +719,7 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
       scrollHeight: target.scrollHeight || 0,
       clientHeight: target.clientHeight || 0,
       linkCount: countProfileLinks(target),
+      usernames: visibleUsernames(target),
       spinner: rootHasSpinner(target),
     };
   }).catch(() => null);
@@ -633,7 +748,22 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
       };
     }, bottomOffsetPx).catch(() => null);
 
-    const moved = !!pushResult && Math.abs((pushResult.now || 0) - (pushResult.prev || 0)) > 2;
+    let moved = !!pushResult && Math.abs((pushResult.now || 0) - (pushResult.prev || 0)) > 2;
+    if (!moved) {
+      const box = await targetHandle.boundingBox().catch(() => null);
+      if (box && box.width > 8 && box.height > 8) {
+        const beforeWheelTop = await targetHandle.evaluate((el) => Math.round(el.scrollTop || 0)).catch(() => 0);
+        await page.mouse
+          .move(box.x + box.width * 0.55, box.y + box.height * 0.72, { steps: randomDelay(4, 9) })
+          .catch(() => {});
+        await page.mouse.wheel({ deltaY: randomDelay(900, 1500) }).catch(() => {});
+        await delay(randomDelay(450, 950));
+        await page.keyboard.press('PageDown').catch(() => {});
+        await delay(randomDelay(350, 800));
+        const afterWheelTop = await targetHandle.evaluate((el) => Math.round(el.scrollTop || 0)).catch(() => beforeWheelTop);
+        moved = Math.abs(afterWheelTop - beforeWheelTop) > 2;
+      }
+    }
 
     const start = Date.now();
     let loadedMore = false;
@@ -643,16 +773,39 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
       await delay(randomDelay(400, 850));
 
       const after = await targetHandle.evaluate((el) => {
+        function parseUsernameFromHref(href) {
+          if (!href || typeof href !== 'string') return null;
+          let path = href.trim();
+          if (path.indexOf('http') === 0) {
+            try { path = new URL(path).pathname; } catch (_) { return null; }
+          }
+          const m = path.match(/^\/([^/?#]+)(?:\/|\?|#|$)/);
+          if (!m) return null;
+          const u = m[1].toLowerCase();
+          return /^[a-z0-9._]{2,30}$/.test(u) ? u : null;
+        }
+
         function countProfileLinks(root) {
           let c = 0;
           for (const a of root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
-            const href = (a.getAttribute('href') || '').trim();
-            const m =
-              href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
-              href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
-            if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+            if (parseUsernameFromHref(a.getAttribute('href') || '')) c++;
           }
           return c;
+        }
+
+        function visibleUsernames(root) {
+          const out = [];
+          const seen = new Set();
+          for (const a of root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+            const u = parseUsernameFromHref(a.getAttribute('href') || '');
+            if (!u || seen.has(u)) continue;
+            const r = a.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4 || r.bottom < 0 || r.top > window.innerHeight) continue;
+            seen.add(u);
+            out.push(u);
+            if (out.length >= 30) break;
+          }
+          return out;
         }
 
         function rootHasSpinner(root) {
@@ -664,13 +817,20 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
           scrollHeight: el.scrollHeight || 0,
           clientHeight: el.clientHeight || 0,
           linkCount: countProfileLinks(el),
+          usernames: visibleUsernames(el),
           spinner: rootHasSpinner(el),
         };
       }).catch(() => null);
 
       if (!after) break;
 
-      if (after.scrollHeight > before.scrollHeight + 20 || after.linkCount > before.linkCount) {
+      const beforeUsernames = Array.isArray(before.usernames) ? before.usernames.join('|') : '';
+      const afterUsernames = Array.isArray(after.usernames) ? after.usernames.join('|') : '';
+      if (
+        after.scrollHeight > before.scrollHeight + 20 ||
+        after.linkCount > before.linkCount ||
+        (beforeUsernames && afterUsernames && beforeUsernames !== afterUsernames)
+      ) {
         loadedMore = true;
         break;
       }
@@ -1100,6 +1260,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] ${listKind === 'following' ? 'Following' : 'Followers'} modal opened, extracting...`);
     await delay(randomDelay(2500, 5000));
+    await captureInstagramListScrollDebug(page, logger, jobId, `${listKind}_modal_opened`).catch(() => {});
     await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
 
     const saveLoginHandled = await page.evaluate(function () {
@@ -1155,6 +1316,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let loopIter = 0;
     let exhaustedConfirmCount = 0;
     let detachedFrameRetryUsed = false;
+    let scrollDebugAfterFirstScrollCaptured = false;
 
     while (true) {
       loopIter++;
@@ -1414,6 +1576,13 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         logger.log(
           `[Scraper][Loop ${loopIter}] Scroll chunk ${batchIndex + 1}/3: scrolled=${!!scrolled} moved=${!!loadResult.moved} loadedMore=${!!loadResult.loadedMore} exhausted=${!!loadResult.exhausted}`
         );
+        if (!scrollDebugAfterFirstScrollCaptured && loopIter === 1 && batchIndex === 0) {
+          scrollDebugAfterFirstScrollCaptured = true;
+          await captureInstagramListScrollDebug(page, logger, jobId, `${listKind}_after_first_scroll`).catch(() => {});
+        }
+        if (!scrolled && !loadResult.moved && !loadResult.loadedMore && batchIndex === 0 && (loopIter <= 2 || exhaustedThisIter)) {
+          await captureInstagramListScrollDebug(page, logger, jobId, `${listKind}_loop_${loopIter}_scroll_failed`).catch(() => {});
+        }
 
         if (batchIndex < 2 && Math.random() < 0.35) {
           await randomMouseDrift(page, { totalDurationMs: randomDelay(250, 700) }).catch(() => {});
