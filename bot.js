@@ -986,10 +986,24 @@ async function handleInstagramTermsUnblock(page) {
 
   const maxPasses = 40;
   let refreshedBlankTermsPage = false;
+  let recoveredApiLandingPage = false;
 
   for (let pass = 0; pass < maxPasses; pass++) {
-    if (!isInstagramTermsUnblockUrl(page.url())) {
-      logger.log(`terms/unblock cleared; url=${page.url()}`);
+    const currentUrl = String(page.url() || '');
+    const currentUrlLower = currentUrl.toLowerCase();
+    if (!isInstagramTermsUnblockUrl(currentUrl)) {
+      if (
+        !recoveredApiLandingPage &&
+        currentUrlLower.includes('instagram.com/api/') &&
+        (currentUrlLower.includes('/fxcal/') || currentUrlLower.includes('/ig_sso_users/'))
+      ) {
+        recoveredApiLandingPage = true;
+        logger.warn(`terms/unblock redirected to Instagram API URL (${currentUrl}); navigating back to app shell.`);
+        await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        await delay(2500);
+        continue;
+      }
+      logger.log(`terms/unblock cleared; url=${currentUrl}`);
       return true;
     }
 
@@ -1004,7 +1018,9 @@ async function handleInstagramTermsUnblock(page) {
       await delay(200);
     }
 
-    const step = await page.evaluate(() => {
+    let step;
+    try {
+      step = await page.evaluate(() => {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
       const lower = (s) => norm(s).toLowerCase();
 
@@ -1203,38 +1219,69 @@ async function handleInstagramTermsUnblock(page) {
       }
 
       return { action: 'scroll_only', label: '', ok: false };
-    });
+      });
+    } catch (e) {
+      const msg = String((e && e.message) || e || '');
+      if (/execution context was destroyed|most likely because of a navigation|cannot find context/i.test(msg)) {
+        logger.warn('[terms/unblock] navigation/context changed while handling terms; waiting for the next page state.');
+        await delay(1800);
+        continue;
+      }
+      throw e;
+    }
 
     if (step.ok) {
       logger.log(`terms/unblock pass ${pass + 1}: ${step.action} "${step.label || ''}"`);
       await delay(1600);
-      const blankState = await page.evaluate(() => {
-        const bodyText = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
-        const visibleInteractive = Array.from(document.querySelectorAll('button, [role="button"], a, input, textarea'))
-          .filter((el) => {
-            try {
-              const st = window.getComputedStyle(el);
-              if (st.visibility === 'hidden' || st.display === 'none') return false;
-              const r = el.getBoundingClientRect();
-              return r.width >= 2 && r.height >= 2;
-            } catch {
-              return false;
-            }
-          });
-        return {
-          blankish: bodyText.length < 80 && visibleInteractive.length <= 1,
-          bodyLen: bodyText.length,
-          href: location.href,
-        };
-      }).catch(() => ({ blankish: false, bodyLen: 999, href: page.url() }));
+      let blankState;
+      try {
+        blankState = await page.evaluate(() => {
+          const bodyText = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+          const visibleInteractive = Array.from(document.querySelectorAll('button, [role="button"], a, input, textarea'))
+            .filter((el) => {
+              try {
+                const st = window.getComputedStyle(el);
+                if (st.visibility === 'hidden' || st.display === 'none') return false;
+                const r = el.getBoundingClientRect();
+                return r.width >= 2 && r.height >= 2;
+              } catch {
+                return false;
+              }
+            });
+          return {
+            blankish: bodyText.length < 80 && visibleInteractive.length <= 1,
+            bodyLen: bodyText.length,
+            href: location.href,
+          };
+        });
+      } catch (e) {
+        const msg = String((e && e.message) || e || '');
+        if (/execution context was destroyed|most likely because of a navigation|cannot find context/i.test(msg)) {
+          logger.warn('[terms/unblock] navigation/context changed after CTA click; waiting for the next page state.');
+          await delay(1800);
+          continue;
+        }
+        blankState = { blankish: false, bodyLen: 999, href: page.url() };
+      }
       if (
         !refreshedBlankTermsPage &&
         blankState.blankish &&
         String(blankState.href || '').includes('instagram.com')
       ) {
         refreshedBlankTermsPage = true;
-        logger.warn(`terms/unblock click landed on a blank/sticky page (bodyLen=${blankState.bodyLen}); reloading once.`);
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        const blankHref = String(blankState.href || '');
+        if (
+          !recoveredApiLandingPage &&
+          /instagram\.com\/api\//i.test(blankHref) &&
+          (/\/fxcal\//i.test(blankHref) || /\/ig_sso_users\//i.test(blankHref))
+        ) {
+          recoveredApiLandingPage = true;
+          logger.warn(`terms/unblock landed on Instagram API page (${blankHref}); navigating back to app shell.`);
+          await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        } else {
+          logger.warn(`terms/unblock click landed on a blank/sticky page (bodyLen=${blankState.bodyLen}); reloading once.`);
+          await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        }
         await delay(2500);
       }
       continue;
@@ -5500,8 +5547,6 @@ async function runBotMultiTenant() {
                 .catch(() => {});
             }
           }
-          // Keep control flag aligned with worker state so dashboards don't show "running" after an auto-exit.
-          await sb.setControl(cid, 1).catch(() => {});
         }
         logger.log('No work. Exiting after surfacing the specific blocker for each client.');
         await invalidateSendWorkerBrowser(null);

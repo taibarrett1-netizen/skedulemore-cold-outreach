@@ -1881,7 +1881,7 @@ app.post('/api/control/start', async (req, res) => {
         if (reason === 'no_pending' && !rMsg) {
           statusToSet = 'No pending leads to send.';
         } else if (reason === 'pending_ready' && !rMsg) {
-          statusToSet = 'Send enabled — jobs will run when a send worker picks them up.';
+          statusToSet = 'Ready to send.';
         } else if (rMsg) {
           statusToSet = rMsg.slice(0, 500);
         } else {
