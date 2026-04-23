@@ -275,11 +275,34 @@ async function getInstagramListScrollTargetHandle(page) {
 
     let dialog = null;
     let bestCount = 0;
-    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+    for (const d of document.querySelectorAll('[role="dialog"]')) {
+      const count = countProfileLinks(d);
+      const text = (d.textContent || '').toLowerCase();
+      const rect = d.getBoundingClientRect();
+      const compactModal = rect.width >= 280 && rect.width <= Math.min(760, window.innerWidth - 40) && rect.height >= 220;
+      if (count > bestCount && count >= 3 && compactModal && (text.includes('followers') || text.includes('following') || text.includes('search'))) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('[role="dialog"], div[role="menu"]')) {
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 5) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('div[role="presentation"]')) {
+        const rect = d.getBoundingClientRect();
+        if (rect.width > window.innerWidth * 0.85 && rect.height > window.innerHeight * 0.85) continue;
       const count = countProfileLinks(d);
       if (count > bestCount && count >= 5) {
         bestCount = count;
         dialog = d;
+      }
       }
     }
     if (bestCount < 5) {
@@ -389,11 +412,34 @@ async function getInstagramListModalSnapshot(page) {
 
     let dialog = null;
     let bestCount = 0;
-    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+    for (const d of document.querySelectorAll('[role="dialog"]')) {
+      const count = countProfileLinks(d);
+      const text = (d.textContent || '').toLowerCase();
+      const rect = d.getBoundingClientRect();
+      const compactModal = rect.width >= 280 && rect.width <= Math.min(760, window.innerWidth - 40) && rect.height >= 220;
+      if (count > bestCount && count >= 3 && compactModal && (text.includes('followers') || text.includes('following') || text.includes('search'))) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('[role="dialog"], div[role="menu"]')) {
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 5) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('div[role="presentation"]')) {
+        const rect = d.getBoundingClientRect();
+        if (rect.width > window.innerWidth * 0.85 && rect.height > window.innerHeight * 0.85) continue;
       const count = countProfileLinks(d);
       if (count > bestCount && count >= 5) {
         bestCount = count;
         dialog = d;
+      }
       }
     }
     if (bestCount < 5) {
@@ -704,11 +750,34 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
 
     let dialog = null;
     let bestCount = 0;
-    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+    for (const d of document.querySelectorAll('[role="dialog"]')) {
+      const count = countProfileLinks(d);
+      const text = (d.textContent || '').toLowerCase();
+      const rect = d.getBoundingClientRect();
+      const compactModal = rect.width >= 280 && rect.width <= Math.min(760, window.innerWidth - 40) && rect.height >= 220;
+      if (count > bestCount && count >= 3 && compactModal && (text.includes('followers') || text.includes('following') || text.includes('search'))) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('[role="dialog"], div[role="menu"]')) {
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 5) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) {
+      for (const d of document.querySelectorAll('div[role="presentation"]')) {
+        const rect = d.getBoundingClientRect();
+        if (rect.width > window.innerWidth * 0.85 && rect.height > window.innerHeight * 0.85) continue;
       const count = countProfileLinks(d);
       if (count > bestCount && count >= 5) {
         bestCount = count;
         dialog = d;
+      }
       }
     }
     if (!dialog) return null;
@@ -1349,12 +1418,36 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           }
           return c;
         }
-        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]');
-        for (const d of candidates) {
+        for (const d of document.querySelectorAll('[role="dialog"]')) {
+          const count = countProfileLinks(d);
+          const text = (d.textContent || '').toLowerCase();
+          const rect = d.getBoundingClientRect();
+          const compactModal = rect.width >= 280 && rect.width <= Math.min(760, window.innerWidth - 40) && rect.height >= 220;
+          if (count > bestCount && count >= 3 && compactModal && (text.includes('followers') || text.includes('following') || text.includes('search'))) {
+            bestCount = count;
+            root = d;
+          }
+        }
+        if (bestCount < 3) {
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="menu"]');
+          for (const d of candidates) {
+            const count = countProfileLinks(d);
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              root = d;
+            }
+          }
+        }
+        if (bestCount < 3) {
+          const candidates = document.querySelectorAll('div[role="presentation"]');
+          for (const d of candidates) {
+            const rect = d.getBoundingClientRect();
+            if (rect.width > window.innerWidth * 0.85 && rect.height > window.innerHeight * 0.85) continue;
           const count = countProfileLinks(d);
           if (count > bestCount && count >= 5) {
             bestCount = count;
             root = d;
+          }
           }
         }
         if (bestCount < 5) {
