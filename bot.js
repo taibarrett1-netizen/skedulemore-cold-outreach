@@ -2687,6 +2687,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }));
   }
   if (!searchPick.ok) {
+    const failureUrl = String(page.url() || '').toLowerCase();
+    if (failureUrl.includes('/terms/unblock')) {
+      const handledTerms = await handleInstagramTermsUnblock(page).catch(() => false);
+      if (handledTerms) {
+        return {
+          ok: false,
+          reason: 'retry_needed_after_terms_unblock',
+          pageSnippet: 'Accepted Instagram terms/unblock during search-result selection. Retrying DM open flow.',
+        };
+      }
+    }
     await logDmSearchFailureDiagnostics(page, u, searchPick).catch(() => {});
     return {
       ok: false,
