@@ -201,8 +201,11 @@ async function main() {
         claimErrorCount = 0;
       } catch (e) {
         const waitMs = backoffMs(claimErrorCount++);
+        const cause = e?.cause
+          ? ` cause=${e.cause.code || e.cause.name || e.cause.message || String(e.cause)}`
+          : '';
         logger.warn(
-          `[scrape-worker] claim failed; backing off ${Math.ceil(waitMs / 1000)}s (${e?.message || e})`
+          `[scrape-worker] claim failed; backing off ${Math.ceil(waitMs / 1000)}s (${e?.message || e}${cause})`
         );
         await delay(waitMs);
         break;

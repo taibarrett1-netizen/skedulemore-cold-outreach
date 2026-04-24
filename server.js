@@ -1397,7 +1397,16 @@ app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
     logger.warn(
       `[API] follow-up/send response ok=false status=${status} error=${result.error || 'Send failed'}${corrPart}`
     );
-    return res.status(status).json({ ok: false, error: result.error || 'Send failed' });
+    return res.status(status).json({
+      ok: false,
+      error: result.error || 'Send failed',
+      ...(result.code ? { code: result.code } : {}),
+      ...(result.retryable != null ? { retryable: Boolean(result.retryable) } : {}),
+      ...(result.retryAfter ? { retryAfter: result.retryAfter } : {}),
+      ...(result.retryAfterIso ? { retryAfterIso: result.retryAfterIso } : {}),
+      ...(result.dailyLimit != null ? { dailyLimit: result.dailyLimit } : {}),
+      ...(result.totalSent != null ? { totalSent: result.totalSent } : {}),
+    });
   } catch (e) {
     logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });

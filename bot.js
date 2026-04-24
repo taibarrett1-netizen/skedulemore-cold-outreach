@@ -4557,12 +4557,12 @@ function followUpReasonToError(reason, pageSnippet) {
  * Follow-up audio is configured in dashboard `bot_config.follow_ups[]`; this handler does not read campaigns or
  * `cold_dm_message_group_messages` / migration 010 columns — only the request body + `cold_dm_instagram_sessions`.
  */
-function logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId) {
+function logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId, extra = {}) {
   const c = correlationId ? ` correlationId=${correlationId}` : '';
   logger.warn(
     `[follow-up] failed clientId=${clientId || '-'} sessionId=${instagramSessionId || '-'} recipient=@${recipientUsername || '-'} error=${error}${c}`
   );
-  return { ok: false, error, statusCode };
+  return { ok: false, error, statusCode, ...extra };
 }
 
 /** Success payload for dashboard webhook dedupe (GraphQL `item_id` when captured). */
@@ -4585,8 +4585,8 @@ async function sendFollowUp(body) {
   const clientId = (body.clientId || '').trim();
   const instagramSessionId = (body.instagramSessionId || '').trim();
   const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
-  const fail = (error, statusCode) =>
-    logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId);
+  const fail = (error, statusCode, extra) =>
+    logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId, extra);
   if (!clientId || !instagramSessionId || !recipientUsername) {
     return fail('clientId, instagramSessionId, and recipientUsername are required', 400);
   }
@@ -4640,7 +4640,15 @@ async function sendFollowUp(body) {
       const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
       return fail(
         `Instagram session daily DM limit reached (${usageApi.totalSent}/${sessionDailyCapApi}). Retry after ${preciseResume.resumeAtIso}.`,
-        429
+        429,
+        {
+          code: 'instagram_session_daily_dm_limit',
+          retryable: true,
+          retryAfter: preciseResume.resumeAtIso,
+          retryAfterIso: preciseResume.resumeAtIso,
+          dailyLimit: sessionDailyCapApi,
+          totalSent: usageApi.totalSent,
+        }
       );
     }
   }
