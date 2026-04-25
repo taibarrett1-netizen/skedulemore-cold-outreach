@@ -891,12 +891,27 @@ async function ensureDirectNewComposerMode(page, logger) {
             title.includes('compose')
           );
         });
-        if (newMessageBtn) {
-          (newMessageBtn.closest('button, [role="button"], a') || newMessageBtn).click();
+        const topRightIconBtn = clickables.find((el) => {
+          const r = el.getBoundingClientRect();
+          if (!(r.top >= 0 && r.top <= 180 && r.left >= window.innerWidth * 0.55)) return false;
+          const t = norm(el.textContent).replace(/\s+/g, ' ').trim();
+          if (t === 'profile' || t === 'more' || t === 'menu') return false;
+          const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+          const title = norm(el.getAttribute && el.getAttribute('title'));
+          // Some IG variants render compose as icon-only.
+          if (aria.includes('new message') || title.includes('new message') || aria.includes('compose') || title.includes('compose')) {
+            return true;
+          }
+          const hasSvg = !!el.querySelector('svg');
+          return hasSvg && t.length <= 2;
+        });
+        const clickTarget = newMessageBtn || topRightIconBtn;
+        if (clickTarget) {
+          (clickTarget.closest('button, [role="button"], a') || clickTarget).click();
           return {
             inComposer: false,
             clicked: true,
-            clickLabel: (newMessageBtn.textContent || newMessageBtn.getAttribute('aria-label') || 'new message')
+            clickLabel: (clickTarget.textContent || clickTarget.getAttribute('aria-label') || clickTarget.getAttribute('title') || 'new message')
               .toString()
               .trim(),
             hasInboxTabs,
@@ -917,6 +932,37 @@ async function ensureDirectNewComposerMode(page, logger) {
     }
     break;
   }
+  // Final non-DOM fallback: top-right click by coordinates in case button semantics are stripped.
+  try {
+    const fallbackState = await page.evaluate(() => {
+      const text = ((document.body && document.body.innerText) || '').toLowerCase();
+      const hasInboxTabs = text.includes('primary') && text.includes('general');
+      const hasToField = Array.from(
+        document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
+      ).some((el) => {
+        const ph = ((el.getAttribute && el.getAttribute('placeholder')) || '').toLowerCase();
+        const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
+        return ph.includes('to:') || aria.includes('to:');
+      });
+      return { hasInboxTabs, hasToField };
+    });
+    if (fallbackState.hasInboxTabs && !fallbackState.hasToField) {
+      const vp = page.viewport() || { width: 1280, height: 800 };
+      await page.mouse.click(Math.floor(vp.width * 0.93), 34, { delay: 80 });
+      logger.log('[dm-search] Composer fallback click at top-right coordinates');
+      await delay(900);
+      const nowComposer = await page.evaluate(() => {
+        return Array.from(
+          document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
+        ).some((el) => {
+          const ph = ((el.getAttribute && el.getAttribute('placeholder')) || '').toLowerCase();
+          const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
+          return ph.includes('to:') || aria.includes('to:');
+        });
+      });
+      if (nowComposer) return true;
+    }
+  } catch (_) {}
   return false;
 }
 
@@ -2800,7 +2846,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   // Includes cookie-consent handling; direct/new can surface cookie walls that block search/compose.
   await dismissInstagramPopups(page, logger);
   await delay(500);
-  await ensureDirectNewComposerMode(page, logger).catch(() => {});
+  const composerReady = await ensureDirectNewComposerMode(page, logger).catch(() => false);
+  if (!composerReady) {
+    logger.warn('[dm-search] Could not confirm composer mode on /direct/new before search typing.');
+  }
 
   // Wait for the direct/new search UI to render (may be an input, textarea, or contenteditable element).
   await page
@@ -2867,6 +2916,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       }
     });
 
+    const bodyLower = ((document.body && document.body.innerText) || '').toLowerCase();
+    const looksLikeInboxChrome = bodyLower.includes('primary') && bodyLower.includes('general');
+
     const findWithHints = (predicates) => {
       for (const pred of predicates) {
         const hit = candidates.find((el) => pred(el));
@@ -2893,10 +2945,20 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return !!el.isContentEditable;
     };
 
+    const toFieldOnly = (el) => {
+      const ph = normalize(el.placeholder);
+      const aria = normalize(el.getAttribute && el.getAttribute('aria-label'));
+      return ph.includes('to:') || aria.includes('to:');
+    };
+
     const hit =
-      findWithHints([searchOrTo, comboboxRole]) ||
-      findWithHints([textInput]) ||
-      candidates[0] ||
+      // If inbox chrome is visible, never pick generic search fields; require "To:".
+      (looksLikeInboxChrome
+        ? findWithHints([toFieldOnly])
+        : findWithHints([searchOrTo, comboboxRole])) ||
+      findWithHints([toFieldOnly]) ||
+      (!looksLikeInboxChrome ? findWithHints([textInput]) : null) ||
+      (!looksLikeInboxChrome ? candidates[0] : null) ||
       null;
 
     return hit;
