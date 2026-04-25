@@ -3301,6 +3301,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         if (el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) candidates.push(el);
       });
     }
+    console.log('BUTTONS:', candidates.map(el => (el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40)).filter(Boolean).join(' | '));
     const needle = (t) => t.toLowerCase().replace(/\s+/g, ' ').trim();
     const labels = ['send message', 'message', 'next', 'chat', 'send a message', 'start a chat'];
     for (const label of labels) {
