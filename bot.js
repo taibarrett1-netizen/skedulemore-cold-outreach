@@ -1003,6 +1003,81 @@ async function dismissNotificationsPromptHard(page, logger) {
   }
 }
 
+function normalizeExtractedDisplayName(rawDisplayName) {
+  const raw = String(rawDisplayName || '').replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  const parts = raw.split(' ').filter(Boolean);
+  // Handle badge text appended as a separate trailing token: "Name Verified".
+  if (parts.length >= 2 && parts[parts.length - 1].toLowerCase() === 'verified') {
+    return parts.slice(0, -1).join(' ');
+  }
+  return raw;
+}
+
+function isLowConfidenceThreadNameExtraction(nameDebug) {
+  if (!nameDebug || typeof nameDebug !== 'object') return false;
+  const winningPath = String(nameDebug.winningPath || '');
+  const paneTag = String(nameDebug?.threadPane?.paneTag || '').toUpperCase();
+  const fallbackToBody = nameDebug?.threadPane?.fallbackToBody === true;
+  const composeFound = nameDebug?.threadPane?.composeFound === true;
+  if (fallbackToBody || paneTag === 'BODY' || !composeFound) return true;
+  if (
+    winningPath === 'step3_profile_link_parent' ||
+    winningPath === 'step4_pane_text_before_username_token' ||
+    winningPath === 'step1_header_banner_text_fallback'
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Force the DM recipient search field to the exact username (guards against stale/duplicated text
+ * between retries like "instagraminstagram" or partial cursor insertions).
+ */
+async function setDmSearchFieldExact(page, fieldEl, username) {
+  const target = String(username || '').trim().replace(/^@/, '');
+  if (!fieldEl || !target) return false;
+  const targetLower = target.toLowerCase();
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await page
+      .evaluate((el, value) => {
+        const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
+        const isCE = !!el.isContentEditable || el.getAttribute('contenteditable') === 'true';
+        try {
+          el.focus();
+        } catch {}
+        if (isInput) {
+          el.value = '';
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+          el.value = value;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return;
+        }
+        if (isCE) {
+          el.textContent = '';
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+          el.textContent = value;
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        }
+      }, fieldEl, target)
+      .catch(() => {});
+    await delay(120);
+    const check = await page
+      .evaluate((el) => {
+        const isInput = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA';
+        const isCE = !!el.isContentEditable || el.getAttribute('contenteditable') === 'true';
+        if (isInput) return (el.value || '').toString().trim();
+        if (isCE) return (el.innerText || el.textContent || '').toString().trim();
+        return '';
+      }, fieldEl)
+      .catch(() => '');
+    if (String(check || '').toLowerCase() === targetLower) return true;
+  }
+  return false;
+}
+
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
 function instagramAuthUrlFailureReason(url) {
   try {
@@ -3086,11 +3161,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       await clickElementNaturally(page, retrySearchEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
       await organicPause('compose', 0.45);
       if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA' || retryMeta.isCE) {
-        await focusAndTypeNaturally(page, retrySearchEl, u, {
-          clearFirst: true,
-          minKeyDelay: 45,
-          maxKeyDelay: 120,
-        });
+        const exactSet = await setDmSearchFieldExact(page, retrySearchEl, u).catch(() => false);
+        if (!exactSet) {
+          await focusAndTypeNaturally(page, retrySearchEl, u, {
+            clearFirst: true,
+            minKeyDelay: 45,
+            maxKeyDelay: 120,
+          });
+        }
       } else {
         await delay(100);
         await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
@@ -3139,11 +3217,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await organicPause('compose', 0.45);
 
   if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA' || searchMeta.isCE) {
-    await focusAndTypeNaturally(page, searchEl, u, {
-      clearFirst: true,
-      minKeyDelay: 45,
-      maxKeyDelay: 120,
-    });
+    const exactSet = await setDmSearchFieldExact(page, searchEl, u).catch(() => false);
+    if (!exactSet) {
+      await focusAndTypeNaturally(page, searchEl, u, {
+        clearFirst: true,
+        minKeyDelay: 45,
+        maxKeyDelay: 120,
+      });
+    }
   } else {
     // contenteditable element: use keyboard typing so React/Instagram gets the right events
     await delay(100);
@@ -4125,9 +4206,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       }
 
       if (extracted) {
-        const trimmed = extracted.trim();
+        const trimmed = normalizeExtractedDisplayName(extracted).trim();
+        const extractionLowConfidence = isLowConfidenceThreadNameExtraction(nameDebug);
         if (/^\d{1,3}\s*[mhdw]$/i.test(trimmed)) {
-          logger.log(`Display name from thread for @${u} ignored (inbox time token, not a name): "${extracted}"`);
+          logger.log(`Display name from thread for @${u} ignored (inbox time token, not a name): "${trimmed}"`);
+        } else if (extractionLowConfidence && displayNameForSubst) {
+          logger.log(
+            `Display name from thread for @${u} ignored (low-confidence extraction: ${nameDebug?.winningPath || 'unknown'}); keeping row-based name "${displayNameForSubst}"`
+          );
         } else {
           const firstWord = trimmed.split(/\s+/)[0] || '';
           const normalizedFirst = normalizeName(firstWord);
@@ -4138,9 +4224,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             logger.log(`Display name from thread for @${u} not used: first name "${normalizedFirst}" is blocklisted`);
           } else {
             if (preferThreadName || !displayNameForSubst) {
-              displayNameForSubst = extracted;
+              displayNameForSubst = trimmed;
               resolvedNameSource = 'thread';
-              logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+              logger.log(`Using display name from thread for @${u}: "${trimmed}"`);
             }
           }
         }
