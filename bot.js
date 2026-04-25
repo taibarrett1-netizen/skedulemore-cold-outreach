@@ -4362,7 +4362,20 @@ async function previewDmLeadNamesFromSession(body) {
           : {}),
       };
     }
-    return { ok: false, error: 'Unexpected send path (preview only)' };
+    return {
+      ok: false,
+      error: result.reason || 'preview_failed',
+      reason: result.reason || null,
+      username: result.username,
+      url: result.url,
+      composeFound: result.composeFound,
+      pane_scoped_snippet: result.pane_scoped_snippet,
+      body_snippet: result.body_snippet,
+      name_extraction_debug: result.name_extraction_debug,
+      ...(result.compose_recovery_screenshot
+        ? { compose_recovery_screenshot: result.compose_recovery_screenshot }
+        : {}),
+    };
   } catch (e) {
     if (e && e.code === 'INSTAGRAM_PASSWORD_REAUTH' && clientId && instagramSessionId) {
       await sb.handleInstagramPasswordReauthDisruption(clientId, instagramSessionId).catch(() => {});
