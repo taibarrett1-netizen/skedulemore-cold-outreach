@@ -1,0 +1,24 @@
+CLEAR WARNINGS
+
+1) Clear Graph API false reconnect badge
+update public.instagram_accounts
+set
+  needs_reconnect = false,
+  connection_status = 'connected',
+  connection_error = null,
+  is_active = true,
+  updated_at = now()
+where client_id = '218bb47f-b112-42fb-b42b-ba2a80a8c710'
+  and lower(username) = 'tatjanahummels';
+2) Clear Automation session (outbound) reconnect badge
+update public.cold_dm_instagram_sessions
+set
+  web_session_needs_refresh = false,
+  updated_at = now()
+where id = 'd2f3cfa2-e669-4c6e-8bda-ac1de4cf479d';
+3) Optional cleanup (stale status text that can keep warning vibes)
+update public.cold_dm_control
+set
+  status_message = null,
+  updated_at = now()
+where client_id = '218bb47f-b112-42fb-b42b-ba2a80a8c710';
