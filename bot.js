@@ -1053,11 +1053,18 @@ async function setDmSearchFieldExact(page, fieldEl, username) {
           el.focus();
         } catch {}
         if (isInput) {
-          el.value = '';
-          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
-          el.value = value;
-          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+          el.focus();
+          // Use React's internal setter to trigger synthetic events
+          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+          ).set;
+          nativeInputValueSetter.call(el, '');
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          await new Promise(r => setTimeout(r, 50));
+          nativeInputValueSetter.call(el, value);
+          el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
           return;
         }
         if (isCE) {
