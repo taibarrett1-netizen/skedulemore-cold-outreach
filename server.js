@@ -68,6 +68,7 @@ const envPath = path.join(projectRoot, '.env');
 const leadsPath = path.join(projectRoot, process.env.LEADS_CSV || 'leads.csv');
 const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
+const loginDebugScreenshotsDir = path.join(projectRoot, 'logs', 'login-debug');
 const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -1533,6 +1534,63 @@ app.get('/api/debug/follow-up-screenshots/file', (req, res) => {
   const fp = path.join(followUpScreenshotsDir, name);
   const resolved = path.resolve(fp);
   const resolvedDir = path.resolve(followUpScreenshotsDir);
+  if (!resolved.startsWith(resolvedDir + path.sep)) {
+    return res.status(400).json({ ok: false, error: 'Invalid path' });
+  }
+  if (!fs.existsSync(resolved)) return res.status(404).json({ ok: false, error: 'Not found' });
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+  res.sendFile(resolved);
+});
+
+/** List PNGs from logs/login-debug (DM search / login / compose debug captures). */
+app.get('/api/debug/login-screenshots', (req, res) => {
+  try {
+    if (!fs.existsSync(loginDebugScreenshotsDir)) {
+      return res.json({
+        ok: true,
+        files: [],
+        directory: 'logs/login-debug',
+        hint: 'Enable DM_SEARCH_DEBUG_SCREENSHOTS=true, then run preview/connect/send to generate screenshots.',
+      });
+    }
+    const names = fs
+      .readdirSync(loginDebugScreenshotsDir)
+      .filter((f) => /\.png$/i.test(f) && !f.startsWith('.'));
+    const files = names
+      .map((name) => {
+        const fp = path.join(loginDebugScreenshotsDir, name);
+        try {
+          const st = fs.statSync(fp);
+          return { name, size: st.size, mtime: st.mtime.toISOString() };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean)
+      .sort((a, b) => (a.mtime < b.mtime ? 1 : -1));
+    return res.json({
+      ok: true,
+      files,
+      directory: 'logs/login-debug',
+      downloadUrl: '/api/debug/login-screenshots/file?name=FILENAME.png',
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message || 'list failed' });
+  }
+});
+
+/** Download one screenshot PNG from logs/login-debug (query: name=). */
+app.get('/api/debug/login-screenshots/file', (req, res) => {
+  const raw = req.query.name;
+  const name =
+    raw && typeof raw === 'string' && /^[a-zA-Z0-9._-]+\.png$/i.test(path.basename(raw))
+      ? path.basename(raw)
+      : null;
+  if (!name) return res.status(400).json({ ok: false, error: 'Invalid or missing ?name=filename.png' });
+  const fp = path.join(loginDebugScreenshotsDir, name);
+  const resolved = path.resolve(fp);
+  const resolvedDir = path.resolve(loginDebugScreenshotsDir);
   if (!resolved.startsWith(resolvedDir + path.sep)) {
     return res.status(400).json({ ok: false, error: 'Invalid path' });
   }
