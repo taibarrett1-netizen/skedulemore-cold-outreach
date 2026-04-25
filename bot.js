@@ -1060,7 +1060,6 @@ async function setDmSearchFieldExact(page, fieldEl, username) {
           ).set;
           nativeInputValueSetter.call(el, '');
           el.dispatchEvent(new Event('input', { bubbles: true }));
-          await new Promise(r => setTimeout(r, 50));
           nativeInputValueSetter.call(el, value);
           el.dispatchEvent(new Event('input', { bubbles: true }));
           el.dispatchEvent(new Event('change', { bubbles: true }));
