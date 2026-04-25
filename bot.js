@@ -966,6 +966,43 @@ async function ensureDirectNewComposerMode(page, logger) {
   return false;
 }
 
+/** Extra-hard close for IG "Turn on Notifications" prompt inside New message composer. */
+async function dismissNotificationsPromptHard(page, logger) {
+  for (let i = 0; i < 4; i++) {
+    const clicked = await page
+      .evaluate(() => {
+        const visible = (el) => {
+          try {
+            if (!el || el.disabled) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 2 && r.height > 2;
+          } catch {
+            return false;
+          }
+        };
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+        for (const d of dialogs) {
+          const t = norm(d.textContent || '');
+          if (!t.includes('turn on notifications')) continue;
+          const clickables = Array.from(
+            d.querySelectorAll('button, [role="button"], div[role="button"], span[role="button"], a')
+          ).filter(visible);
+          const notNow = clickables.find((el) => norm(el.textContent || '') === 'not now');
+          if (notNow) {
+            (notNow.closest('button, [role="button"], a') || notNow).click();
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (!clicked) break;
+    if (logger) logger.log('[dm-search] Dismissed notifications prompt via hard handler');
+    await delay(600);
+  }
+}
+
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
 function instagramAuthUrlFailureReason(url) {
   try {
@@ -2889,7 +2926,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     )
     .catch(() => {});
 
-  const searchHandle = await page.evaluateHandle(() => {
+  let searchHandle = await page.evaluateHandle(() => {
     const normalize = (s) => (s || '').toString().toLowerCase();
     const candidates = Array.from(
       document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
@@ -2964,7 +3001,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     return hit;
   });
 
-  const searchEl = searchHandle.asElement();
+  let searchEl = searchHandle.asElement();
   if (!searchEl) {
     const diag = await page
       .evaluate(() => {
@@ -3060,10 +3097,40 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       }
       await retrySearchEl.dispose().catch(() => {});
       await retryHandle.dispose().catch(() => {});
+      searchHandle = await page.evaluateHandle(() => {
+        const norm = (s) => (s || '').toString().toLowerCase();
+        const visible = (el) => {
+          try {
+            if (!el || el.disabled) return false;
+            if (el.type === 'hidden') return false;
+            const r = el.getClientRects && el.getClientRects();
+            return !!(r && r.length);
+          } catch {
+            return false;
+          }
+        };
+        const els = Array.from(
+          document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
+        ).filter(visible);
+        const toField = els.find((el) => {
+          const ph = norm(el.getAttribute && el.getAttribute('placeholder'));
+          const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+          return ph.includes('to:') || aria.includes('to:');
+        });
+        return toField || els[0] || null;
+      });
+      searchEl = searchHandle.asElement();
     } else {
       await retryHandle.dispose().catch(() => {});
       throw new Error(`Search input not found on direct/new page (url=${diag?.url || 'unknown'} visible=${diag?.visibleCount ?? 'n/a'})`);
     }
+  }
+
+  await dismissNotificationsPromptHard(page, logger).catch(() => {});
+  await dismissInstagramPopups(page, logger).catch(() => {});
+
+  if (!searchEl) {
+    throw new Error('Search input handle is null after retry resolution');
   }
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
@@ -3083,8 +3150,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
   }
 
-  await searchEl.dispose();
-  await searchHandle.dispose();
+  await searchEl.dispose().catch(() => {});
+  await searchHandle.dispose().catch(() => {});
   await organicPause('open_dm');
   await dismissInstagramPopups(page, logger).catch(() => {});
   await delay(300);
