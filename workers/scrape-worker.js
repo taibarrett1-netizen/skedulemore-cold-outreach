@@ -20,6 +20,22 @@ const logPrefix = clientId ? `[${clientId.slice(0, 8)}]` : '[unscoped]';
   logger[method] = (msg, ...rest) => original(`${logPrefix} ${msg}`, ...rest);
 });
 
+['log', 'warn', 'error', 'info', 'debug'].forEach((method) => {
+  const orig = console[method];
+  if (typeof orig !== 'function') return;
+  console[method] = (...args) => {
+    if (args.length && typeof args[0] === 'string' && args[0].startsWith(logPrefix)) {
+      return orig.apply(console, args);
+    }
+    if (args.length && typeof args[0] === 'string') {
+      args[0] = `${logPrefix} ${args[0]}`;
+    } else {
+      args.unshift(logPrefix);
+    }
+    return orig.apply(console, args);
+  };
+});
+
 const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);

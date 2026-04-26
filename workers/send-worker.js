@@ -19,6 +19,23 @@ const logPrefix = clientId ? `[${clientId.slice(0, 8)}]` : '[unscoped]';
   logger[method] = (msg, ...rest) => original(`${logPrefix} ${msg}`, ...rest);
 });
 
+// database/supabase.js (and some deps) use console.* — prefix those too so worker logs grep cleanly.
+['log', 'warn', 'error', 'info', 'debug'].forEach((method) => {
+  const orig = console[method];
+  if (typeof orig !== 'function') return;
+  console[method] = (...args) => {
+    if (args.length && typeof args[0] === 'string' && args[0].startsWith(logPrefix)) {
+      return orig.apply(console, args);
+    }
+    if (args.length && typeof args[0] === 'string') {
+      args[0] = `${logPrefix} ${args[0]}`;
+    } else {
+      args.unshift(logPrefix);
+    }
+    return orig.apply(console, args);
+  };
+});
+
 async function main() {
   if (!sb.isSupabaseConfigured() && !fs.existsSync(csvPath)) {
     logger.error(`Leads file not found: ${csvPath}. Create leads.csv or set LEADS_CSV (or use Supabase).`);
