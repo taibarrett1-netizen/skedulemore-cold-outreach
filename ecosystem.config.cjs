@@ -25,7 +25,9 @@ module.exports = {
     {
       name: 'ig-dm-dashboard',
       script: 'server.js',
-      max_memory_restart: '512M',
+      // Dashboard runs Puppeteer for Instagram connect; 512M causes PM2 restart loops under real load.
+      max_memory_restart: process.env.PM2_DASHBOARD_MAX_MEMORY || '2048M',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
     },
   ],
 };
