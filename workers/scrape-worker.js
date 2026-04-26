@@ -11,6 +11,14 @@ const os = require('os');
 const logger = require('../utils/logger');
 const sb = require('../database/supabase');
 const legacyScraper = require('../scraper');
+const clientId = String(process.env.COLD_DM_CLIENT_ID || '').trim();
+const logPrefix = clientId ? `[${clientId.slice(0, 8)}]` : '[unscoped]';
+
+['log', 'warn', 'error'].forEach((method) => {
+  const original = logger[method];
+  if (typeof original !== 'function') return;
+  logger[method] = (msg, ...rest) => original(`${logPrefix} ${msg}`, ...rest);
+});
 
 const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);

@@ -183,13 +183,7 @@ function isSupabaseConfigured() {
 }
 
 function getClientId() {
-  if (process.env.COLD_DM_CLIENT_ID) return process.env.COLD_DM_CLIENT_ID;
-  try {
-    if (fs.existsSync(CLIENT_ID_FILE)) {
-      return fs.readFileSync(CLIENT_ID_FILE, 'utf8').trim();
-    }
-  } catch (e) {}
-  return null;
+  return (process.env.COLD_DM_CLIENT_ID || '').trim() || null;
 }
 
 function setClientId(clientId) {
@@ -1950,13 +1944,21 @@ async function getClientIdsWithPauseZero() {
   const sb = getSupabase();
   if (!sb) return [];
   const pinnedClientId = (getClientId() || '').trim();
+  const vpsIp = String(process.env.COLD_DM_VPS_IP || '').trim();
   const { data, error } = await sb
     .from('cold_dm_control')
     .select('client_id')
     .eq('pause', 0)
     .order('client_id', { ascending: true });
   if (error) throw error;
-  const clientIds = (data || []).map((r) => r.client_id).filter(Boolean);
+  let clientIds = (data || []).map((r) => r.client_id).filter(Boolean);
+  if (!pinnedClientId && vpsIp) {
+    const assignedClientIds = await getClientsAssignedToVpsIp(vpsIp).catch(() => []);
+    if (assignedClientIds.length) {
+      const assignedSet = new Set(assignedClientIds);
+      clientIds = clientIds.filter((id) => assignedSet.has(id));
+    }
+  }
   if (!pinnedClientId) return clientIds;
   return clientIds.includes(pinnedClientId) ? [pinnedClientId] : [];
 }
@@ -5455,6 +5457,110 @@ async function countActiveCampaignsForClient(clientId) {
   return Number(count ?? 0);
 }
 
+async function getClientsAssignedToVpsIp(vpsIp) {
+  const sb = getSupabase();
+  const ip = String(vpsIp || '').trim();
+  if (!sb || !ip) return [];
+
+  const { data: fleetRows, error: fleetError } = await sb
+    .from('cold_dm_vps_fleet')
+    .select('id')
+    .eq('ip', ip)
+    .eq('status', 'active');
+  if (fleetError) throw fleetError;
+
+  const fleetIds = (fleetRows || []).map((row) => row.id).filter(Boolean);
+  if (!fleetIds.length) return [];
+
+  const { data: clientRows, error: clientError } = await sb
+    .from('cold_dm_client_workers')
+    .select('client_id')
+    .in('vps_fleet_id', fleetIds);
+  if (clientError) throw clientError;
+
+  return [...new Set((clientRows || []).map((row) => row.client_id).filter(Boolean))];
+}
+
+async function getClientsOnCurrentVps() {
+  const configuredIp = String(process.env.COLD_DM_VPS_IP || '').trim();
+  if (!configuredIp) return [];
+  return getClientsAssignedToVpsIp(configuredIp);
+}
+
+async function getRecommendedSendWorkerInstanceCountForClients(clientIdsInput = []) {
+  const sb = getSupabase();
+  const clientIds = [...new Set((Array.isArray(clientIdsInput) ? clientIdsInput : []).map((id) => String(id || '').trim()).filter(Boolean))];
+  const minN = 1;
+  const maxN = Math.max(
+    1,
+    parseInt(process.env.COLD_DM_MAX_CONCURRENT_SENDERS || process.env.SEND_WORKER_MAX || '64', 10) || 64
+  );
+  if (!sb || clientIds.length === 0) {
+    return {
+      recommended: minN,
+      pauseZeroClients: 0,
+      instagramSessionsForActiveClients: 0,
+      campaignsWithReadyJobs: 0,
+      minN,
+      maxN,
+      clientIds,
+    };
+  }
+
+  const { data: activeControlRows } = await sb
+    .from('cold_dm_control')
+    .select('client_id')
+    .eq('pause', 0)
+    .in('client_id', clientIds);
+  const activeClientIds = (activeControlRows || []).map((row) => row.client_id).filter(Boolean);
+
+  let instagramSessionsForActiveClients = 0;
+  if (activeClientIds.length > 0) {
+    const { count } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('*', { count: 'exact', head: true })
+      .in('client_id', activeClientIds);
+    instagramSessionsForActiveClients = Number(count || 0);
+  }
+
+  let campaignsWithReadyJobs = 0;
+  if (activeClientIds.length > 0) {
+    const nowIso = new Date().toISOString();
+    const { data: readyJobs } = await sb
+      .from('cold_dm_send_jobs')
+      .select('campaign_id')
+      .in('client_id', activeClientIds)
+      .in('status', ['pending', 'retry'])
+      .lte('available_at', nowIso)
+      .not('campaign_id', 'is', null);
+    const readyCampaignIds = [...new Set((readyJobs || []).map((row) => row.campaign_id).filter(Boolean))];
+    if (readyCampaignIds.length > 0) {
+      const { count } = await sb
+        .from('cold_dm_campaigns')
+        .select('id', { count: 'exact', head: true })
+        .in('id', readyCampaignIds)
+        .eq('status', 'active')
+        .in('client_id', activeClientIds);
+      campaignsWithReadyJobs = Number(count || 0);
+    }
+  }
+
+  const pauseZeroClients = activeClientIds.length;
+  const raw = pauseZeroClients === 0
+    ? 1
+    : Math.max(1, pauseZeroClients, instagramSessionsForActiveClients, campaignsWithReadyJobs);
+  const recommended = Math.max(minN, Math.min(maxN, raw));
+  return {
+    recommended,
+    pauseZeroClients,
+    instagramSessionsForActiveClients,
+    campaignsWithReadyJobs,
+    minN,
+    maxN,
+    clientIds: activeClientIds,
+  };
+}
+
 module.exports = {
   getSupabase,
   isSupabaseConfigured,
@@ -5551,11 +5657,14 @@ module.exports = {
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
   countActiveCampaignsForClient,
+  getClientsAssignedToVpsIp,
+  getClientsOnCurrentVps,
   canClientActivelySendNow,
   getClientIdsWithPauseZero,
   getDistinctActiveCampaignIdsWithReadySendJobs,
   getClientSendCampaignTurn,
   getRecommendedSendWorkerInstanceCount,
+  getRecommendedSendWorkerInstanceCountForClients,
   getNextPendingWorkAnyClient,
   getOrResolveColdDmProxyUrl,
   getClientOutsideScheduleStatus,

@@ -10,6 +10,14 @@ const logger = require('../utils/logger');
 const sb = require('../database/supabase');
 
 const csvPath = process.env.LEADS_CSV || path.join(process.cwd(), 'leads.csv');
+const clientId = String(process.env.COLD_DM_CLIENT_ID || '').trim();
+const logPrefix = clientId ? `[${clientId.slice(0, 8)}]` : '[unscoped]';
+
+['log', 'warn', 'error'].forEach((method) => {
+  const original = logger[method];
+  if (typeof original !== 'function') return;
+  logger[method] = (msg, ...rest) => original(`${logPrefix} ${msg}`, ...rest);
+});
 
 async function main() {
   if (!sb.isSupabaseConfigured() && !fs.existsSync(csvPath)) {

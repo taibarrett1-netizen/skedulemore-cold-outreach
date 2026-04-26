@@ -5,13 +5,13 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { exec, spawn } = require('child_process');
+const pm2 = require('pm2');
 const multer = require('multer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const {
   isSupabaseConfigured,
   getClientId,
-  setClientId,
   getControl: getControlSupabase,
   setControl: setControlSupabase,
   getClientStatusMessage: getClientStatusMessageSupabase,
@@ -47,6 +47,7 @@ const {
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
   getLatestSuccessfulColdDmSentAt,
+  getClientsOnCurrentVps,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -249,11 +250,6 @@ function requireScopedClientId(req, res) {
     res.status(400).json({ ok: false, error: 'clientId is required' });
     return null;
   }
-  const pinnedClientId = (process.env.COLD_DM_CLIENT_ID || '').trim();
-  if (pinnedClientId && pinnedClientId !== clientId) {
-    res.status(403).json({ ok: false, error: 'Forbidden: this worker is pinned to a different clientId' });
-    return null;
-  }
   if (req.authClientId && req.authClientId !== clientId) {
     res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
     return null;
@@ -415,9 +411,6 @@ app.post('/api/admin/update', (req, res) => {
       'npm install',
       // Best-effort: load ecosystem if missing (no-op if already started).
       '(pm2 start ecosystem.config.cjs --update-env >/dev/null 2>&1 || true)',
-      // Restart workers first so even if the dashboard restart kills this runner, workers are already bounced.
-      '(pm2 restart ig-dm-send --update-env || pm2 start ecosystem.config.cjs --only ig-dm-send --update-env)',
-      '(pm2 restart ig-dm-scrape --update-env || pm2 start ecosystem.config.cjs --only ig-dm-scrape --update-env)',
       // Save before restarting the dashboard (the command below may kill this runner).
       '(pm2 save || true)',
       '(pm2 restart ig-dm-dashboard --update-env || pm2 start ecosystem.config.cjs --only ig-dm-dashboard --update-env)',
@@ -438,28 +431,27 @@ app.post('/api/admin/update', (req, res) => {
 });
 
 app.post('/api/admin/assign-client', (req, res) => {
-  // Used by the Edge function when assigning a spare pool droplet to a client.
-  // Pins this droplet to that clientId so requests cannot target other tenants.
   const clientId = (req.body?.clientId || '').toString().trim();
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  try {
-    // Do not rewrite the whole .env (it contains secrets); patch just this key.
-    upsertEnvKey('COLD_DM_CLIENT_ID', clientId);
-    setClientId(clientId);
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
-  }
-  // IMPORTANT: respond before restarting. Restarting the process can kill this request mid-flight,
-  // which makes the Edge function hang/timeout even though the assignment succeeded.
-  res.json({ ok: true, clientId, restarting: true, bootIdBeforeRestart: PROCESS_BOOT_ID });
+  // Respond first so Edge does not timeout while PM2 starts workers.
+  res.json({ ok: true, clientId, accepted: true });
   setTimeout(() => {
-    const cmd = 'pm2 restart ig-dm-dashboard --update-env';
-    exec(cmd, { maxBuffer: 4 * 1024 * 1024 }, (err) => {
-      if (err) console.error('[API] assign-client pm2 restart failed', err);
+    ensureClientWorkerStack(clientId).then((result) => {
+      if (!result.ok) {
+        console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${result.error || 'unknown'}`);
+      }
+    }).catch((e) => {
+      console.error(`[API] assign-client worker spawn exception clientId=${clientId.slice(0, 8)}`, e);
     });
-  }, 50);
+  }, 10);
+});
+
+app.get('/api/admin/clients', (_req, res) => {
+  listActiveClientIdsFromPm2()
+    .then((clientIds) => res.json({ ok: true, clientIds }))
+    .catch((e) => res.status(500).json({ ok: false, error: e?.message || String(e) }));
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');
@@ -471,6 +463,8 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SCRAPE_PM2_NAME = 'ig-dm-scrape';
+const SEND_PM2_PREFIX = 'ig-dm-send-';
+const SCRAPE_PM2_PREFIX = 'ig-dm-scrape-';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPE_WORKER_ENTRY = process.env.SCRAPE_WORKER_ENTRY || 'workers/scrape-worker.js';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
@@ -735,6 +729,125 @@ async function getPm2AppStatusByName(appName) {
     };
   } catch (e) {
     return { exists: false, online: false, status: null, error: e };
+  }
+}
+
+function sanitizeClientIdForPm2(clientId) {
+  return String(clientId || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '-');
+}
+
+function getSendWorkerPm2Name(clientId) {
+  return `${SEND_PM2_PREFIX}${sanitizeClientIdForPm2(clientId)}`;
+}
+
+function getScrapeWorkerPm2Name(clientId) {
+  return `${SCRAPE_PM2_PREFIX}${sanitizeClientIdForPm2(clientId)}`;
+}
+
+async function listPm2Processes() {
+  const res = await execPm2('pm2 jlist');
+  if (!res.ok) throw res.err || new Error(res.stderr || 'pm2 jlist failed');
+  const list = JSON.parse(res.stdout || '[]');
+  return Array.isArray(list) ? list : [];
+}
+
+async function listActiveClientIdsFromPm2() {
+  const list = await listPm2Processes();
+  return [
+    ...new Set(
+      list
+        .map((proc) => String(proc?.name || ''))
+        .filter((name) => name.startsWith(SEND_PM2_PREFIX))
+        .map((name) => name.slice(SEND_PM2_PREFIX.length))
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function pm2ConnectAsync() {
+  return new Promise((resolve, reject) => {
+    pm2.connect((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function pm2DisconnectSafe() {
+  try {
+    pm2.disconnect();
+  } catch (_) {}
+}
+
+function pm2StartAsync(options) {
+  return new Promise((resolve, reject) => {
+    pm2.start(options, (err, apps) => (err ? reject(err) : resolve(apps)));
+  });
+}
+
+async function startClientProcessIfMissing(processName, script, env, outFile, errorFile) {
+  const status = await getPm2AppStatusByName(processName);
+  if (!status.error && status.online) {
+    return { ok: true, action: 'noop_online' };
+  }
+  await pm2StartAsync({
+    name: processName,
+    script,
+    cwd: projectRoot,
+    exec_mode: 'fork',
+    autorestart: true,
+    max_restarts: 20,
+    min_uptime: 5000,
+    out_file: outFile,
+    error_file: errorFile,
+    env,
+    updateEnv: true,
+  });
+  return { ok: true, action: status.exists ? 'restart_existing' : 'create_missing' };
+}
+
+async function ensureClientWorkerStack(clientId) {
+  const normalizedClientId = String(clientId || '').trim();
+  if (!normalizedClientId) return { ok: false, error: 'Missing clientId' };
+  if (!String(process.env.COLD_DM_VPS_IP || '').trim()) {
+    await detectLocalPublicIp().catch(() => '');
+  }
+  const sendName = getSendWorkerPm2Name(normalizedClientId);
+  const scrapeName = getScrapeWorkerPm2Name(normalizedClientId);
+  const mergedEnv = { ...process.env, COLD_DM_CLIENT_ID: normalizedClientId };
+  const sendOut = path.join(projectRoot, 'logs', `send-${normalizedClientId}.out.log`);
+  const sendErr = path.join(projectRoot, 'logs', `send-${normalizedClientId}.err.log`);
+  const scrapeOut = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.out.log`);
+  const scrapeErr = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.err.log`);
+
+  await pm2ConnectAsync();
+  try {
+    await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
+    await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  } finally {
+    pm2DisconnectSafe();
+  }
+}
+
+async function detectLocalPublicIp() {
+  if ((process.env.COLD_DM_VPS_IP || '').trim()) return process.env.COLD_DM_VPS_IP.trim();
+  try {
+    const ip = await fetchTextWithTimeout('http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address', 2500);
+    if (ip) process.env.COLD_DM_VPS_IP = ip;
+    return ip;
+  } catch {
+    return '';
+  }
+}
+
+async function ensureAssignedClientWorkerStacksOnStartup() {
+  await detectLocalPublicIp().catch(() => '');
+  const clientIds = await getClientsOnCurrentVps().catch(() => []);
+  for (const clientId of clientIds) {
+    const result = await ensureClientWorkerStack(clientId);
+    if (!result.ok) {
+      console.error(`[pm2:auto-ensure] client stack failed on startup clientId=${String(clientId).slice(0, 8)} error=${result.error || 'unknown'}`);
+    }
   }
 }
 
@@ -1622,6 +1735,7 @@ app.post('/api/voice/upload', uploadVoice.single('file'), (req, res) => {
 const pending2FAMap = new Map();
 const pendingScraper2FAMap = new Map();
 const pendingEmailVerifyMap = new Map();
+const reconnectLocksByClientId = new Map();
 const PENDING_2FA_TTL_MS = 2 * 60 * 1000;
 
 function cleanupExpired2FA() {
@@ -1675,7 +1789,12 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
+  if (reconnectLocksByClientId.get(String(clientId))) {
+    return res.status(409).json({ ok: false, error: 'A reconnect is already in progress for this client. Please wait and retry.' });
+  }
+  reconnectLocksByClientId.set(String(clientId), true);
   if (!isSupabaseConfigured()) {
+    reconnectLocksByClientId.delete(String(clientId));
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
@@ -1803,6 +1922,8 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     res.status(500).json({ ok: false, error: e.message || 'Login failed' });
+  } finally {
+    reconnectLocksByClientId.delete(String(clientId));
   }
 });
 
@@ -2410,7 +2531,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
   schedulePoolWorkerReadyRegistration();
   setTimeout(() => {
-    ensureAssignedClientWorkerStack('startup').catch((err) => {
+    ensureAssignedClientWorkerStacksOnStartup().catch((err) => {
       console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
     });
   }, 1500);
