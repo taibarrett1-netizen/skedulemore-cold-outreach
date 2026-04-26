@@ -2880,15 +2880,23 @@ app.listen(PORT, '0.0.0.0', () => {
     processScheduledResponsesFallbackEnabled: PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED,
     autoScaleSendWorkers: shouldAutoScaleSendWorkers(),
     perClientPm2WorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+    autoEnsureClientWorkersOnDashboardStart: AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START,
     legacySharedSendWorkerEnabled: LEGACY_SHARED_SEND_WORKER_ENABLED,
     remoteUpdateCanRestartDashboard: true,
   });
   schedulePoolWorkerReadyRegistration();
-  setTimeout(() => {
-    ensureAssignedClientWorkerStacksOnStartup().catch((err) => {
-      console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
+  if (AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START) {
+    setTimeout(() => {
+      ensureAssignedClientWorkerStacksOnStartup().catch((err) => {
+        console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
+      });
+    }, 1500);
+  } else {
+    appendDashboardAudit('startup_worker_auto_ensure_skipped', {
+      reason: 'disabled_by_default',
+      enableWith: 'COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START=1',
     });
-  }, 1500);
+  }
   if (shouldAutoScaleSendWorkers()) {
     const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
     console.log(
