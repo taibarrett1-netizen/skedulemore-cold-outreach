@@ -467,6 +467,9 @@ const SEND_PM2_PREFIX = 'ig-dm-send-';
 const SCRAPE_PM2_PREFIX = 'ig-dm-scrape-';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPE_WORKER_ENTRY = process.env.SCRAPE_WORKER_ENTRY || 'workers/scrape-worker.js';
+const PER_CLIENT_PM2_WORKERS_ENABLED =
+  process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== '0' &&
+  process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== 'false';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
@@ -821,12 +824,39 @@ async function ensureClientWorkerStack(clientId) {
   try {
     await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
     await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
-    return { ok: true };
+    const legacyCleanup = await stopLegacySharedSendWorkerIfPerClientMode('ensure_client_stack');
+    return { ok: true, sendName, scrapeName, legacyCleanup };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   } finally {
     pm2DisconnectSafe();
   }
+}
+
+async function stopLegacySharedSendWorkerIfPerClientMode(reason) {
+  if (!PER_CLIENT_PM2_WORKERS_ENABLED) {
+    return { ok: true, action: 'disabled' };
+  }
+  let list;
+  try {
+    list = await listPm2Processes();
+  } catch (e) {
+    return { ok: false, action: 'list_failed', error: e?.message || String(e) };
+  }
+  const names = list.map((proc) => String(proc?.name || ''));
+  const hasPerClientSendWorker = names.some((name) => name.startsWith(SEND_PM2_PREFIX));
+  const hasLegacySendWorker = names.includes(BOT_PM2_NAME);
+  if (!hasPerClientSendWorker || !hasLegacySendWorker) {
+    return { ok: true, action: 'noop' };
+  }
+
+  const deleted = await execPm2(`pm2 delete ${BOT_PM2_NAME}`);
+  if (!deleted.ok && !/not found|does not exist|process or namespace not found/i.test(deleted.out)) {
+    return { ok: false, action: 'delete_failed', error: deleted.out || deleted.err?.message || 'pm2 delete failed' };
+  }
+  await execPm2('pm2 save');
+  console.log(`[pm2:auto-ensure] deleted legacy shared ${BOT_PM2_NAME} after per-client worker start reason=${reason}`);
+  return { ok: true, action: 'deleted_legacy_shared_send_worker' };
 }
 
 async function detectLocalPublicIp() {
@@ -935,29 +965,18 @@ async function ensureAssignedClientWorkerStack(reason) {
     return;
   }
 
-  const results = await Promise.allSettled([
-    ensureSendWorkerProcess(),
-    ensureScrapeWorkerProcess(),
-  ]);
-
-  const labels = ['send', 'scrape'];
-  results.forEach((result, idx) => {
-    const label = labels[idx];
-    if (result.status === 'rejected') {
-      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}`, result.reason);
-      return;
-    }
-    if (!result.value.ok) {
-      const detail = String(result.value.out || result.value.err?.message || 'pm2 ensure failed').slice(0, 220);
-      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}: ${detail}`);
-      return;
-    }
-    if (result.value.action !== 'noop_online') {
-      console.log(
-        `[pm2:auto-ensure] ${label} worker ${result.value.action} reason=${reason} clientId=${assignedClientId.slice(0, 8)}`
-      );
-    }
-  });
+  const result = await ensureClientWorkerStack(assignedClientId);
+  if (!result.ok) {
+    console.error(
+      `[pm2:auto-ensure] client worker stack failed reason=${reason} clientId=${assignedClientId.slice(0, 8)} error=${
+        result.error || 'unknown'
+      }`
+    );
+    return;
+  }
+  console.log(
+    `[pm2:auto-ensure] client worker stack ready reason=${reason} clientId=${assignedClientId.slice(0, 8)} send=${result.sendName}`
+  );
 }
 
 const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
@@ -2141,22 +2160,31 @@ app.post('/api/control/start', async (req, res) => {
     }
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
-    ensureSendWorkerProcess()
+    const ensureWorkers = PER_CLIENT_PM2_WORKERS_ENABLED
+      ? ensureClientWorkerStack(clientId)
+      : ensureSendWorkerProcess();
+    ensureWorkers
       .then((r) => {
         if (!r.ok) {
-          const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
-          console.error('[API] pm2 ensure send worker failed', r.err || detail);
-          setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+          const detail = String(r.out || r.err?.message || r.error || 'pm2 ensure failed').slice(0, 220);
+          console.error('[API] pm2 ensure client worker stack failed', r.err || detail);
+          setClientStatusMessage(clientId, `Worker stack did not start: ${detail}`).catch(() => {});
           return;
         }
-        if (r.out) console.log(`[API] pm2 ensure send worker (${r.action}):`, r.out.slice(0, 800));
-        else console.log(`[API] pm2 ensure send worker (${r.action}) done.`);
-        scheduleAutoScaleSendWorkers('after_start');
+        if (PER_CLIENT_PM2_WORKERS_ENABLED) {
+          console.log(
+            `[API] pm2 ensure client worker stack ready send=${r.sendName || 'n/a'} scrape=${r.scrapeName || 'n/a'}`
+          );
+        } else {
+          if (r.out) console.log(`[API] pm2 ensure send worker (${r.action}):`, r.out.slice(0, 800));
+          else console.log(`[API] pm2 ensure send worker (${r.action}) done.`);
+          scheduleAutoScaleSendWorkers('after_start');
+        }
       })
       .catch((err) => {
-        console.error('[API] pm2 ensure send worker failed', err);
+        console.error('[API] pm2 ensure client worker stack failed', err);
         const detail = String(err?.message || 'pm2 ensure failed').slice(0, 220);
-        setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+        setClientStatusMessage(clientId, `Worker stack did not start: ${detail}`).catch(() => {});
       });
     return;
   }
