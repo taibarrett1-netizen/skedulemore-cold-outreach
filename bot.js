@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs');
@@ -3288,7 +3288,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   // Display name extracted from the search result sidebar row (most reliable source —
   // IG always shows "Display Name / username / bio" in the left panel before you click).
   const sidebarDisplayName = (searchPick.displayName && String(searchPick.displayName).trim()) || null;
-  if (sidebarDisplayName) {
+  if (sidebarDisplayName && SEND_WORKER_VERBOSE_LOGS) {
     logger.log(`[name-extraction] sidebar display name for @${u}: "${sidebarDisplayName}"`);
   }
   await organicPause('between_actions');
@@ -3304,7 +3304,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     const buttonTexts = candidates.map(el => (el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40)).filter(Boolean);
     return { debug: buttonTexts };
   });
-  logger.log('BUTTONS: ' + JSON.stringify(openedThread));
+  if (SEND_WORKER_VERBOSE_LOGS) {
+    logger.log('BUTTONS: ' + JSON.stringify(openedThread));
+  }
   if (openedThread) await organicPause('open_dm');
   await organicPause('between_actions');
 
@@ -3357,7 +3359,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
 
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
-  logger.log('Waiting for compose area...');
+  if (SEND_WORKER_VERBOSE_LOGS) {
+    logger.log('Waiting for compose area...');
+  }
   let composeFound = false;
   let noComposeReason = 'no_compose';
   let composeRecoveryScreenshotPath = null;

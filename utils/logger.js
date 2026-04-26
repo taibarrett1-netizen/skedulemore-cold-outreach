@@ -14,9 +14,14 @@ function timestamp() {
 }
 
 function write(level, msg) {
-  const line = `[${timestamp()}] [${level}] ${msg}\n`;
-  process.stdout.write(line);
-  logStream.write(line);
+  const fileLine = `[${timestamp()}] [${level}] ${msg}\n`;
+  const stdoutHasPm2Timestamp =
+    process.env.pm_id != null &&
+    process.env.LOG_STDOUT_TIMESTAMP !== '1' &&
+    process.env.LOG_STDOUT_TIMESTAMP !== 'true';
+  const stdoutLine = stdoutHasPm2Timestamp ? `[${level}] ${msg}\n` : fileLine;
+  process.stdout.write(stdoutLine);
+  logStream.write(fileLine);
 }
 
 function log(msg) {
