@@ -5,7 +5,7 @@
  * This drains cold_dm_scrape_jobs and runs the older browser-based follower/following
  * scraper against the per-client Instagram session row.
  */
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 
 const os = require('os');
 const logger = require('../utils/logger');

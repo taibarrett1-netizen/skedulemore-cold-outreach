@@ -5478,7 +5478,33 @@ async function getClientsAssignedToVpsIp(vpsIp) {
     .in('vps_fleet_id', fleetIds);
   if (clientError) throw clientError;
 
-  return [...new Set((clientRows || []).map((row) => row.client_id).filter(Boolean))];
+  const rawClientIds = [...new Set((clientRows || []).map((row) => row.client_id).filter(Boolean))];
+  if (!rawClientIds.length) return [];
+
+  const { data: userRows, error: userError } = await sb
+    .from('users')
+    .select('id, user_id')
+    .or(`id.in.(${rawClientIds.join(',')}),user_id.in.(${rawClientIds.join(',')})`);
+  if (userError) {
+    console.warn('[getClientsAssignedToVpsIp] could not canonicalize client IDs; using raw worker client_id values', userError.message || userError);
+    return rawClientIds;
+  }
+
+  const canonicalByAnyId = new Map();
+  for (const row of userRows || []) {
+    if (row?.id) canonicalByAnyId.set(row.id, row.id);
+    if (row?.user_id && row?.id) canonicalByAnyId.set(row.user_id, row.id);
+  }
+  const canonicalClientIds = rawClientIds.map((id) => canonicalByAnyId.get(id) || id);
+  const remapped = rawClientIds.filter((id, idx) => id !== canonicalClientIds[idx]);
+  if (remapped.length) {
+    console.warn(
+      `[getClientsAssignedToVpsIp] canonicalized ${remapped.length} worker client_id value(s) from users.user_id to users.id: ${remapped
+        .map((id) => String(id).slice(0, 8))
+        .join(',')}`
+    );
+  }
+  return [...new Set(canonicalClientIds)];
 }
 
 async function getClientsOnCurrentVps() {

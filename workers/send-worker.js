@@ -3,7 +3,7 @@
  * Dedicated send worker: same behavior as `node cli.js --start` / multi-tenant runBot().
  * Run under PM2 as `ig-dm-send` (see ecosystem.config.cjs). Do not use deprecated `ig-dm-bot`.
  */
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const path = require('path');
 const fs = require('fs');
 const logger = require('../utils/logger');

@@ -134,7 +134,9 @@ function appendDashboardAudit(event, details = {}) {
     fs.appendFileSync(dashboardAuditPath, line);
   } catch (_) {}
   try {
-    console.log(`[dashboard:audit] ${event} ${safeJson(details)}`);
+    if (process.env.DASHBOARD_AUDIT_CONSOLE === '1' || process.env.DASHBOARD_AUDIT_CONSOLE === 'true') {
+      console.log(`[dashboard:audit] ${event} ${safeJson(redactForAudit(details))}`);
+    }
   } catch (_) {}
 }
 
