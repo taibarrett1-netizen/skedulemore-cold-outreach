@@ -553,6 +553,16 @@ app.post('/api/admin/update', (req, res) => {
       `echo "[admin:update] start updateId=${updateId} branch=${branch} at=$(date -Is)"`,
       `git pull origin ${shQuote(branch)}`,
       'npm install',
+      `node - <<'NODE'
+const { execFileSync } = require('child_process');
+const list = JSON.parse(execFileSync('pm2', ['jlist'], { encoding: 'utf8' }) || '[]');
+for (const proc of list) {
+  const name = proc && proc.name;
+  if (typeof name === 'string' && /^ig-dm-(send|scrape)-/.test(name)) {
+    execFileSync('pm2', ['restart', name, '--update-env'], { stdio: 'inherit' });
+  }
+}
+NODE`,
       // Best-effort: load ecosystem if missing (no-op if already started).
       '(pm2 start ecosystem.config.cjs --update-env >/dev/null 2>&1 || true)',
       // Save before restarting the dashboard (the command below may kill this runner).
@@ -2853,7 +2863,10 @@ app.post('/api/scraper/start', async (req, res) => {
       },
       hint: 'Scrape worker will be started automatically if needed.',
     });
-    ensureScrapeWorkerProcess()
+    const ensureScrapeWorker = PER_CLIENT_PM2_WORKERS_ENABLED
+      ? ensureClientWorkerStack(clientId)
+      : ensureScrapeWorkerProcess();
+    ensureScrapeWorker
       .then((r) => {
         if (!r.ok) {
           const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
@@ -2861,7 +2874,7 @@ app.post('/api/scraper/start', async (req, res) => {
           return;
         }
         if (r.action !== 'noop_online') {
-          console.log(`[API] pm2 ensure scrape worker (${r.action}) done.`);
+          console.log(`[API] pm2 ensure scrape worker (${r.action || 'client_stack'}) done.`);
         }
       })
       .catch((err) => console.error('[API] pm2 ensure scrape worker failed', err));
