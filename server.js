@@ -1060,6 +1060,11 @@ function cleanEnvForPm2Child(extra = {}) {
 async function startClientProcessIfMissing(processName, script, env, outFile, errorFile) {
   const status = await getPm2AppStatusByName(processName);
   if (!status.error && status.online) {
+    appendDashboardAudit('pm2_child_start_skipped_existing_online', {
+      processName,
+      script,
+      statusBeforeStart: status,
+    });
     return { ok: true, action: 'noop_online' };
   }
   appendDashboardAudit('pm2_child_start_request', {
