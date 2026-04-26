@@ -131,35 +131,120 @@ order by assigned_clients asc, f.created_at asc;
 
 ## Existing Client Worker Rows
 
-Inspect current assignment state:
+Important: canonical client routing must use `users.id`. Some older rows may have `cold_dm_client_workers.client_id = users.user_id`; those are legacy auth-user-id rows and should not be the main routing rows.
+
+Inspect current assignment state and identify canonical vs legacy rows:
 
 ```sql
 select
-  cw.client_id,
+  u.id as canonical_client_id,
+  u.user_id as auth_user_id,
+  u.name,
   u.primary_email,
+  cw.client_id as worker_client_id,
+  case
+    when cw.client_id = u.id then 'canonical'
+    when cw.client_id = u.user_id then 'legacy_auth_user_id'
+    when cw.client_id is null then 'missing_worker_row'
+    else 'other_mismatch'
+  end as worker_id_type,
   cw.vps_fleet_id,
   cw.droplet_ipv4,
   cw.base_url,
   cw.status,
-  cw.last_error,
-  cw.updated_at
-from cold_dm_client_workers cw
-left join users u on u.id = cw.client_id
-order by cw.updated_at desc;
+  cw.last_error
+from users u
+left join cold_dm_client_workers cw
+  on cw.client_id = u.id
+  or cw.client_id = u.user_id
+where u.service_category = 'cold_outreach_only'
+   or u.plan_tier in ('cold_outreach', 'both')
+   or exists (
+     select 1
+     from cold_dm_instagram_sessions s
+     where s.client_id = u.id or s.client_id = u.user_id
+   )
+order by u.created_at desc;
 ```
 
-Backfill missing `vps_fleet_id` where the worker row already points at a known fleet IP/base URL:
+For a single existing VPS where all current Cold Outreach users should live on that box, update existing canonical rows first:
 
 ```sql
 update cold_dm_client_workers cw
-set vps_fleet_id = f.id,
-    droplet_ipv4 = coalesce(cw.droplet_ipv4, f.ip),
-    base_url = regexp_replace(coalesce(cw.base_url, f.base_url), '/+$', ''),
-    status = case
-      when cw.status in ('ready', 'provisioning') then 'ready'
-      else cw.status
-    end,
-    updated_at = now()
+set
+  vps_fleet_id = '<FLEET_ID>'::uuid,
+  provider = 'digitalocean',
+  droplet_id = null,
+  droplet_ipv4 = '<VPS_PUBLIC_IP>',
+  base_url = 'http://<VPS_PUBLIC_IP>:3000',
+  status = 'ready',
+  last_error = null,
+  updated_at = now()
+from users u
+where cw.client_id = u.id
+  and (
+    u.service_category = 'cold_outreach_only'
+    or u.plan_tier in ('cold_outreach', 'both')
+    or exists (
+      select 1
+      from cold_dm_instagram_sessions s
+      where s.client_id = u.id or s.client_id = u.user_id
+    )
+  );
+```
+
+Then insert missing canonical rows. This avoids `ON CONFLICT`, because older DBs may not have a unique constraint on `cold_dm_client_workers.client_id`.
+
+```sql
+insert into cold_dm_client_workers (
+  client_id,
+  vps_fleet_id,
+  provider,
+  droplet_id,
+  droplet_ipv4,
+  base_url,
+  status,
+  last_error,
+  updated_at
+)
+select
+  u.id,
+  '<FLEET_ID>'::uuid,
+  'digitalocean',
+  null,
+  '<VPS_PUBLIC_IP>',
+  'http://<VPS_PUBLIC_IP>:3000',
+  'ready',
+  null,
+  now()
+from users u
+where (
+    u.service_category = 'cold_outreach_only'
+    or u.plan_tier in ('cold_outreach', 'both')
+    or exists (
+      select 1
+      from cold_dm_instagram_sessions s
+      where s.client_id = u.id or s.client_id = u.user_id
+    )
+  )
+  and not exists (
+    select 1
+    from cold_dm_client_workers cw
+    where cw.client_id = u.id
+  );
+```
+
+For multiple existing VPSs, backfill by current IP/base URL instead of assigning everything to one box:
+
+```sql
+update cold_dm_client_workers cw
+set
+  vps_fleet_id = f.id,
+  droplet_ipv4 = coalesce(cw.droplet_ipv4, f.ip),
+  base_url = regexp_replace(coalesce(cw.base_url, f.base_url), '/+$', ''),
+  status = case when cw.status in ('ready', 'provisioning') then 'ready' else cw.status end,
+  last_error = case when cw.status in ('ready', 'provisioning') then null else cw.last_error end,
+  updated_at = now()
 from cold_dm_vps_fleet f
 where cw.vps_fleet_id is null
   and (
@@ -168,19 +253,76 @@ where cw.vps_fleet_id is null
   );
 ```
 
-Check for rows still missing fleet assignment:
+Verify canonical worker rows are ready:
 
 ```sql
 select
-  cw.client_id,
+  u.id as canonical_client_id,
+  u.name,
   u.primary_email,
+  cw.client_id as worker_client_id,
+  cw.vps_fleet_id,
   cw.droplet_ipv4,
   cw.base_url,
   cw.status,
   cw.last_error
-from cold_dm_client_workers cw
-left join users u on u.id = cw.client_id
-where cw.vps_fleet_id is null;
+from users u
+left join cold_dm_client_workers cw on cw.client_id = u.id
+where u.service_category = 'cold_outreach_only'
+   or u.plan_tier in ('cold_outreach', 'both')
+   or exists (
+     select 1
+     from cold_dm_instagram_sessions s
+     where s.client_id = u.id or s.client_id = u.user_id
+   )
+order by u.created_at desc;
+```
+
+Verify no routed canonical clients are left without a fleet assignment:
+
+```sql
+select
+  u.id as canonical_client_id,
+  u.name,
+  u.primary_email,
+  cw.client_id as worker_client_id,
+  cw.vps_fleet_id,
+  cw.droplet_ipv4,
+  cw.base_url,
+  cw.status,
+  cw.last_error
+from users u
+left join cold_dm_client_workers cw on cw.client_id = u.id
+where (
+    u.service_category = 'cold_outreach_only'
+    or u.plan_tier in ('cold_outreach', 'both')
+    or exists (
+      select 1
+      from cold_dm_instagram_sessions s
+      where s.client_id = u.id or s.client_id = u.user_id
+    )
+  )
+  and (cw.client_id is null or cw.vps_fleet_id is null or cw.status <> 'ready');
+```
+
+After canonical rows are verified and live traffic works, inspect legacy auth-user-id worker rows. Delete only rows where `client_id = users.user_id` and a canonical `client_id = users.id` row already exists:
+
+```sql
+select
+  legacy.client_id as legacy_worker_client_id,
+  u.id as canonical_client_id,
+  u.user_id as auth_user_id,
+  u.name,
+  u.primary_email,
+  legacy.status,
+  legacy.base_url
+from users u
+join cold_dm_client_workers legacy on legacy.client_id = u.user_id
+where exists (
+  select 1
+  from cold_dm_client_workers canonical
+  where canonical.client_id = u.id
+);
 ```
 
 ## Edge Deploy
