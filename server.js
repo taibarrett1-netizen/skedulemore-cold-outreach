@@ -1203,6 +1203,18 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
     });
     return { ok: true, action: 'noop_online' };
   }
+  // Avoid restart churn: if PM2 reports a transient state, let it settle.
+  if (
+    status.exists &&
+    ['launching', 'stopping', 'waiting restart'].includes(String(status.status || '').toLowerCase())
+  ) {
+    appendDashboardAudit('pm2_child_start_skipped_transient', {
+      processName,
+      script,
+      statusBeforeStart: status,
+    });
+    return { ok: true, action: 'noop_transient' };
+  }
   appendDashboardAudit('pm2_child_start_request', {
     processName,
     script,
@@ -1221,7 +1233,7 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
     ),
   });
   const args = status.exists
-    ? ['restart', processName, '--update-env']
+    ? ['start', processName, '--update-env']
     : [
         'start',
         script,
@@ -1239,13 +1251,13 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
         '--update-env',
       ];
   const auditCommand = status.exists
-    ? `pm2 restart ${processName} --update-env`
+    ? `pm2 start ${processName} --update-env`
     : `pm2 start ${script} --name ${processName} --cwd ${projectRoot} --update-env`;
   const result = await execPm2File(args, env, auditCommand);
   if (!result.ok) {
     throw result.err || new Error(result.stderr || result.stdout || `pm2 failed for ${processName}`);
   }
-  return { ok: true, action: status.exists ? 'restart_existing' : 'create_missing' };
+  return { ok: true, action: status.exists ? 'start_existing' : 'create_missing' };
 }
 
 async function ensureClientWorkerStack(clientId) {
