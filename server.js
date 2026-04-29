@@ -1299,8 +1299,26 @@ async function ensureClientWorkerStack(clientId) {
   const scrapeErr = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.err.log`);
 
   try {
-    await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
-    await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
+    const sendResult = await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
+    const scrapeResult = await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
+
+    // Critical for VPS reboots/resizes: persist per-client workers so PM2 resurrect can restore them.
+    // Only save when we actually touched PM2 state (create/start/recreate), not on pure no-ops.
+    const isNoop = (action) => ['noop_online', 'noop_transient'].includes(String(action || ''));
+    const shouldSave = !isNoop(sendResult?.action) || !isNoop(scrapeResult?.action);
+    if (shouldSave) {
+      const saved = await execPm2('pm2 save');
+      if (!saved.ok) {
+        appendDashboardAudit('pm2_save_failed_after_ensure_client_stack', {
+          clientId: normalizedClientId,
+          sendAction: sendResult.action,
+          scrapeAction: scrapeResult.action,
+          err: saved.err ? String(saved.err.message || saved.err) : null,
+          out: saved.out || null,
+          stderr: saved.stderr || null,
+        });
+      }
+    }
     dashboardDebugState.lastWorkerEnsure = {
       ...dashboardDebugState.lastWorkerEnsure,
       sendName,

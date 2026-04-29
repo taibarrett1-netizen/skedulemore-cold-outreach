@@ -365,7 +365,7 @@ COLD_DM_VPS_IP=<this VPS public IP>
 COLD_DM_API_KEY=<same key Edge uses>
 COLD_DM_PER_CLIENT_PM2_WORKERS=1
 COLD_DM_MAX_CONCURRENT_SCRAPES_PER_VPS=2
-COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START=0
+COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START=1
 ASSIGN_CLIENT_SYNC_TIMEOUT_MS=15000
 DASHBOARD_AUDIT_CONSOLE=0
 SEND_WORKER_VERBOSE_LOGS=0
@@ -382,6 +382,8 @@ pm2 delete ig-dm-send || true
 pm2 delete ig-dm-scrape || true
 pm2 save
 ```
+
+After a VPS reboot/resize, `pm2 resurrect` (via `pm2 startup`) should bring back saved per-client workers. The dashboard also auto-ensures workers for all clients assigned to the VPS IP on startup when `COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START=1`.
 
 For existing clients assigned to that VPS, start or confirm per-client stacks:
 

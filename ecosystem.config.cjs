@@ -25,6 +25,13 @@ module.exports = {
     {
       name: 'ig-dm-dashboard',
       script: 'server.js',
+      env: {
+        // After VPS reboot/resize, per-client workers must come back without manual intervention.
+        // Dashboard will query Supabase for clients assigned to this VPS IP and ensure
+        // `ig-dm-send-<clientId>` + `ig-dm-scrape-<clientId>` are running.
+        COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START:
+          process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START || '1',
+      },
       // Dashboard runs Puppeteer for Instagram connect; 512M causes PM2 restart loops under real load.
       max_memory_restart: process.env.PM2_DASHBOARD_MAX_MEMORY || '2048M',
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
