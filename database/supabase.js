@@ -364,6 +364,14 @@ function parseClockTimeToSeconds(hhmmss) {
 function getClockSecondsInTimezone(now, timezone) {
   const tz = normalizeTimezoneInput(timezone);
   if (!tz) {
+    const raw = typeof timezone === 'string' ? timezone.trim() : '';
+    if (raw) {
+      globalThis._coldDmBadTzWarned = globalThis._coldDmBadTzWarned || new Set();
+      if (!globalThis._coldDmBadTzWarned.has(raw)) {
+        globalThis._coldDmBadTzWarned.add(raw);
+        console.warn(`[schedule] Invalid timezone "${raw}" (falling back to UTC). Use an IANA timezone like "America/New_York".`);
+      }
+    }
     return now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
   }
   try {
@@ -665,6 +673,20 @@ function normalizeTimezoneInput(timezone) {
     singapore: 'Asia/Singapore',
     asiasingapore: 'Asia/Singapore',
     'asia/singapore': 'Asia/Singapore',
+    // Common (legacy) timezone shorthands. These are ambiguous globally, but in practice
+    // our cold outreach clients use these to mean US timezones.
+    est: 'America/New_York',
+    edt: 'America/New_York',
+    cst: 'America/Chicago',
+    cdt: 'America/Chicago',
+    mst: 'America/Denver',
+    mdt: 'America/Denver',
+    pst: 'America/Los_Angeles',
+    pdt: 'America/Los_Angeles',
+    'us/eastern': 'America/New_York',
+    'us/central': 'America/Chicago',
+    'us/mountain': 'America/Denver',
+    'us/pacific': 'America/Los_Angeles',
   };
   const candidate = aliases[aliasKey] || slashNormalized;
   try {
@@ -2430,9 +2452,16 @@ async function getClientNoWorkResumeAt(clientId) {
       lastErrorClass: earliestQueuedJob?.last_error_class || '',
       lastErrorMessage: earliestQueuedJob?.last_error_message || '',
     };
+    // If the queue is deferred due to schedule, keep the overall reason as `outside_schedule`
+    // so the send worker re-checks periodically instead of sleeping until (possibly incorrect)
+    // `available_at` far in the future.
+    const queueReason =
+      String(earliestQueuedJob?.last_error_class || '').trim() === 'outside_schedule'
+        ? 'outside_schedule'
+        : 'queue_wait';
     return {
       message: formatQueueWaitDeferMessage(earliestQueuedAtRaw, settings?.timezone ?? null, jobMeta),
-      reason: 'queue_wait',
+      reason: queueReason,
       resumeAt,
     };
   }

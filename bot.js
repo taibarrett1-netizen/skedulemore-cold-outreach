@@ -5883,6 +5883,8 @@ async function drainSleep(ms, label) {
     if (leasedCampaignIdForSignal === campaignId) leasedCampaignIdForSignal = null;
   }
 
+  let lastPinnedIdleSyncAt = 0;
+
   for (;;) {
     const nowMs = Date.now();
     if (nowMs - sendWorkerLastLoopTickLogAt >= 5 * 60 * 1000) {
@@ -5941,6 +5943,23 @@ async function drainSleep(ms, label) {
         process.exit(0);
       }
       throttlePinIdleLog(`[send-worker] ${pinForcedIdleDetail}`);
+      // Self-heal for schedule transitions: when PIN_CAMPAIGNS is enabled and there are
+      // no "ready" jobs (available_at <= now), we can get stuck idling forever if jobs
+      // were previously deferred (outside_schedule) and never rescheduled.
+      // Periodically sync send jobs for pause=0 clients so outside_schedule jobs get
+      // pulled forward when the window opens.
+      const PIN_IDLE_SYNC_MS = 2 * 60 * 1000;
+      if (nowMs - lastPinnedIdleSyncAt >= PIN_IDLE_SYNC_MS) {
+        lastPinnedIdleSyncAt = nowMs;
+        try {
+          const clientIds = await sb.getClientIdsWithPauseZero().catch(() => []);
+          if (clientIds.length) {
+            for (const cid of clientIds) {
+              await sb.syncSendJobsForClient(cid).catch(() => 0);
+            }
+          }
+        } catch (_) {}
+      }
       await delay(randomDelay(20000, 40000));
       continue;
     }
