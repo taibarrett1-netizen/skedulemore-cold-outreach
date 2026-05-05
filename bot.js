@@ -1824,6 +1824,54 @@ async function deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, r
 }
 
 /**
+ * Best-effort guard: if the recipient has already replied since the source cold DM,
+ * skip/cancel queued follow-ups to avoid messaging someone after inbound engagement.
+ */
+async function hasInboundAfterColdFollowUpSource(supabase, row) {
+  if (!supabase || !row?.client_id) return false;
+  let conversationId = null;
+
+  const threadId = typeof row.instagram_thread_id === 'string' ? row.instagram_thread_id.trim() : '';
+  if (threadId) {
+    const { data: byThread } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('client_id', row.client_id)
+      .eq('instagram_thread_id', threadId)
+      .maybeSingle();
+    conversationId = byThread?.id || null;
+  }
+
+  if (!conversationId) {
+    const normalized = normalizeUsername(row.username || '');
+    if (!normalized) return false;
+    const { data: byUsername } = await supabase
+      .from('conversations')
+      .select('id, created_at')
+      .eq('client_id', row.client_id)
+      .ilike('participant_username', normalized)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    conversationId = byUsername?.id || null;
+  }
+
+  if (!conversationId) return false;
+  const sourceSentAtMs = new Date(row.source_sent_at || 0).getTime();
+  const thresholdIso = Number.isFinite(sourceSentAtMs)
+    ? new Date(sourceSentAtMs - 5 * 60 * 1000).toISOString()
+    : new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
+
+  const { count } = await supabase
+    .from('messages')
+    .select('id', { head: true, count: 'exact' })
+    .eq('conversation_id', conversationId)
+    .eq('sender_type', 'them')
+    .gte('sent_at', thresholdIso);
+  return (count || 0) > 0;
+}
+
+/**
  * Optional same-session follow-up: after a cold send, if a cold_dm_follow_up_queue row is already due
  * or becomes due within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS, we may wait briefly and send in-browser.
  * Anything scheduled farther out (minutes, days, …) stays `pending` for Supabase pg_cron
@@ -2020,6 +2068,23 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
       `[follow-up-interleave] re-queued claimed row ${row.id} to ${preciseResume.resumeAtIso} (session cap ${sessionDailyCap}; tracked=${tracked2} pendingCold=${pendingColdCompleting})`
     );
     return { processed: false, skippedDueToSessionDailyLimit: true };
+  }
+
+  const inboundAfterSource = await hasInboundAfterColdFollowUpSource(supabase, claimed).catch(() => false);
+  if (inboundAfterSource) {
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'cancelled',
+        cancel_reason: 'inbound_reply_detected',
+        cancelled_at: new Date().toISOString(),
+        error_message: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    logger.log(`[follow-up-interleave] cancelled row ${row.id} for @${row.username || 'unknown'} (inbound reply detected)`);
+    return { processed: false, cancelledDueToInboundReply: true };
   }
 
   const uname = normalizeUsername(row.username || '');
