@@ -1996,7 +1996,9 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   );
   const { data: pendingRows, error: queueErr } = await supabase
     .from('cold_dm_follow_up_queue')
-    .select('id, client_id, follow_up_index, username, scheduled_for, retry_count')
+    .select(
+      'id, client_id, follow_up_index, username, scheduled_for, retry_count, instagram_thread_id, source_sent_at'
+    )
     .eq('client_id', clientId)
     .eq('status', 'pending')
     .lte('scheduled_for', dueCutoffIso)
@@ -2070,7 +2072,8 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     return { processed: false, skippedDueToSessionDailyLimit: true };
   }
 
-  const inboundAfterSource = await hasInboundAfterColdFollowUpSource(supabase, claimed).catch(() => false);
+  // claim_cold_dm_follow_up_queue_item returns boolean only — pass the queue row for inbound detection.
+  const inboundAfterSource = await hasInboundAfterColdFollowUpSource(supabase, row).catch(() => false);
   if (inboundAfterSource) {
     await supabase
       .from('cold_dm_follow_up_queue')
