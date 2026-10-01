@@ -260,6 +260,14 @@ def insert_lead_if_new(conn, client_id, username, source, lead_group_id=None):
       (client_id, clean, source, lead_group_id),
     )
     row = cur.fetchone()
+    if row:
+      cur.execute(
+        """
+        INSERT INTO cold_dm_scrape_quota_events (client_id, username, source, counted_at)
+        VALUES (%s, %s, %s, NOW())
+        """,
+        (client_id, clean, source),
+      )
   conn.commit()
   return bool(row)
 
@@ -289,9 +297,9 @@ def get_scrape_quota_status(conn, client_id):
     cur.execute(
       """
       SELECT COUNT(*)::int AS used
-      FROM cold_dm_leads
+      FROM cold_dm_scrape_quota_events
       WHERE client_id = %s
-        AND added_at >= %s
+        AND counted_at >= %s
         AND (
           source ILIKE 'followers:%%'
           OR source ILIKE 'following:%%'
@@ -307,22 +315,22 @@ def get_scrape_quota_status(conn, client_id):
     if used > 0:
       cur.execute(
         """
-        SELECT added_at
-        FROM cold_dm_leads
+        SELECT counted_at
+        FROM cold_dm_scrape_quota_events
         WHERE client_id = %s
-          AND added_at >= %s
+          AND counted_at >= %s
           AND (
             source ILIKE 'followers:%%'
             OR source ILIKE 'following:%%'
             OR source ILIKE 'comments:%%'
           )
-        ORDER BY added_at ASC
+        ORDER BY counted_at ASC
         LIMIT 1
         """,
         (client_id, window_start),
       )
       oldest = cur.fetchone()
-      oldest_added_at = oldest.get("added_at") if oldest else None
+      oldest_added_at = oldest.get("counted_at") if oldest else None
       if oldest_added_at is not None:
         reset_at = oldest_added_at + timedelta(days=7)
     reset_delta = (reset_at - now) if reset_at is not None else timedelta()

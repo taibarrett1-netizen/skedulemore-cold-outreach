@@ -1758,6 +1758,45 @@ function normalizeColdFollowUpItems(raw) {
     .filter(Boolean);
 }
 
+async function rescheduleLaterPendingColdFollowUpsForSource(supabase, params) {
+  const sourceSentMessageId = params?.sourceSentMessageId;
+  if (!supabase || !sourceSentMessageId) return 0;
+  const followUps = Array.isArray(params.followUps) ? params.followUps : [];
+  const sentFollowUpIndex = Number(params.sentFollowUpIndex);
+  const currentDelay = followUps[sentFollowUpIndex]?.delay_minutes;
+  const sentAtMs = new Date(params.sentAtIso).getTime();
+  if (!Number.isFinite(currentDelay) || !Number.isFinite(sentAtMs)) return 0;
+
+  const { data: laterRows, error: loadErr } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .select('id, follow_up_index')
+    .eq('client_id', params.clientId)
+    .eq('source_sent_message_id', sourceSentMessageId)
+    .eq('status', 'pending')
+    .gt('follow_up_index', sentFollowUpIndex)
+    .neq('id', params.sentQueueId);
+  if (loadErr) throw loadErr;
+
+  let updated = 0;
+  for (const row of Array.isArray(laterRows) ? laterRows : []) {
+    const laterDelay = followUps[row.follow_up_index]?.delay_minutes;
+    if (!Number.isFinite(laterDelay) || laterDelay <= currentDelay) continue;
+    const scheduledFor = new Date(sentAtMs + (laterDelay - currentDelay) * 60 * 1000).toISOString();
+    const { error: updateErr } = await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        scheduled_for: scheduledFor,
+        error_message: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'pending');
+    if (updateErr) throw updateErr;
+    updated++;
+  }
+  return updated;
+}
+
 function coldDmFollowUpDebugEnabled() {
   return process.env.COLD_DM_FOLLOW_UP_DEBUG === '1' || process.env.COLD_DM_FOLLOW_UP_DEBUG === 'true';
 }
@@ -2041,7 +2080,7 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   const { data: pendingRows, error: queueErr } = await supabase
     .from('cold_dm_follow_up_queue')
     .select(
-      'id, client_id, follow_up_index, username, scheduled_for, retry_count, instagram_thread_id, source_sent_at'
+      'id, client_id, source_sent_message_id, follow_up_index, username, scheduled_for, retry_count, instagram_thread_id, source_sent_at'
     )
     .eq('client_id', clientId)
     .eq('status', 'pending')
@@ -2170,17 +2209,32 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
     const sent = await sendPlainTextInThread(page, textOut);
     if (!sent.ok) throw new Error(sent.reason || 'follow_up_send_failed');
+    const sentAtIso = new Date().toISOString();
     await supabase
       .from('cold_dm_follow_up_queue')
       .update({
         status: 'sent',
-        sent_at: new Date().toISOString(),
+        sent_at: sentAtIso,
         error_message: null,
         vps_session_id: session.id,
-        updated_at: new Date().toISOString(),
+        updated_at: sentAtIso,
       })
       .eq('id', row.id)
       .eq('status', 'processing');
+    const rescheduled = await rescheduleLaterPendingColdFollowUpsForSource(supabase, {
+      clientId,
+      sourceSentMessageId: row.source_sent_message_id || null,
+      sentQueueId: row.id,
+      sentFollowUpIndex: row.follow_up_index,
+      sentAtIso,
+      followUps,
+    }).catch((error) => {
+      logger.warn(`[follow-up-interleave] failed rescheduling later follow-ups row=${row.id}: ${error?.message || error}`);
+      return 0;
+    });
+    if (rescheduled > 0) {
+      logger.log(`[follow-up-interleave] rescheduled ${rescheduled} later follow-up row(s) after row=${row.id}`);
+    }
     return { processed: true, username: uname };
   } catch (e) {
     const retryCount = Math.max(0, Number(row.retry_count || 0));

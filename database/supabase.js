@@ -3274,10 +3274,10 @@ async function getScrapeQuotaStatus(clientId) {
   const windowStartIso = new Date(nowMs - windowMs).toISOString();
 
   let countQuery = sb
-    .from('cold_dm_leads')
+    .from('cold_dm_scrape_quota_events')
     .select('id', { count: 'exact', head: true })
     .eq('client_id', clientId)
-    .gte('added_at', windowStartIso);
+    .gte('counted_at', windowStartIso);
   countQuery = applyScrapedLeadSourceFilter(countQuery);
   const { count, error: countErr } = await countQuery;
   if (countErr) throw countErr;
@@ -3287,17 +3287,17 @@ async function getScrapeQuotaStatus(clientId) {
   let resetAtIso = null;
   if (used > 0) {
     let oldestQuery = sb
-      .from('cold_dm_leads')
-      .select('added_at')
+      .from('cold_dm_scrape_quota_events')
+      .select('counted_at')
       .eq('client_id', clientId)
-      .gte('added_at', windowStartIso)
-      .order('added_at', { ascending: true })
+      .gte('counted_at', windowStartIso)
+      .order('counted_at', { ascending: true })
       .limit(1)
       .maybeSingle();
     oldestQuery = applyScrapedLeadSourceFilter(oldestQuery);
     const { data: oldestRow, error: oldestErr } = await oldestQuery;
     if (oldestErr) throw oldestErr;
-    const oldestAddedAt = oldestRow?.added_at ? new Date(oldestRow.added_at).getTime() : NaN;
+    const oldestAddedAt = oldestRow?.counted_at ? new Date(oldestRow.counted_at).getTime() : NaN;
     if (Number.isFinite(oldestAddedAt)) {
       resetAtIso = new Date(oldestAddedAt + windowMs).toISOString();
     }
@@ -3313,6 +3313,26 @@ async function getScrapeQuotaStatus(clientId) {
     resetInText,
     message: scrapeQuotaReachedMessage(resetInText),
   };
+}
+
+async function recordScrapeQuotaEvents(clientId, usernames, source, countedAtIso = new Date().toISOString()) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const rows = [...new Set((usernames || []).map((u) => normalizeUsername(u)).filter(Boolean))].map((username) => ({
+    client_id: clientId,
+    username,
+    source: source || null,
+    counted_at: countedAtIso,
+  }));
+  if (!rows.length) return 0;
+  let inserted = 0;
+  for (let i = 0; i < rows.length; i += 200) {
+    const slice = rows.slice(i, i + 200);
+    const { data, error } = await sb.from('cold_dm_scrape_quota_events').insert(slice).select('id');
+    if (error) throw error;
+    inserted += (data || []).length;
+  }
+  return inserted;
 }
 
 async function updateScrapeJob(jobId, updates) {
@@ -4659,9 +4679,18 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
   const insChunk = 200;
   for (let i = 0; i < inserts.length; i += insChunk) {
     const slice = inserts.slice(i, i + insChunk);
-    const { data: insData, error: insErr } = await sb.from('cold_dm_leads').insert(slice).select('id');
+    const { data: insData, error: insErr } = await sb.from('cold_dm_leads').insert(slice).select('id, username');
     if (insErr) throw insErr;
-    inserted += (insData || []).length;
+    const insertedCount = (insData || []).length;
+    inserted += insertedCount;
+    if (insertedCount > 0) {
+      await recordScrapeQuotaEvents(
+        clientId,
+        (insData || []).map((row) => row.username),
+        source,
+        isoNow
+      );
+    }
   }
 
   const assignIds = [...new Set(idsToAssignGroup)];

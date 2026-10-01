@@ -636,16 +636,44 @@ async function humanScrollInstagramListModal(page, opts = {}) {
       const stepResult = await targetHandle.evaluate(
         async (el, config) => {
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          function pushScrollableElement(target, deltaY) {
+            if (!target) return { prev: 0, now: 0, maxScroll: 0, moved: false };
+            if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+            try { target.focus({ preventScroll: true }); } catch (_) {}
+            const maxScroll = Math.max(0, target.scrollHeight - target.clientHeight);
+            const prev = target.scrollTop || 0;
+            const dy = Math.max(0, Math.min(deltaY, maxScroll - prev));
+            if (dy <= 0) return { prev, now: target.scrollTop || 0, maxScroll, moved: false };
+
+            /*
+             * Background tabs do not reliably deliver Puppeteer mouse wheels to Instagram's
+             * modal. Fire the same DOM signals in-page, then set scrollTop directly so the
+             * list advances even when Chrome is not the active tab.
+             */
+            try {
+              target.dispatchEvent(new WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                deltaY: dy,
+                deltaMode: 0,
+                view: window,
+              }));
+            } catch (_) {}
+            try { target.scrollBy({ top: dy, left: 0, behavior: 'auto' }); } catch (_) {}
+            target.scrollTop = Math.min(maxScroll, Math.max(target.scrollTop || 0, prev + dy));
+            try { target.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+            return { prev, now: target.scrollTop || 0, maxScroll, moved: Math.abs((target.scrollTop || 0) - prev) > 1 };
+          }
+
           let didMove = false;
           for (let step = 0; step < config.steps; step++) {
             const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
             if (maxScroll <= 0) break;
             const remaining = Math.max(0, maxScroll - el.scrollTop);
             if (remaining <= 3) break;
-            const prev = el.scrollTop;
             const delta = Math.min(remaining, config.baseStep + Math.round(Math.random() * config.stepVariance));
-            el.scrollTop = Math.min(maxScroll, prev + delta);
-            if (Math.abs(el.scrollTop - prev) > 1) didMove = true;
+            const pushed = pushScrollableElement(el, delta);
+            if (pushed.moved) didMove = true;
             await sleep(config.stepPauseMin + Math.round(Math.random() * (config.stepPauseMax - config.stepPauseMin)));
           }
           return { didMove, top: Math.round(el.scrollTop || 0) };
@@ -816,15 +844,31 @@ async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
     await moveMouseToElement(page, targetHandle, { totalDurationMs: randomDelay(180, 420) }).catch(() => {});
 
     const pushResult = await targetHandle.evaluate((el, offsetPx) => {
+      function pushScrollableElement(target, targetTop, fallbackDelta) {
+        if (!target) return { prev: 0, now: 0, maxScroll: 0 };
+        if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+        try { target.focus({ preventScroll: true }); } catch (_) {}
+        const maxScroll = Math.max(0, target.scrollHeight - target.clientHeight);
+        const prev = target.scrollTop || 0;
+        const next = Math.max(0, Math.min(maxScroll, targetTop));
+        const dy = Math.max(1, Math.abs(next - prev) || fallbackDelta || 1);
+        try {
+          target.dispatchEvent(new WheelEvent('wheel', {
+            bubbles: true,
+            cancelable: true,
+            deltaY: dy,
+            deltaMode: 0,
+            view: window,
+          }));
+        } catch (_) {}
+        try { target.scrollBy({ top: Math.min(dy, maxScroll - prev), left: 0, behavior: 'auto' }); } catch (_) {}
+        target.scrollTop = next;
+        try { target.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (_) {}
+        return { prev, now: target.scrollTop || 0, maxScroll };
+      }
       const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
-      const prev = el.scrollTop || 0;
       const target = Math.max(0, maxScroll - offsetPx);
-      el.scrollTop = target;
-      return {
-        prev,
-        now: el.scrollTop || 0,
-        maxScroll,
-      };
+      return pushScrollableElement(el, target, 900);
     }, bottomOffsetPx).catch(() => null);
 
     let moved = !!pushResult && Math.abs((pushResult.now || 0) - (pushResult.prev || 0)) > 2;
